@@ -1,0 +1,16 @@
+
+// New Types
+< s32:d u32:g s16:C u16:H s8:c u8:h f32:f f64:F string:s wstring:S u64:G s64:D bool:c enum:s >
+
+[ xProperties : 9 ]
+{ Name:s                            Value:?                   }
+//--------------------------------  -------------------------
+  "PipelinePlugin/TypeName"                  ;string "AnimPackage"
+  "PipelinePlugin/FileExtension"             ;wstring "xanim_package"
+  "PipelinePlugin/TypeGUID/Value"            ;u64    #E69E8A8439A9BB1B
+  "PipelinePlugin/Icon"                      ;string "\xEE\xAF\x99"
+  "PipelinePlugin/Details/RunAfter[]"        ;s64    1
+  "PipelinePlugin/Details/RunAfter[G:0]/Value" ;u64    #F5D3BE1ED860ABF7
+  "PipelinePlugin/Details/CompilationScript" ;wstring "Cache\\Plugins\\xanim_package.plugin\\Build\\CreateAndBuildProject.bat"
+  "PipelinePlugin/Details/DebugCompiler"     ;wstring "Cache\\Plugins\\xanim_package.plugin\\Build\\xanim_package_compiler.vs2022\\Debug\\xanim_package_compiler.exe"
+  "PipelinePlugin/Details/ReleaseCompiler"   ;wstring "Cache\\Plugins\\xanim_package.plugin\\Build\\xanim_package_compiler.vs2022\\Release\\xanim_package_compiler.exe"
