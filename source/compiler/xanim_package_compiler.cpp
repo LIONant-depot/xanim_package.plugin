@@ -13,7 +13,6 @@
 #include "dependencies/xmath/source/bridge/xmath_to_xproperty.h"
 
 #include <unordered_map>
-#include <unordered_set>
 #include <algorithm>
 #include <cmath>
 
@@ -123,21 +122,26 @@ namespace xanim_package_compiler
 
         //--------------------------------------------------------------------------------------
         // Builds one compiled clip from a raw import + its (possibly null) descriptor override.
-        // Returns false (via Skip) if the clip is ignored. Bone identity is hashed from the RAW
-        // imported bone name - if the referenced skeleton later renames a bone (xskeleton_desc::
-        // bone::m_Rename), this clip's hash for that bone will no longer match the skeleton's
-        // compiled hash and it simply won't bind at runtime. Retargeting across a rename is out of
-        // scope for this pass; BuildCompiledClip only warns when a raw bone name isn't found in the
-        // referenced skeleton's manifest at all.
+        // Returns false (via Skip) if the clip is ignored.
+        //
+        // Bone-order-synced by construction: the output curve is laid out in the REFERENCED
+        // SKELETON's own compiled bone order/width (ResolvedBones), not the raw file's own bone
+        // list/order - every skeleton bone gets a slot in every clip. A skeleton bone with a matching
+        // raw bone (by name) gets that bone's animated curve; any skeleton bone the raw file doesn't
+        // carry a channel for gets a constant curve equal to the skeleton's own compiled rest pose
+        // (carried in the cross-plugin bone manifest - see xskeleton_bone_manifest.h). This is what
+        // lets playback index a clip's frame directly by the skeleton's own bone index, with no
+        // per-frame name-hash lookup. A raw bone with no matching skeleton bone is simply never read
+        // (warned about below, for author visibility) - retargeting across a skeleton-side rename is
+        // out of scope for this pass.
         xerr BuildCompiledClip
-        ( const raw_clip&                         Raw
-        , const xanim_package_desc::clip*         pOv
-        , const std::unordered_set<std::string>&  SkeletonBoneNames
-        , bool&                                   Skip
-        , xanim_package::clip&                    Out
-        , std::vector<std::uint32_t>&             AllBoneHashes
-        , std::vector<xmath::transform3>&         AllKeyFrames
-        , std::vector<xmath::fvec3>&               AllRootMotion
+        ( const raw_clip&                                    Raw
+        , const xanim_package_desc::clip*                    pOv
+        , const std::vector<xskeleton_desc::bone_manifest::bone_entry>& ResolvedBones
+        , bool&                                               Skip
+        , xanim_package::clip&                                Out
+        , std::vector<xmath::transform3>&                     AllKeyFrames
+        , std::vector<xmath::fvec3>&                          AllRootMotion
         )
         {
             Skip = pOv && pOv->m_bIgnore;
@@ -152,7 +156,8 @@ namespace xanim_package_compiler
 
             const int SourceFPS     = Raw.m_Anim.m_FPS;
             const int SourceFrames  = Raw.m_Anim.m_nFrames;
-            const int nBones        = static_cast<int>(Raw.m_Anim.m_Bone.size());
+            const int nRawBones     = static_cast<int>(Raw.m_Anim.m_Bone.size());
+            const int nSkelBones    = static_cast<int>(ResolvedBones.size());
 
             if (TargetFPS > SourceFPS)
                 LogMessage(xresource_pipeline::msg_type::WARNING
@@ -171,35 +176,52 @@ namespace xanim_package_compiler
             Out.m_nFrames         = OutFrames;
             Out.m_bLoop           = bLoop;
             Out.m_RootMotionMode  = RootMotion;
-            Out.m_nBones          = static_cast<std::uint16_t>(nBones);
-            Out.m_iFirstBone      = static_cast<std::uint32_t>(AllBoneHashes.size());
             Out.m_iFirstKeyFrame  = static_cast<std::uint32_t>(AllKeyFrames.size());
             Out.m_iFirstRootMotion = static_cast<std::uint32_t>(AllRootMotion.size());
             Out.m_LoopDisplacement = xmath::fvec3::fromZero();
 
-            for (int b = 0; b < nBones; ++b)
+            // Map each skeleton bone (by name) to its raw-clip bone slot, if any - a small, one-time,
+            // compile-time lookup, not a runtime cost.
+            std::vector<int> SkelToRaw(nSkelBones, -1);
+            for (int s = 0; s < nSkelBones; ++s)
             {
-                const auto& Name = Raw.m_Anim.m_Bone[b].m_Name;
-                AllBoneHashes.push_back(xstrtool::CRC32(Name));
-
-                if (SkeletonBoneNames.find(Name) == SkeletonBoneNames.end())
+                for (int r = 0; r < nRawBones; ++r)
+                {
+                    if (Raw.m_Anim.m_Bone[r].m_Name == ResolvedBones[s].m_Name) { SkelToRaw[s] = r; break; }
+                }
+            }
+            for (int r = 0; r < nRawBones; ++r)
+            {
+                const bool bFound = std::find(SkelToRaw.begin(), SkelToRaw.end(), r) != SkelToRaw.end();
+                if (!bFound)
                     LogMessage(xresource_pipeline::msg_type::WARNING
-                        , std::format("Clip '{}' references bone '{}' which was not found in the referenced skeleton.", CompiledName, Name));
+                        , std::format("Clip '{}' references bone '{}' which was not found in the referenced skeleton.", CompiledName, Raw.m_Anim.m_Bone[r].m_Name));
             }
 
             const std::size_t KeyFrameBase = AllKeyFrames.size();
-            AllKeyFrames.resize(KeyFrameBase + static_cast<std::size_t>(OutFrames) * nBones);
+            AllKeyFrames.resize(KeyFrameBase + static_cast<std::size_t>(OutFrames) * nSkelBones);
             for (int f = 0; f < OutFrames; ++f)
             {
                 const int SrcFrame = std::clamp(ResampleFrameIndex(StartFrame + f, SourceFPS, FinalFPS), 0, SourceFrames - 1);
-                for (int b = 0; b < nBones; ++b)
-                    AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nBones + b] = Raw.m_Anim.m_KeyFrame[static_cast<std::size_t>(SrcFrame) * nBones + b];
+                for (int s = 0; s < nSkelBones; ++s)
+                {
+                    const int iRaw = SkelToRaw[s];
+                    AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + s] = (iRaw != -1)
+                        ? Raw.m_Anim.m_KeyFrame[static_cast<std::size_t>(SrcFrame) * nRawBones + iRaw]
+                        : xmath::transform3
+                          { .m_Scale    = ResolvedBones[s].m_RestScale
+                          , .m_Rotation = xmath::fquat(ResolvedBones[s].m_RestRotX, ResolvedBones[s].m_RestRotY, ResolvedBones[s].m_RestRotZ, ResolvedBones[s].m_RestRotW)
+                          , .m_Position = ResolvedBones[s].m_RestPosition
+                          };
+                }
             }
 
             if (RootMotion != xanim_package::root_motion_mode::NONE)
             {
-                const int iRoot = FindRootBone(Raw.m_Anim);
-                if (iRoot == -1)
+                const int iRawRoot = FindRootBone(Raw.m_Anim);
+                const int iSkelRoot = (iRawRoot == -1) ? -1 : static_cast<int>(std::find(SkelToRaw.begin(), SkelToRaw.end(), iRawRoot) - SkelToRaw.begin());
+
+                if (iRawRoot == -1 || iSkelRoot >= nSkelBones)
                 {
                     LogMessage(xresource_pipeline::msg_type::WARNING
                         , std::format("Clip '{}' asked for root-motion extraction but no root bone (m_iParent==-1) was found - skipping extraction.", CompiledName));
@@ -209,11 +231,11 @@ namespace xanim_package_compiler
                     const std::size_t RootMotionBase = AllRootMotion.size();
                     AllRootMotion.resize(RootMotionBase + OutFrames);
 
-                    const auto Frame0Pos = AllKeyFrames[KeyFrameBase + 0 * nBones + iRoot].m_Position;
+                    const auto Frame0Pos = AllKeyFrames[KeyFrameBase + 0 * nSkelBones + iSkelRoot].m_Position;
 
                     for (int f = 0; f < OutFrames; ++f)
                     {
-                        auto& RootKey = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nBones + iRoot];
+                        auto& RootKey = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot];
                         xmath::fvec3 Delta = RootKey.m_Position - Frame0Pos;
 
                         if (RootMotion == xanim_package::root_motion_mode::XZ_ONLY)
@@ -259,13 +281,10 @@ namespace xanim_package_compiler
             std::unordered_map<std::string, const xanim_package_desc::clip*> Overrides;
             CollectOverrides(Overrides);
 
-            std::unordered_set<std::string> SkeletonBoneNames;
-            for (auto& B : m_Descriptor.m_ResolvedSkeletonBones.m_Bones)
-                SkeletonBoneNames.insert(B.m_Name);
+            auto& ResolvedBones = m_Descriptor.m_ResolvedSkeletonBones.m_Bones;
 
             std::vector<xanim_package::clip>       Clips;
             std::vector<std::string>               Names;
-            std::vector<std::uint32_t>              AllBoneHashes;
             std::vector<xmath::transform3>          AllKeyFrames;
             std::vector<xmath::fvec3>               AllRootMotion;
 
@@ -276,7 +295,7 @@ namespace xanim_package_compiler
 
                 bool                  Skip = false;
                 xanim_package::clip   Compiled{};
-                if (auto Err = BuildCompiledClip(Raw, pOv, SkeletonBoneNames, Skip, Compiled, AllBoneHashes, AllKeyFrames, AllRootMotion); Err)
+                if (auto Err = BuildCompiledClip(Raw, pOv, ResolvedBones, Skip, Compiled, AllKeyFrames, AllRootMotion); Err)
                     return Err;
                 if (Skip) continue;
 
@@ -293,9 +312,10 @@ namespace xanim_package_compiler
             m_FinalPackage.m_pClips = new xanim_package::clip[Clips.size()];
             std::copy(Clips.begin(), Clips.end(), m_FinalPackage.m_pClips);
 
-            m_FinalPackage.m_nTotalBones = static_cast<std::uint32_t>(AllBoneHashes.size());
-            m_FinalPackage.m_pBoneNameHashes = new std::uint32_t[AllBoneHashes.size()];
-            std::copy(AllBoneHashes.begin(), AllBoneHashes.end(), m_FinalPackage.m_pBoneNameHashes);
+            m_FinalPackage.m_nBones = static_cast<std::uint32_t>(ResolvedBones.size());
+            m_FinalPackage.m_pBoneNameHashes = new std::uint32_t[ResolvedBones.size()];
+            for (std::size_t i = 0; i < ResolvedBones.size(); ++i)
+                m_FinalPackage.m_pBoneNameHashes[i] = ResolvedBones[i].m_NameHash;
 
             m_FinalPackage.m_nTotalKeyFrames = static_cast<std::uint32_t>(AllKeyFrames.size());
             m_FinalPackage.m_pKeyFrame = new xmath::transform3[AllKeyFrames.size()];
