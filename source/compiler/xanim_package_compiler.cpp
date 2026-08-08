@@ -137,13 +137,15 @@ namespace xanim_package_compiler
         xerr BuildCompiledClip
         ( const raw_clip&                                    Raw
         , const xanim_package_desc::clip*                    pOv
-        , const std::vector<xskeleton_desc::bone_manifest::bone_entry>& ResolvedBones
+        , const xskeleton_desc::bone_manifest&                Manifest
         , bool&                                               Skip
         , xanim_package::clip&                                Out
         , std::vector<xmath::transform3>&                     AllKeyFrames
         , std::vector<xmath::fvec3>&                          AllRootMotion
         )
         {
+            const auto& ResolvedBones = Manifest.m_Bones;
+
             Skip = pOv && pOv->m_bIgnore;
             if (Skip) return {};
 
@@ -216,12 +218,51 @@ namespace xanim_package_compiler
                 }
             }
 
+            // Identify the SKELETON's own root bone slot (m_iParent < 0, per the manifest - NOT the
+            // raw clip's own hierarchy) - shared by the PreTransform correction below and root-motion
+            // extraction further down. Deliberately NOT FindRootBone(Raw.m_Anim): assimp/FBX imports
+            // frequently wrap the real, named root under a synthetic "RootNode" container, so the raw
+            // clip's own m_iParent==-1 bone is often that wrapper, not the skeleton's actual root -
+            // matching against it either silently corrects the wrong bone or (when the wrapper's name
+            // matches nothing in the skeleton, as here) never corrects anything at all. Only meaningful
+            // if that skeleton bone's slot actually came from this raw clip's animated data (see the
+            // SkelToRaw construction above) - never the rest-pose fallback.
+            int iSkelRoot = -1;
+            for (int s = 0; s < nSkelBones; ++s)
+                if (ResolvedBones[s].m_iParent < 0) { iSkelRoot = s; break; }
+            const bool bHaveAnimatedRoot = (iSkelRoot != -1) && (SkelToRaw[iSkelRoot] != -1);
+
+            // Apply the skeleton's own author-time PreTransform to the animated root bone's curve -
+            // mirrors xskeleton_compiler.cpp's ApplyPreTransform() exactly (root-only; every
+            // descendant inherits the correction for free through the normal parent-multiply FK chain
+            // at playback). This clip's raw import never passes through the skeleton's own import
+            // step, so without this the animated root stays in raw-import space while the skeleton's
+            // rest pose (and every unanimated bone's fallback here, both already-corrected via the
+            // manifest) sit in engine space - a visible scale/offset mismatch between the two.
+            if (bHaveAnimatedRoot
+                && (Manifest.m_PreTransformScale != xmath::fvec3::fromOne()
+                 || Manifest.m_PreTransformRotationDeg != xmath::fvec3::fromZero()
+                 || Manifest.m_PreTransformTranslation != xmath::fvec3::fromZero()))
+            {
+                xmath::radian3 Rot;
+                Rot.m_Roll  = xmath::radian{ xmath::DegToRad(Manifest.m_PreTransformRotationDeg.m_Z) };
+                Rot.m_Pitch = xmath::radian{ xmath::DegToRad(Manifest.m_PreTransformRotationDeg.m_X) };
+                Rot.m_Yaw   = xmath::radian{ xmath::DegToRad(Manifest.m_PreTransformRotationDeg.m_Y) };
+                const xmath::fquat PreQuat(Rot);
+                const xmath::fmat4 M(Manifest.m_PreTransformScale, PreQuat, Manifest.m_PreTransformTranslation);
+
+                for (int f = 0; f < OutFrames; ++f)
+                {
+                    auto& RootKey      = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot];
+                    RootKey.m_Position = M * RootKey.m_Position;
+                    RootKey.m_Rotation = PreQuat * RootKey.m_Rotation;
+                    RootKey.m_Scale    = Manifest.m_PreTransformScale * RootKey.m_Scale;
+                }
+            }
+
             if (RootMotion != xanim_package::root_motion_mode::NONE)
             {
-                const int iRawRoot = FindRootBone(Raw.m_Anim);
-                const int iSkelRoot = (iRawRoot == -1) ? -1 : static_cast<int>(std::find(SkelToRaw.begin(), SkelToRaw.end(), iRawRoot) - SkelToRaw.begin());
-
-                if (iRawRoot == -1 || iSkelRoot >= nSkelBones)
+                if (!bHaveAnimatedRoot)
                 {
                     LogMessage(xresource_pipeline::msg_type::WARNING
                         , std::format("Clip '{}' asked for root-motion extraction but no root bone (m_iParent==-1) was found - skipping extraction.", CompiledName));
@@ -281,7 +322,8 @@ namespace xanim_package_compiler
             std::unordered_map<std::string, const xanim_package_desc::clip*> Overrides;
             CollectOverrides(Overrides);
 
-            auto& ResolvedBones = m_Descriptor.m_ResolvedSkeletonBones.m_Bones;
+            auto& Manifest      = m_Descriptor.m_ResolvedSkeletonBones;
+            auto& ResolvedBones = Manifest.m_Bones;
 
             std::vector<xanim_package::clip>       Clips;
             std::vector<std::string>               Names;
@@ -295,7 +337,7 @@ namespace xanim_package_compiler
 
                 bool                  Skip = false;
                 xanim_package::clip   Compiled{};
-                if (auto Err = BuildCompiledClip(Raw, pOv, ResolvedBones, Skip, Compiled, AllKeyFrames, AllRootMotion); Err)
+                if (auto Err = BuildCompiledClip(Raw, pOv, Manifest, Skip, Compiled, AllKeyFrames, AllRootMotion); Err)
                     return Err;
                 if (Skip) continue;
 
