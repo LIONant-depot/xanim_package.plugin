@@ -6,8 +6,10 @@
 #include "plugins/xskeleton.plugin/source/xskeleton_bone_manifest.h"
 #include "xanim_package.h"
 #include "xanim_package_details.h"
+#include "dependencies/xstrtool/source/xstrtool.h"
 #include <functional>
 #include <format>
+#include <algorithm>
 
 namespace xanim_package_desc
 {
@@ -21,47 +23,50 @@ namespace xanim_package_desc
     , xproperty::settings::enum_item("XYZ",     xanim_package::root_motion_mode::XYZ)
     };
 
+    // A sparse override entry for one imported clip, matched BY m_OriginalName against its OWNING
+    // import_source's own details::source::m_ClipList - a raw clip's name is only ever guaranteed
+    // unique WITHIN the file it came from (see xanim_package_details.h's own comment on why), so this
+    // lives nested inside import_source below, never in a flat cross-file list.
+    struct clip
+    {
+        std::string                       m_OriginalName   = {};   // raw imported name - the stable match key across re-imports; never shown or edited directly, only ever read by MergeWithDetails/findClip
+        std::string                       m_Name           = {};   // user-facing/compiled name - initialized to m_OriginalName when this entry is first created (see MergeWithDetails), freely renamable afterward; THIS gets CRC32'd into the compiled clip's name hash
+        bool                              m_bDelete        = false;// excluded from the compiled output entirely - still visible in Details, so it can be re-enabled later
+        bool                              m_bLoop          = false;
+        int                               m_DownsampleFPS  = 0;    // 0 = keep the imported rate (the importer always samples at 60fps) - lowering this (e.g. to 30) only ever trades quality for memory, never fixes anything; no upsampling, nothing to invent above the imported rate
+        int                               m_TrimStartFrame = -1;   // frame index, in the FINAL (post-resample) domain; -1 = from the start
+        int                               m_TrimEndFrame   = -1;   // frame index; -1 = to the end
+        xanim_package::root_motion_mode   m_RootMotion     = xanim_package::root_motion_mode::NONE;
+
+        XPROPERTY_DEF
+        ( "Clip", clip
+        , obj_member<"OriginalName",    &clip::m_OriginalName, member_flags<flags::SHOW_READONLY> >
+        , obj_member<"Name",            &clip::m_Name >
+        , obj_member<"Delete",          &clip::m_bDelete >
+        , obj_member<"Loop",            &clip::m_bLoop >
+        , obj_member<"DownsampleFPS",   &clip::m_DownsampleFPS >
+        , obj_member<"TrimStartFrame",  &clip::m_TrimStartFrame >
+        , obj_member<"TrimEndFrame",    &clip::m_TrimEndFrame >
+        , obj_member<"RootMotion",      &clip::m_RootMotion, member_enum_span<root_motion_mode_v> >
+        )
+    };
+    XPROPERTY_REG(clip)
+
     // One entry in the "official list" of source files this package collects clips from - a single
-    // FBX can contain multiple baked-in animation clips, all of which land in `details` for the
-    // descriptor's sparse per-clip overrides (below) to curate.
+    // FBX can contain multiple baked-in animation clips, all of which get their own sparse override
+    // entry here (see MergeWithDetails), curated per-file rather than in one cross-file pool.
     struct import_source
     {
-        std::wstring    m_Path  = {};
+        std::wstring       m_Path  = {};
+        std::vector<clip>  m_Clips = {};   // every clip found in THIS file, curated
 
         XPROPERTY_DEF
         ( "ImportSource", import_source
         , obj_member<"Path",    &import_source::m_Path, member_ui<std::wstring>::file_dialog<mesh_filter_v, true, 1> >
+        , obj_member<"Clips",   &import_source::m_Clips >
         )
     };
     XPROPERTY_REG(import_source)
-
-    // A sparse override entry for one imported clip, matched BY NAME against details::m_ClipList -
-    // same by-name-matching pattern as xskeleton's bone tree, but flat (clips have no hierarchy, so
-    // no reparenting concerns).
-    struct clip
-    {
-        std::string                       m_Name          = {};   // raw imported name - SHOW_READONLY, stable match key across re-imports
-        std::string                       m_Rename        = {};   // if set, THIS gets CRC32'd into the compiled clip's name hash
-        bool                              m_bIgnore       = false;// excluded from the compiled output entirely - still visible in Details, so it can be re-enabled later
-        bool                              m_bLoop         = false;
-        int                               m_TargetFPS     = 0;    // 0 = keep the imported base FPS; must be <= imported (no upsampling - nothing to invent)
-        float                             m_TrimStartTime = -1.f; // seconds, in the FINAL (post-resample) domain; -1 = from the start
-        float                             m_TrimEndTime   = -1.f; // seconds; -1 = to the end
-        xanim_package::root_motion_mode   m_RootMotion    = xanim_package::root_motion_mode::NONE;
-
-        XPROPERTY_DEF
-        ( "Clip", clip
-        , obj_member<"Name",          &clip::m_Name, member_flags< flags::SHOW_READONLY> >
-        , obj_member<"Rename",        &clip::m_Rename >
-        , obj_member<"Ignore",        &clip::m_bIgnore >
-        , obj_member<"Loop",          &clip::m_bLoop >
-        , obj_member<"TargetFPS",     &clip::m_TargetFPS >
-        , obj_member<"TrimStartTime", &clip::m_TrimStartTime >
-        , obj_member<"TrimEndTime",   &clip::m_TrimEndTime >
-        , obj_member<"RootMotion",    &clip::m_RootMotion, member_enum_span<root_motion_mode_v> >
-        )
-    };
-    XPROPERTY_REG(clip)
 
     struct descriptor : xresource_pipeline::descriptor::base
     {
@@ -85,34 +90,47 @@ namespace xanim_package_desc
             }
         }
 
-        int findClip(std::string_view Name) const noexcept
+        int findImportSource(std::wstring_view Path) const noexcept
         {
-            for (auto& E : m_Clips)
-                if (E.m_Name == Name) return static_cast<int>(&E - m_Clips.data());
+            for (auto& E : m_ImportSources)
+                if (E.m_Path == Path) return static_cast<int>(&E - m_ImportSources.data());
             return -1;
         }
 
-        // Reconciles the sparse per-clip override list against a freshly (re-)imported set of clips
-        // (details) - same job as xskeleton_desc::descriptor::MergeWithDetails, but flat (no tree/
-        // reparenting): a clip missing from a fresh import gets its override pruned (with a warning),
-        // a newly-found clip gets a fresh, un-curated override entry appended.
+        // Reconciles each import source's sparse per-clip override list against a freshly
+        // (re-)imported set of clips (details) - same job as xskeleton_desc::descriptor::
+        // MergeWithDetails, scoped per-file so a clip is only ever matched against clips FROM THE
+        // SAME FILE: a clip missing from a fresh import of its own file gets its override pruned
+        // (with a warning), a newly-found clip gets a fresh, un-curated override entry appended -
+        // m_Name seeded from m_OriginalName so it starts out displaying the imported name, freely
+        // renamable afterward. An import source with no matching Details entry (nothing imported from
+        // it yet, or the file failed to import) is left untouched - not an error, just nothing to
+        // reconcile yet.
         std::vector<std::string> MergeWithDetails(const details& Details)
         {
             std::vector<std::string> Messages;
 
-            for (int i = 0; i < static_cast<int>(m_Clips.size()); ++i)
+            for (auto& Source : m_ImportSources)
             {
-                if (Details.findClip(m_Clips[i].m_Name) != -1) continue;
+                const int iDetailsSource = Details.findSource(Source.m_Path);
+                if (iDetailsSource == -1) continue;
+                const auto& DetailsSource = Details.m_Sources[iDetailsSource];
 
-                Messages.push_back(std::format("WARNING: Clip [{}] no longer found in the imported sources - removing its override.", m_Clips[i].m_Name));
-                m_Clips.erase(m_Clips.begin() + i);
-                --i;
-            }
+                for (int i = 0; i < static_cast<int>(Source.m_Clips.size()); ++i)
+                {
+                    if (DetailsSource.findClip(Source.m_Clips[i].m_OriginalName) != -1) continue;
 
-            for (auto& Src : Details.m_ClipList)
-            {
-                if (findClip(Src.m_Name) == -1)
-                    m_Clips.push_back(clip{ .m_Name = Src.m_Name });
+                    Messages.push_back(std::format("WARNING: Clip [{}] no longer found in [{}] - removing its override.", Source.m_Clips[i].m_OriginalName, xstrtool::To(Source.m_Path)));
+                    Source.m_Clips.erase(Source.m_Clips.begin() + i);
+                    --i;
+                }
+
+                for (auto& Src : DetailsSource.m_ClipList)
+                {
+                    const bool bFound = std::any_of(Source.m_Clips.begin(), Source.m_Clips.end(), [&](const clip& C) { return C.m_OriginalName == Src.m_Name; });
+                    if (!bFound)
+                        Source.m_Clips.push_back(clip{ .m_OriginalName = Src.m_Name, .m_Name = Src.m_Name });
+                }
             }
 
             return Messages;
@@ -167,9 +185,8 @@ namespace xanim_package_desc
             return {};
         }
 
-        std::vector<import_source>     m_ImportSources         = {};   // the "official list" of source files
+        std::vector<import_source>     m_ImportSources         = {};   // the "official list" of source files - each owns its own clips now (see import_source)
         xrsc::skeleton                  m_SkeletonRef           = {};   // required - Validate() errors if empty
-        std::vector<clip>               m_Clips                 = {};   // sparse per-clip overrides
 
         xskeleton_desc::bone_manifest   m_ResolvedSkeletonBones = {};   // NOT saved - populated in Serialize() above
 
@@ -177,7 +194,6 @@ namespace xanim_package_desc
         ( "AnimPackage", descriptor
         , obj_member<"ImportSources",           &descriptor::m_ImportSources >
         , obj_member<"SkeletonRef",             &descriptor::m_SkeletonRef >
-        , obj_member<"Clips",                   &descriptor::m_Clips >
         , obj_member<"ResolvedSkeletonBones",   &descriptor::m_ResolvedSkeletonBones, member_flags<flags::DONT_SHOW, flags::DONT_SAVE> >
         )
     };

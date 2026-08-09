@@ -77,16 +77,22 @@ namespace xanim_package_compiler
         //--------------------------------------------------------------------------------------
         // Editor-facing view of every clip actually found across every source file - unaffected by
         // descriptor overrides, same role/timing as xskeleton_compiler.cpp's ComputeDetailStructure().
+        // Nested by source file (see xanim_package_details.h's own comment on why) - one `source`
+        // entry per m_ImportSources entry, in the same order, so a source with zero clips (a failed
+        // or animation-less import) still shows up as an empty group rather than disappearing.
         void ComputeDetailStructure()
         {
-            m_Details.m_ClipList.clear();
-            m_Details.m_NumSourceFiles = static_cast<int>(m_Descriptor.m_ImportSources.size());
+            m_Details.m_Sources.clear();
+            for (auto& Source : m_Descriptor.m_ImportSources)
+                m_Details.m_Sources.push_back({ .m_Path = Source.m_Path });
 
             for (auto& Raw : m_RawClips)
             {
-                auto& D = m_Details.m_ClipList.emplace_back();
+                const int iSource = m_Details.findSource(Raw.m_SourceFile);
+                if (iSource == -1) continue; // shouldn't happen - every raw clip is tagged from m_Descriptor.m_ImportSources itself
+                auto& D = m_Details.m_Sources[iSource].m_ClipList.emplace_back();
+
                 D.m_Name              = Raw.m_Anim.m_Name;
-                D.m_SourceFile        = Raw.m_SourceFile;
                 D.m_OriginalFPS       = Raw.m_Anim.m_FPS;
                 D.m_OriginalFrameCount = Raw.m_Anim.m_nFrames;
                 D.m_DurationSeconds   = Raw.m_Anim.m_FPS > 0 ? static_cast<float>(Raw.m_Anim.m_nFrames) / Raw.m_Anim.m_FPS : 0.f;
@@ -100,15 +106,24 @@ namespace xanim_package_compiler
                     D.m_bRootMotionCandidate = (Last - First).Length() > 0.001f;
                 }
             }
-            m_Details.m_NumClips = static_cast<int>(m_Details.m_ClipList.size());
+
+            m_Details.m_NumSourceFiles = static_cast<int>(m_Details.m_Sources.size());
+            m_Details.m_NumClips = 0;
+            for (auto& S : m_Details.m_Sources) m_Details.m_NumClips += static_cast<int>(S.m_ClipList.size());
         }
 
         //--------------------------------------------------------------------------------------
-
-        void CollectOverrides(std::unordered_map<std::string, const xanim_package_desc::clip*>& Map)
+        // Keyed by [SourceFile][OriginalName] - a raw clip's override can only ever be looked up
+        // scoped to the file it actually came from (see xanim_package_desc::clip's own comment on
+        // why matching can't be a flat cross-file map).
+        void CollectOverrides(std::unordered_map<std::wstring, std::unordered_map<std::string, const xanim_package_desc::clip*>>& Map)
         {
-            for (auto& C : m_Descriptor.m_Clips)
-                Map[C.m_Name] = &C;
+            for (auto& Source : m_Descriptor.m_ImportSources)
+            {
+                auto& SourceMap = Map[Source.m_Path];
+                for (auto& C : Source.m_Clips)
+                    SourceMap[C.m_OriginalName] = &C;
+            }
         }
 
         //--------------------------------------------------------------------------------------
@@ -146,31 +161,32 @@ namespace xanim_package_compiler
         {
             const auto& ResolvedBones = Manifest.m_Bones;
 
-            Skip = pOv && pOv->m_bIgnore;
+            Skip = pOv && pOv->m_bDelete;
             if (Skip) return {};
 
-            const std::string  CompiledName = (pOv && !pOv->m_Rename.empty()) ? pOv->m_Rename : Raw.m_Anim.m_Name;
+            const std::string  CompiledName = (pOv && !pOv->m_Name.empty()) ? pOv->m_Name : Raw.m_Anim.m_Name;
             const bool          bLoop        = pOv && pOv->m_bLoop;
             const auto          RootMotion   = pOv ? pOv->m_RootMotion : xanim_package::root_motion_mode::NONE;
-            const int           TargetFPS    = pOv ? pOv->m_TargetFPS : 0;
-            const float         TrimStart    = pOv ? pOv->m_TrimStartTime : -1.f;
-            const float         TrimEnd      = pOv ? pOv->m_TrimEndTime : -1.f;
+            const int           DownsampleFPS  = pOv ? pOv->m_DownsampleFPS : 0;
+            const int           TrimStartFrame = pOv ? pOv->m_TrimStartFrame : -1;
+            const int           TrimEndFrame   = pOv ? pOv->m_TrimEndFrame   : -1;
 
             const int SourceFPS     = Raw.m_Anim.m_FPS;
             const int SourceFrames  = Raw.m_Anim.m_nFrames;
             const int nRawBones     = static_cast<int>(Raw.m_Anim.m_Bone.size());
             const int nSkelBones    = static_cast<int>(ResolvedBones.size());
 
-            if (TargetFPS > SourceFPS)
+            if (DownsampleFPS > SourceFPS)
                 LogMessage(xresource_pipeline::msg_type::WARNING
-                    , std::format("Clip '{}' asked for a target FPS ({}) higher than the imported rate ({}) - keeping the imported rate (no upsampling).", CompiledName, TargetFPS, SourceFPS));
+                    , std::format("Clip '{}' asked to downsample to {} fps, which is higher than the imported rate ({}) - keeping the imported rate (no upsampling).", CompiledName, DownsampleFPS, SourceFPS));
 
-            const int FinalFPS = (TargetFPS > 0 && TargetFPS <= SourceFPS) ? TargetFPS : SourceFPS;
+            const int FinalFPS = (DownsampleFPS > 0 && DownsampleFPS <= SourceFPS) ? DownsampleFPS : SourceFPS;
             const int ResampledFrameCount = (FinalFPS == SourceFPS) ? SourceFrames : std::max(1, static_cast<int>(std::lround(static_cast<double>(SourceFrames) * FinalFPS / SourceFPS)));
 
-            // Trim bounds are evaluated in the FINAL (post-resample) frame domain.
-            const int StartFrame = (TrimStart < 0.f) ? 0 : std::clamp(static_cast<int>(std::lround(TrimStart * FinalFPS)), 0, ResampledFrameCount - 1);
-            const int EndFrame   = (TrimEnd   < 0.f) ? (ResampledFrameCount - 1) : std::clamp(static_cast<int>(std::lround(TrimEnd * FinalFPS)), StartFrame, ResampledFrameCount - 1);
+            // Trim bounds are frame indices directly in the FINAL (post-resample) domain - no unit
+            // conversion needed, just clamp into range.
+            const int StartFrame = (TrimStartFrame < 0) ? 0 : std::clamp(TrimStartFrame, 0, ResampledFrameCount - 1);
+            const int EndFrame   = (TrimEndFrame   < 0) ? (ResampledFrameCount - 1) : std::clamp(TrimEndFrame, StartFrame, ResampledFrameCount - 1);
             const int OutFrames  = EndFrame - StartFrame + 1;
 
             Out.m_NameHash        = xstrtool::CRC32(CompiledName);
@@ -296,6 +312,37 @@ namespace xanim_package_compiler
                 }
             }
 
+            // Seamless-loop correction: raw mocap/imported clips almost never end exactly where they
+            // started, which pops visibly when a looping clip wraps back to frame 0 (the same problem
+            // every major engine's "Loop Pose" / loop-compensation feature exists to fix). Distribute
+            // the frame-0-vs-last-frame discrepancy linearly across every frame (t = f/(nFrames-1)) so
+            // frame 0 is untouched, the last frame exactly matches frame 0, and everything in between
+            // is nudged by an imperceptible, smoothly ramping amount rather than a sudden correction
+            // crammed into just the last few frames. A no-op for any bone that's constant across the
+            // whole clip (rest-pose fallback, or genuinely static) since First == Last already.
+            // Root-motion translation is already pinned flat by the extraction above, so this is a
+            // no-op there too - only rotation/scale (and position on non-root bones) actually move.
+            if (bLoop && OutFrames > 1)
+            {
+                for (int s = 0; s < nSkelBones; ++s)
+                {
+                    const auto  First    = AllKeyFrames[KeyFrameBase + 0 * nSkelBones + s];
+                    const auto  Last     = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(OutFrames - 1) * nSkelBones + s];
+                    const xmath::fvec3 PosDelta   = First.m_Position - Last.m_Position;
+                    const xmath::fvec3 ScaleDelta = First.m_Scale    - Last.m_Scale;
+                    const xmath::fquat RotDelta   = First.m_Rotation * Last.m_Rotation.InverseCopy();
+
+                    for (int f = 1; f < OutFrames; ++f)
+                    {
+                        const float t = static_cast<float>(f) / static_cast<float>(OutFrames - 1);
+                        auto& Key = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + s];
+                        Key.m_Position += PosDelta * t;
+                        Key.m_Scale    += ScaleDelta * t;
+                        Key.m_Rotation  = xmath::fquat::Slerp(xmath::fquat::fromIdentity(), RotDelta, t) * Key.m_Rotation;
+                    }
+                }
+            }
+
             return {};
         }
 
@@ -319,7 +366,7 @@ namespace xanim_package_compiler
 
         xerr BuildFinalPackage()
         {
-            std::unordered_map<std::string, const xanim_package_desc::clip*> Overrides;
+            std::unordered_map<std::wstring, std::unordered_map<std::string, const xanim_package_desc::clip*>> Overrides;
             CollectOverrides(Overrides);
 
             auto& Manifest      = m_Descriptor.m_ResolvedSkeletonBones;
@@ -332,8 +379,12 @@ namespace xanim_package_compiler
 
             for (auto& Raw : m_RawClips)
             {
-                auto  It  = Overrides.find(Raw.m_Anim.m_Name);
-                auto* pOv = (It == Overrides.end()) ? nullptr : It->second;
+                const xanim_package_desc::clip* pOv = nullptr;
+                if (auto SourceIt = Overrides.find(Raw.m_SourceFile); SourceIt != Overrides.end())
+                {
+                    if (auto ClipIt = SourceIt->second.find(Raw.m_Anim.m_Name); ClipIt != SourceIt->second.end())
+                        pOv = ClipIt->second;
+                }
 
                 bool                  Skip = false;
                 xanim_package::clip   Compiled{};
@@ -341,7 +392,7 @@ namespace xanim_package_compiler
                     return Err;
                 if (Skip) continue;
 
-                Names.push_back((pOv && !pOv->m_Rename.empty()) ? pOv->m_Rename : Raw.m_Anim.m_Name);
+                Names.push_back((pOv && !pOv->m_Name.empty()) ? pOv->m_Name : Raw.m_Anim.m_Name);
                 Clips.emplace_back(std::move(Compiled));
             }
 
