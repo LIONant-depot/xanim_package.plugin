@@ -8,7 +8,7 @@
   "PipelinePlugin/TypeName"                  ;string "AnimPackage"
   "PipelinePlugin/FileExtension"             ;wstring "xanim_package"
   "PipelinePlugin/TypeGUID/Value"            ;u64    #E69E8A8439A9BB1B
-  "PipelinePlugin/Icon"                      ;string "\xEE\xAF\x99"
+  "PipelinePlugin/IconPath"                      ;wstring "icon.png"
   "PipelinePlugin/Details/RunAfter[]"        ;s64    1
   "PipelinePlugin/Details/RunAfter[G:0]/Value" ;u64    #F5D3BE1ED860ABF7
   "PipelinePlugin/Details/CompilationScript" ;wstring "Cache\\Plugins\\xanim_package.plugin\\Build\\CreateAndBuildProject.bat"
