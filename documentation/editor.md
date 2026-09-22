@@ -31,6 +31,7 @@ Run as `<resource name>\<Command>`. Paths and values are base64.
 |---|---|
 | `ListClips` | every clip: name, imported name, options, and whether a compiled clip exists |
 | `ListProperties [-Filter text]`, `SetProperty -Path -Value [-Before]` | descriptor properties (undoable); a clip's fields are `AnimPackage/ImportSources[G:s]/Clips[G:c]/<Name, Delete, Loop, DownsampleFPS, TrimStartFrame, TrimEndFrame, RootMotion>`; `RootMotion` takes `None`, `XZ Only` or `XYZ` |
+| `ListOp -Path -Op Insert\|Delete\|Move -Index n [-ToIndex n]` | inserts, deletes or moves an element in the middle of a 1D array property (undoable); ordinal keys only |
 | `SelectClip -Source s -Clip c` | which clip plays (view state) |
 | `Play`, `Pause`, `Seek -Time seconds`, `SetSpeed -Index step`, `PlaybackInfo` | the transport (view state) |
 | `Save`, `Compile`, `Undo`, `Redo` | |
