@@ -450,7 +450,7 @@ namespace xanim_package_editor
             m_Scene.HandleInput();
             if (ImGui::IsItemHovered() && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Space, false) && SelectedClip()) m_bPlaying = !m_bPlaying;
 
-            m_Scene.UpdateView(Avail.x, Avail.y);
+            m_Scene.UpdateView(Min, Avail.x, Avail.y);
             EvaluatePose(*pSkeleton);
 
             const std::vector<bool> NoTwist;
