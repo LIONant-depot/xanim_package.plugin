@@ -7,6 +7,7 @@
 // undoable. A clip plays on the skeleton it is bound to, in a 3D view, with a transport bar and a timeline. Hosts include this header and open
 // editors through xeditor::open_resource_editors.
 #include "source/Tools/Editor/xeditor_descriptor_editor.h"
+#include "dependencies/xeditor/include/xeditor/hint.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_inspector_pickers.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_resources.h"
 #include "plugins/xskeleton.plugin/source/Editor/xskeleton_editor_scene.h"
@@ -70,6 +71,28 @@ namespace xanim_package_editor
     //--------------------------------------------------------------------------------------------
     // The editor
     //--------------------------------------------------------------------------------------------
+    // The Animation Package editor's own actions (Preview/...).
+    struct anim_actions
+    {
+        session* m_pS = nullptr;
+        anim_actions() noexcept = default;
+        explicit anim_actions(session& S) noexcept : m_pS(&S) {}
+
+        void        PlayPause() noexcept;       const char* WhyNoPlayPause() const noexcept;
+
+        XPROPERTY_DEF
+        ( "AnimPackage", anim_actions
+        , obj_scope<"Preview"
+            , obj_action<"PlayPause", &anim_actions::PlayPause
+                , member_help<"Plays or pauses the selected clip in the preview">
+                , ximgui::actions::member_keys<"P">
+                , member_dynamic_reason<+[](const anim_actions& A) noexcept -> const char* { return A.WhyNoPlayPause(); }> >
+            >
+        )
+    };
+    XPROPERTY_REG(anim_actions)
+    XIMGUI_ACTIONS_OWNER(anim_actions)
+
     struct session : xeditor::descriptor_editor
     {
         using desc = xanim_package_desc::descriptor;
@@ -98,6 +121,8 @@ namespace xanim_package_editor
         float                                           m_TimeSeconds = 0.0f;
         int                                             m_LoopsElapsed = 0;
         bool                                            m_bPlaying = false;
+        anim_actions                                    m_EditorActions{ *this };       // this editor's own keys (Preview/...)
+        void RegisterActions(ximgui::actions::context& Ctx) noexcept override { Ctx.Scope(m_EditorActions, "Preview"); }
         int                                             m_iSpeedIndex = xgpu::tools::editors::g_DefaultSpeedIndex;
         xgpu::tools::imgui::timeline::state             m_Timeline;
 
@@ -321,7 +346,7 @@ namespace xanim_package_editor
                 {
                     ImGui::TableSetColumnIndex(Column);
                     ImGui::TableHeader(pLabel);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", pTip);
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text("%s", pTip);
                 };
                 Header(0, "Name",       "Compiled clip name - hover a row's name for its original import stats and source file");
                 Header(1, g_DeleteIcon, "Delete Clip - excluded from the compiled output entirely (still listed here, so it can be re-enabled)");
@@ -377,10 +402,10 @@ namespace xanim_package_editor
                                 if (iDetailsClip != -1)
                                 {
                                     auto& D = m_Details.m_Sources[iDetailsSource].m_ClipList[iDetailsClip];
-                                    ImGui::SetTooltip("Imported as \"%s\"\nSource: %s\n%d fps, %d frames, %.2fs\n(double-click to rename)", Clip.m_OriginalName.c_str(), FileName.empty() ? "(no path set)" : FileName.c_str(), D.m_OriginalFPS, D.m_OriginalFrameCount, D.m_DurationSeconds);
+                                    xeditor::hint::Text("Imported as \"%s\"\nSource: %s\n%d fps, %d frames, %.2fs\n(double-click to rename)", Clip.m_OriginalName.c_str(), FileName.empty() ? "(no path set)" : FileName.c_str(), D.m_OriginalFPS, D.m_OriginalFrameCount, D.m_DurationSeconds);
                                 }
                                 else
-                                    ImGui::SetTooltip("Imported as \"%s\"\nSource: %s (not in the last import)\n(double-click to rename)", Clip.m_OriginalName.c_str(), FileName.empty() ? "(no path set)" : FileName.c_str());
+                                    xeditor::hint::Text("Imported as \"%s\"\nSource: %s (not in the last import)\n(double-click to rename)", Clip.m_OriginalName.c_str(), FileName.empty() ? "(no path set)" : FileName.c_str());
                             }
                         }
 
@@ -448,7 +473,7 @@ namespace xanim_package_editor
             ImGui::GetWindowDrawList()->AddRectFilled(Min, ImVec2(Min.x + Avail.x, Min.y + Avail.y), IM_COL32(115, 115, 115, 255));        // the depth tint fades toward this
             ImGui::InvisibleButton("##AnimViewport", Avail, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
             m_Scene.HandleInput();
-            if (ImGui::IsItemHovered() && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Space, false) && SelectedClip()) m_bPlaying = !m_bPlaying;
+            // Play / pause is the AnimPackage/Preview/PlayPause action (P; Space belongs to the drawer).
 
             m_Scene.UpdateView(Min, Avail.x, Avail.y);
             EvaluatePose(*pSkeleton);
@@ -473,17 +498,17 @@ namespace xanim_package_editor
             const float Length = ClipLength(*pClip);
 
             if (ImGui::Button(m_bPlaying ? ed::g_PauseIcon : ed::g_PlayIcon)) m_bPlaying = !m_bPlaying;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(m_bPlaying ? "Pause" : "Play");
+            if (ImGui::IsItemHovered()) xeditor::hint::Text(m_bPlaying ? "Pause" : "Play");
             ImGui::SameLine();
             if (ImGui::Button(ed::g_GoToStartIcon)) { m_TimeSeconds = 0.0f; m_LoopsElapsed = 0; }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Go to start");
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("Go to start");
             ImGui::SameLine();
             if (ImGui::Button(ed::g_GoToEndIcon)) m_TimeSeconds = Length;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Go to end");
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("Go to end");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(140.0f);
             ImGui::SliderInt("##speed", &m_iSpeedIndex, 0, ed::g_NumPlaybackSpeeds - 1, ed::g_PlaybackSpeedLabels[m_iSpeedIndex]);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Playback speed");
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("Playback speed");
 
             const char* pName = nullptr;
             if (auto* pDesc = Desc(); pDesc && m_iSelectedSource >= 0 && m_iSelectedSource < int(pDesc->m_ImportSources.size()))
@@ -570,6 +595,9 @@ namespace xanim_package_editor
         }
         return {};
     }
+
+    inline const char* anim_actions::WhyNoPlayPause() const noexcept { return m_pS->SelectedClip() ? nullptr : "select a clip first"; }
+    inline void anim_actions::PlayPause() noexcept { m_pS->m_bPlaying = !m_pS->m_bPlaying; }
 
     inline const xeditor::auto_register_resource_editor g_Registration
     { xrsc::anim_package_type_guid_v
