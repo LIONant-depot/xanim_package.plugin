@@ -472,6 +472,7 @@ namespace xanim_package_editor
             const ImVec2 Min   = ImGui::GetCursorScreenPos();
             ImGui::GetWindowDrawList()->AddRectFilled(Min, ImVec2(Min.x + Avail.x, Min.y + Avail.y), IM_COL32(115, 115, 115, 255));        // the depth tint fades toward this
             ImGui::InvisibleButton("##AnimViewport", Avail, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
+            xeditor::PreviewGestures();
             m_Scene.HandleInput();
             // Play / pause is the AnimPackage/Preview/PlayPause action (P; Space belongs to the drawer).
 
