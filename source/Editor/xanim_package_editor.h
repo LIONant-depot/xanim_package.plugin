@@ -7,8 +7,8 @@
 // undoable. A clip plays on the skeleton it is bound to, in a 3D view, with a transport bar and a timeline. Hosts include this header and open
 // editors through xeditor::open_resource_editors.
 #include "source/Tools/Editor/xeditor_descriptor_editor.h"
-#include "dependencies/xresource_pipeline_v2/source/editor/E10_InspectorPickers.h"
-#include "dependencies/xresource_pipeline_v2/source/editor/E10_Resources.h"
+#include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_inspector_pickers.h"
+#include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_resources.h"
 #include "plugins/xskeleton.plugin/source/Editor/xskeleton_editor_scene.h"
 #include "plugins/xanim_package.plugin/source/xanim_package.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_descriptor.h"
@@ -101,7 +101,7 @@ namespace xanim_package_editor
         int                                             m_iSpeedIndex = xgpu::tools::editors::g_DefaultSpeedIndex;
         xgpu::tools::imgui::timeline::state             m_Timeline;
 
-        session(xresource::full_guid Guid, e10::library::guid LibraryGuid, xgpu::device* pDevice) noexcept
+        session(xresource::full_guid Guid, xresource_editor::library::guid LibraryGuid, xgpu::device* pDevice) noexcept
             : descriptor_editor("AnimPackage", Guid, LibraryGuid, pDevice)
             , m_SelectClip(m_Undo, *this, playback_cmd::kind::select_clip, "SelectClip", "Selects a clip to preview. Usage: SelectClip -Source index -Clip index (see ListClips)")
             , m_Play      (m_Undo, *this, playback_cmd::kind::play,        "Play",       "Plays the selected clip. Usage: Play")
@@ -116,7 +116,7 @@ namespace xanim_package_editor
             m_Document.m_TolerateReadError = [](const xresource_pipeline::descriptor::base& D) { return !static_cast<const desc&>(D).m_SkeletonRef.empty(); };
             m_Document.Load();
             BindDescriptorInspector();
-            e10::WireResourcePickerCallbacks(m_DescriptorInspector.m_Inspector);
+            xresource_editor::WireResourcePickerCallbacks(m_DescriptorInspector.m_Inspector);
             MergeDetails();
 
             AddPanel("Clips",                dock::right,  [this] { RenderClips(); });
@@ -438,7 +438,7 @@ namespace xanim_package_editor
         {
             auto* pHost   = xeditor::host::current();
             auto* pWindow = pHost ? pHost->find<xgpu::window>() : nullptr;
-            if (!m_bReady || !pWindow) { ImGui::TextDisabled("The 3D view needs a GPU device (open from E29)."); return; }
+            if (!m_bReady || !pWindow) { ImGui::TextDisabled("The 3D view needs a GPU device (open from the editor)."); return; }
             if (!m_bShowable) { ImGui::TextWrapped("%s", m_ErrorMessage.empty() ? "Nothing to show." : m_ErrorMessage.c_str()); return; }
             auto* pSkeleton = xresource::g_Mgr.getResource(m_SkeletonRef);
             if (!pSkeleton) return;
@@ -573,7 +573,7 @@ namespace xanim_package_editor
 
     inline const xeditor::auto_register_resource_editor g_Registration
     { xrsc::anim_package_type_guid_v
-    , [](xresource::full_guid Guid, e10::library::guid LibraryGuid, xgpu::device* pDevice) -> std::unique_ptr<xeditor::resource_editor>
+    , [](xresource::full_guid Guid, xresource_editor::library::guid LibraryGuid, xgpu::device* pDevice) -> std::unique_ptr<xeditor::resource_editor>
       { return std::make_unique<session>(Guid, LibraryGuid, pDevice); }
     };
 }
