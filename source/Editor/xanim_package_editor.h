@@ -298,7 +298,7 @@ namespace xanim_package_editor
 
         void SetClipProperty(int iSource, int iClip, const char* pField, const std::string& Value, const std::string& Before) noexcept
         {
-            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Base64Encode(ClipPath(iSource, iClip, pField)), xeditor::Base64Encode(Value), xeditor::Base64Encode(Before)));
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(ClipPath(iSource, iClip, pField)), xeditor::Quote(Value), xeditor::Quote(Before)));
         }
 
         // An integer field: typed straight into the descriptor while it is edited, reported as one command when the edit ends

@@ -25,7 +25,7 @@ A clip that is marked for delete, or whose name changed since the last compile, 
 
 ## Commands
 
-Run as `<resource name>\<Command>`. Paths and values are base64.
+Run as `<resource name>\<Command>`. Paths and values are text, in quotes.
 
 | Command | |
 |---|---|
