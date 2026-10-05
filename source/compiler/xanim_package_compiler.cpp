@@ -458,6 +458,12 @@ namespace xanim_package_compiler
             // Load the source data
             //
             displayProgressBar("Importing Animations", 0);
+
+            // Every source file is a dependency of this resource, registered BEFORE loading them (a broken link still shows as a dependent of the file): it is what the Assets tab counts
+            // (the #N of the file) and lists (Find Resource / Open Resource), and what makes a change of a file compile this resource again.
+            for (auto& Source : m_Descriptor.m_ImportSources)
+                if (!Source.m_Path.empty()) m_Dependencies.m_Assets.push_back(Source.m_Path);
+
             if (auto Err = LoadRaw(); Err)
                 return Err;
             displayProgressBar("Importing Animations", 1);
