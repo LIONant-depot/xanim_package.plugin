@@ -2,10 +2,12 @@
 // New Types
 < s32:d u32:g s16:C u16:H s8:c u8:h f32:f f64:F string:s wstring:S u64:G s64:D bool:c enum:s >
 
-[ xProperties : 10 ]
+[ xProperties : 12 ]
 { Name:s                            Value:?                   }
 //--------------------------------  -------------------------
   "PipelinePlugin/TypeName"                  ;string "AnimPackage"
+  "PipelinePlugin/Group"                     ;string "Animation"
+  "PipelinePlugin/Description"               ;string "A set of animations that play on a skeleton."
   "PipelinePlugin/FileExtension"             ;wstring "xanim_package"
   "PipelinePlugin/TypeGUID/Value"            ;u64    #E69E8A8439A9BB1B
   "PipelinePlugin/IconPaths[]"                      ;s64    1
