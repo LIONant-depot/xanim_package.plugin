@@ -15,7 +15,7 @@
 #include "plugins/xanim_package.plugin/source/xanim_package_descriptor.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.cpp"        // the resource loader: compiled once, in the host's translation unit
-#include "source/tools/xgpu_imgui_timeline.h"
+#include "source/Tools/xgpu_imgui_timeline.h"
 
 #include <charconv>
 
