@@ -7,6 +7,7 @@
 // undoable. A clip plays on the skeleton it is bound to, in a 3D view, with a transport bar and a timeline. Hosts include this header and open
 // editors through xeditor::open_resource_editors.
 #include "source/Tools/Editor/xeditor_descriptor_editor.h"
+#include "source/Tools/Editor/xeditor_camera_toolbar.h"
 #include "dependencies/xeditor/include/xeditor/hint.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_inspector_pickers.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_resources.h"
@@ -100,6 +101,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
 
         xskeleton_editor::scene                         m_Scene;
+        xeditor::camera_toolbar                         m_CameraToolbar;
         xeditor::camera_cmds                            m_CameraCmds;
         xrsc::anim_package                              m_Ref;
         xrsc::skeleton                                  m_SkeletonRef;
@@ -145,6 +147,7 @@ namespace xanim_package_editor
             MergeDetails();
 
             AddPanel("Clips",                dock::right,  [this] { RenderClips(); });
+            if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value);
             AddPanel("AnimPackage Viewport", dock::center, [this] { RenderViewport(); }, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             AddPanel("Playback",             dock::bottom, [this] { RenderPlayback(); });
             AddPanel("Description",          dock::left,   [this] { m_DescriptorInspector.Show(); });
@@ -461,6 +464,11 @@ namespace xanim_package_editor
 
         void RenderViewport() noexcept
         {
+            m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Scene.m_State, [this] { RenderViewportBody(); });
+        }
+
+        void RenderViewportBody() noexcept
+        {
             auto* pHost   = xeditor::host::current();
             auto* pWindow = pHost ? pHost->find<xgpu::window>() : nullptr;
             if (!m_bReady || !pWindow) { ImGui::TextDisabled("The 3D view needs a GPU device (open from the editor)."); return; }
@@ -489,6 +497,7 @@ namespace xanim_package_editor
             {
                 if (m_bOpen) m_Scene.Draw(CmdBuffer);
             });
+            m_Scene.DrawOverlay();
         }
 
         void RenderPlayback() noexcept
