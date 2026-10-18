@@ -464,6 +464,13 @@ namespace xanim_package_compiler
             for (auto& Source : m_Descriptor.m_ImportSources)
                 if (!Source.m_Path.empty()) m_Dependencies.m_Assets.push_back(Source.m_Path);
 
+            // The package follows its skeleton (its PreTransform is applied to the root's keys, its bones are what the curves bind to): it compiles again whenever the skeleton does
+            if (!m_Descriptor.m_SkeletonRef.empty())
+            {
+                m_Dependencies.m_Resources.push_back({ m_Descriptor.m_SkeletonRef.m_Instance, xrsc::skeleton_type_guid_v });
+                m_Dependencies.m_Assets.push_back(xskeleton_desc::ManifestRelativePath(m_Descriptor.m_SkeletonRef.m_Instance.m_Value));
+            }
+
             if (auto Err = LoadRaw(); Err)
                 return Err;
             displayProgressBar("Importing Animations", 1);
