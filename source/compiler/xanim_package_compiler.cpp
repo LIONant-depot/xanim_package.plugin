@@ -248,33 +248,34 @@ namespace xanim_package_compiler
                 if (ResolvedBones[s].m_iParent < 0) { iSkelRoot = s; break; }
             const bool bHaveAnimatedRoot = (iSkelRoot != -1) && (SkelToRaw[iSkelRoot] != -1);
 
-            // Apply the skeleton's own author-time PreTransform to the animated root bone's curve -
-            // mirrors xskeleton_compiler.cpp's ApplyPreTransform() exactly (root-only; every
-            // descendant inherits the correction for free through the normal parent-multiply FK chain
-            // at playback). This clip's raw import never passes through the skeleton's own import
-            // step, so without this the animated root stays in raw-import space while the skeleton's
-            // rest pose (and every unanimated bone's fallback here, both already-corrected via the
-            // manifest) sit in engine space - a visible scale/offset mismatch between the two.
-            if (bHaveAnimatedRoot
-                && (Manifest.m_PreTransformScale != xmath::fvec3::fromOne()
-                 || Manifest.m_PreTransformRotationDeg != xmath::fvec3::fromZero()
-                 || Manifest.m_PreTransformTranslation != xmath::fvec3::fromZero()))
+            // The root bone's curve is put in the skeleton's space: first the package's PostTransform (the artist rotated the model while animating it), then
+            // the skeleton's PreTransform, which mirrors xskeleton_compiler.cpp's ApplyPreTransform() exactly (root-only; every descendant inherits the
+            // correction for free through the normal parent-multiply FK chain at playback). This clip's raw import never passes through the skeleton's own
+            // import step, so without the PreTransform the animated root stays in raw-import space while the skeleton's rest pose (and every unanimated
+            // bone's fallback here, both already-corrected via the manifest) sit in engine space - a visible scale/offset mismatch between the two. Only
+            // meaningful if that skeleton bone's slot actually came from this raw clip's animated data (see the SkelToRaw construction above) - never the
+            // rest-pose fallback.
+            const auto ApplyToRoot = [&](const xmath::fvec3& Scale, const xmath::fvec3& RotationDeg, const xmath::fvec3& Translation)
             {
+                if (!bHaveAnimatedRoot || (Scale == xmath::fvec3::fromOne() && RotationDeg == xmath::fvec3::fromZero() && Translation == xmath::fvec3::fromZero())) return;
+
                 xmath::radian3 Rot;
-                Rot.m_Roll  = xmath::radian{ xmath::DegToRad(Manifest.m_PreTransformRotationDeg.m_Z) };
-                Rot.m_Pitch = xmath::radian{ xmath::DegToRad(Manifest.m_PreTransformRotationDeg.m_X) };
-                Rot.m_Yaw   = xmath::radian{ xmath::DegToRad(Manifest.m_PreTransformRotationDeg.m_Y) };
-                const xmath::fquat PreQuat(Rot);
-                const xmath::fmat4 M(Manifest.m_PreTransformScale, PreQuat, Manifest.m_PreTransformTranslation);
+                Rot.m_Roll  = xmath::radian{ xmath::DegToRad(RotationDeg.m_Z) };
+                Rot.m_Pitch = xmath::radian{ xmath::DegToRad(RotationDeg.m_X) };
+                Rot.m_Yaw   = xmath::radian{ xmath::DegToRad(RotationDeg.m_Y) };
+                const xmath::fquat Quat(Rot);
+                const xmath::fmat4 M(Scale, Quat, Translation);
 
                 for (int f = 0; f < OutFrames; ++f)
                 {
                     auto& RootKey      = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot];
                     RootKey.m_Position = M * RootKey.m_Position;
-                    RootKey.m_Rotation = PreQuat * RootKey.m_Rotation;
-                    RootKey.m_Scale    = Manifest.m_PreTransformScale * RootKey.m_Scale;
+                    RootKey.m_Rotation = Quat * RootKey.m_Rotation;
+                    RootKey.m_Scale    = Scale * RootKey.m_Scale;
                 }
-            }
+            };
+            ApplyToRoot(m_Descriptor.m_PostTransform.m_Scale, m_Descriptor.m_PostTransform.m_Rotation, m_Descriptor.m_PostTransform.m_Translation);
+            ApplyToRoot(Manifest.m_PreTransformScale, Manifest.m_PreTransformRotationDeg, Manifest.m_PreTransformTranslation);
 
             if (RootMotion != xanim_package::root_motion_mode::NONE)
             {

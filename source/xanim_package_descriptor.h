@@ -68,6 +68,22 @@ namespace xanim_package_desc
     };
     XPROPERTY_REG(import_source)
 
+    // Applied to the root bone of every frame of every clip of the package when it compiles (nothing of it is stored or evaluated at runtime)
+    struct post_transform
+    {
+        xmath::fvec3        m_Scale         = xmath::fvec3::fromOne();
+        xmath::fvec3        m_Rotation      = xmath::fvec3::fromZero();   // degrees (X pitch, Y yaw, Z roll: same as the skeleton's PreTransform)
+        xmath::fvec3        m_Translation   = xmath::fvec3::fromZero();
+
+        XPROPERTY_DEF
+        ( "PostTransform", post_transform
+        , obj_member<"Scale",       &post_transform::m_Scale >
+        , obj_member<"Rotation",    &post_transform::m_Rotation >
+        , obj_member<"Translation", &post_transform::m_Translation >
+        )
+    };
+    XPROPERTY_REG(post_transform)
+
     struct descriptor : xresource_pipeline::descriptor::base
     {
         using parent = xresource_pipeline::descriptor::base;
@@ -187,6 +203,7 @@ namespace xanim_package_desc
 
         std::vector<import_source>     m_ImportSources         = {};   // the "official list" of source files - each owns its own clips now (see import_source)
         xrsc::skeleton                  m_SkeletonRef           = {};   // required - Validate() errors if empty
+        post_transform                  m_PostTransform         = {};   // the artist may have rotated the model while animating it: this puts every clip back, before the skeleton's PreTransform
 
         xskeleton_desc::bone_manifest   m_ResolvedSkeletonBones = {};   // NOT saved - populated in Serialize() above
 
@@ -194,6 +211,7 @@ namespace xanim_package_desc
         ( "AnimPackage", descriptor
         , obj_member<"ImportSources",           &descriptor::m_ImportSources >
         , obj_member<"SkeletonRef",             &descriptor::m_SkeletonRef >
+        , obj_member<"PostTransform",           &descriptor::m_PostTransform, member_help<"Applied to the root bone of every frame of every clip, before the skeleton's PreTransform. Use it when the skeleton looks right but its animations do not (the model was rotated while it was animated). It is baked into the clips: no runtime cost, no extra storage.">>
         , obj_member<"ResolvedSkeletonBones",   &descriptor::m_ResolvedSkeletonBones, member_flags<flags::DONT_SHOW, flags::DONT_SAVE> >
         )
     };
