@@ -353,7 +353,7 @@ namespace xanim_package_editor
                 };
                 Header(0, "Name",       "Compiled clip name - hover a row's name for its original import stats and source file");
                 Header(1, g_DeleteIcon, "Delete Clip - excluded from the compiled output entirely (still listed here, so it can be re-enabled)");
-                Header(2, "Loop",       "Loop - play this clip as a seamless loop; the compiler blends out any start/end pose mismatch automatically");
+                Header(2, "Loop",       "Loop - the clip repeats when it reaches its end; its frames are not changed");
                 Header(3, "DS",         "Down Sample - 0 = keep the imported 60fps rate; lower it (e.g. 30) only to trade quality for memory");
                 Header(4, "In",         "Trim In - first frame to keep (post-resample), -1 = from the start");
                 Header(5, "Out",        "Trim Out - last frame to keep (post-resample), -1 = to the end");

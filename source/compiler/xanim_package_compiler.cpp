@@ -312,36 +312,8 @@ namespace xanim_package_compiler
                 }
             }
 
-            // Seamless-loop correction: raw mocap/imported clips almost never end exactly where they
-            // started, which pops visibly when a looping clip wraps back to frame 0 (the same problem
-            // every major engine's "Loop Pose" / loop-compensation feature exists to fix). Distribute
-            // the frame-0-vs-last-frame discrepancy linearly across every frame (t = f/(nFrames-1)) so
-            // frame 0 is untouched, the last frame exactly matches frame 0, and everything in between
-            // is nudged by an imperceptible, smoothly ramping amount rather than a sudden correction
-            // crammed into just the last few frames. A no-op for any bone that's constant across the
-            // whole clip (rest-pose fallback, or genuinely static) since First == Last already.
-            // Root-motion translation is already pinned flat by the extraction above, so this is a
-            // no-op there too - only rotation/scale (and position on non-root bones) actually move.
-            if (bLoop && OutFrames > 1)
-            {
-                for (int s = 0; s < nSkelBones; ++s)
-                {
-                    const auto  First    = AllKeyFrames[KeyFrameBase + 0 * nSkelBones + s];
-                    const auto  Last     = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(OutFrames - 1) * nSkelBones + s];
-                    const xmath::fvec3 PosDelta   = First.m_Position - Last.m_Position;
-                    const xmath::fvec3 ScaleDelta = First.m_Scale    - Last.m_Scale;
-                    const xmath::fquat RotDelta   = First.m_Rotation * Last.m_Rotation.InverseCopy();
-
-                    for (int f = 1; f < OutFrames; ++f)
-                    {
-                        const float t = static_cast<float>(f) / static_cast<float>(OutFrames - 1);
-                        auto& Key = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + s];
-                        Key.m_Position += PosDelta * t;
-                        Key.m_Scale    += ScaleDelta * t;
-                        Key.m_Rotation  = xmath::fquat::Slerp(xmath::fquat::fromIdentity(), RotDelta, t) * Key.m_Rotation;
-                    }
-                }
-            }
+            // Loop only flags the clip: the clip's frames are the source's, untouched. Wrapping from the last frame to the first is the player's job
+            // (a clip that does not end where it began is not made to: that would change every frame of it)
 
             return {};
         }
