@@ -379,6 +379,23 @@ namespace xanim_package_compiler
 
             for (auto& Raw : m_RawClips)
             {
+                // The skeleton keeps only its runtime joints (xraw3d anim::RuntimeJoints): fold the clip's other nodes the same way, so
+                // their motion is baked into the joints below them (documentation/Editors/skeleton_runtime_folding_plan.md)
+                {
+                    std::vector<bool> Keep(Raw.m_Anim.m_Bone.size(), false);
+                    for (std::size_t r = 0; r < Keep.size(); ++r)
+                        Keep[r] = std::any_of(ResolvedBones.begin(), ResolvedBones.end(), [&](const auto& B) { return B.m_Name == Raw.m_Anim.m_Bone[r].m_Name; });
+                    const bool bSyntheticRoot = !ResolvedBones.empty() && ResolvedBones[0].m_Name == xraw3d::anim::synthetic_root_name_v;
+                    const bool bFolds         = bSyntheticRoot || std::find(Keep.begin(), Keep.end(), false) != Keep.end();
+                    if (bFolds && std::find(Keep.begin(), Keep.end(), true) != Keep.end())
+                    {
+                        const auto nBefore = Raw.m_Anim.m_Bone.size();
+                        for (auto& Name : Raw.m_Anim.FoldBones(Keep, bSyntheticRoot))
+                            LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': node '{}' kept, folding it would not fit translation/rotation/scale", Raw.m_Anim.m_Name, Name));
+                        LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': {} source nodes folded into the skeleton's joints", Raw.m_Anim.m_Name, nBefore - (Raw.m_Anim.m_Bone.size() - (bSyntheticRoot ? 1 : 0))));
+                    }
+                }
+
                 const xanim_package_desc::clip* pOv = nullptr;
                 if (auto SourceIt = Overrides.find(Raw.m_SourceFile); SourceIt != Overrides.end())
                 {
