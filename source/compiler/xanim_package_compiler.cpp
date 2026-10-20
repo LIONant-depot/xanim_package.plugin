@@ -248,16 +248,18 @@ namespace xanim_package_compiler
                 if (ResolvedBones[s].m_iParent < 0) { iSkelRoot = s; break; }
             const bool bHaveAnimatedRoot = (iSkelRoot != -1) && (SkelToRaw[iSkelRoot] != -1);
 
-            // The root bone's curve is put in the skeleton's space: first the package's PostTransform (the artist rotated the model while animating it), then
+            // The root bone's curve is put in the skeleton's space: first the skeleton's PostTransform (the artist rotated the model while animating it), then
             // the skeleton's PreTransform, which mirrors xskeleton_compiler.cpp's ApplyPreTransform() exactly (root-only; every descendant inherits the
             // correction for free through the normal parent-multiply FK chain at playback). This clip's raw import never passes through the skeleton's own
             // import step, so without the PreTransform the animated root stays in raw-import space while the skeleton's rest pose (and every unanimated
             // bone's fallback here, both already-corrected via the manifest) sit in engine space - a visible scale/offset mismatch between the two. Only
             // meaningful if that skeleton bone's slot actually came from this raw clip's animated data (see the SkelToRaw construction above) - never the
             // rest-pose fallback.
-            const auto ApplyToRoot = [&](const xmath::fvec3& Scale, const xmath::fvec3& RotationDeg, const xmath::fvec3& Translation)
+            const auto ApplyToRoot = [&](const char* pName, const xmath::fvec3& Scale, const xmath::fvec3& RotationDeg, const xmath::fvec3& Translation)
             {
                 if (!bHaveAnimatedRoot || (Scale == xmath::fvec3::fromOne() && RotationDeg == xmath::fvec3::fromZero() && Translation == xmath::fvec3::fromZero())) return;
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the skeleton's {} is applied to its root (scale {:.4f} {:.4f} {:.4f}, rotation {:.2f} {:.2f} {:.2f}, translation {:.4f} {:.4f} {:.4f})"
+                    , CompiledName, pName, Scale.m_X, Scale.m_Y, Scale.m_Z, RotationDeg.m_X, RotationDeg.m_Y, RotationDeg.m_Z, Translation.m_X, Translation.m_Y, Translation.m_Z));
 
                 xmath::radian3 Rot;
                 Rot.m_Roll  = xmath::radian{ xmath::DegToRad(RotationDeg.m_Z) };
@@ -274,8 +276,44 @@ namespace xanim_package_compiler
                     RootKey.m_Scale    = Scale * RootKey.m_Scale;
                 }
             };
-            ApplyToRoot(m_Descriptor.m_PostTransform.m_Scale, m_Descriptor.m_PostTransform.m_Rotation, m_Descriptor.m_PostTransform.m_Translation);
-            ApplyToRoot(Manifest.m_PreTransformScale, Manifest.m_PreTransformRotationDeg, Manifest.m_PreTransformTranslation);
+            ApplyToRoot("PostTransform", Manifest.m_PostTransformScale, Manifest.m_PostTransformRotationDeg, Manifest.m_PostTransformTranslation);
+            ApplyToRoot("PreTransform", Manifest.m_PreTransformScale, Manifest.m_PreTransformRotationDeg, Manifest.m_PreTransformTranslation);
+            if (bHaveAnimatedRoot)
+            {
+                // where the clip puts the root on its first frame, next to where the frozen pose has it: the two agree when the skeleton, its frozen pose and its animations are in the same space
+                const auto& Root0 = AllKeyFrames[KeyFrameBase + iSkelRoot].m_Position;
+                const auto& Rest  = ResolvedBones[iSkelRoot].m_RestPosition;
+                const auto& Rot0  = AllKeyFrames[KeyFrameBase + iSkelRoot].m_Rotation;
+                const auto  RestQ = xmath::fquat(ResolvedBones[iSkelRoot].m_RestRotX, ResolvedBones[iSkelRoot].m_RestRotY, ResolvedBones[iSkelRoot].m_RestRotZ, ResolvedBones[iSkelRoot].m_RestRotW);
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the root is at {:.4f} {:.4f} {:.4f} on its first frame, the frozen pose has it at {:.4f} {:.4f} {:.4f}", CompiledName, Root0.m_X, Root0.m_Y, Root0.m_Z, Rest.m_X, Rest.m_Y, Rest.m_Z));
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the root turns (quaternion {:.4f} {:.4f} {:.4f} {:.4f}) on its first frame, the frozen pose has it turned {:.4f} {:.4f} {:.4f} {:.4f}", CompiledName, Rot0.m_X, Rot0.m_Y, Rot0.m_Z, Rot0.m_W, RestQ.m_X, RestQ.m_Y, RestQ.m_Z, RestQ.m_W));
+                // the bones where the first frame of the clip is not the rest pose: the angle between the two rotations of the bone (the first few; a bone the clip does not animate is the rest pose)
+                {
+                    std::string Worst;
+                    int nShown = 0;
+                    for (int b = 0; b < nSkelBones && nShown < 6; ++b)
+                    {
+                        const auto& Q  = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(b)].m_Rotation;
+                        const xmath::fquat R(ResolvedBones[b].m_RestRotX, ResolvedBones[b].m_RestRotY, ResolvedBones[b].m_RestRotZ, ResolvedBones[b].m_RestRotW);
+                        const float Dot = std::min(1.0f, std::abs(R.m_X * Q.m_X + R.m_Y * Q.m_Y + R.m_Z * Q.m_Z + R.m_W * Q.m_W));
+                        const float Deg = 2.0f * std::acos(Dot) * 57.29578f;
+                        if (Deg > 5.0f) { Worst += std::format(" [{} '{}' {:.1f} deg]", b, ResolvedBones[b].m_Name, Deg); ++nShown; }
+                    }
+                    LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': bones whose first frame is more than 5 degrees from the frozen pose (first six):{}", CompiledName, Worst.empty() ? std::string(" none") : Worst));
+                }
+                // how far the root's rotation goes from the first frame over the clip (a clip whose root turns while it plays is not at the frozen pose's orientation after its first frame)
+                {
+                    float MaxDeg = 0.0f; int MaxFrame = 0; xmath::fquat MaxQ = Rot0;
+                    for (int f = 1; f < OutFrames; ++f)
+                    {
+                        const auto& Q   = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot].m_Rotation;
+                        const float Dot = std::min(1.0f, std::abs(Rot0.m_X * Q.m_X + Rot0.m_Y * Q.m_Y + Rot0.m_Z * Q.m_Z + Rot0.m_W * Q.m_W));
+                        const float Deg = 2.0f * std::acos(Dot) * 57.29578f;
+                        if (Deg > MaxDeg) { MaxDeg = Deg; MaxFrame = f; MaxQ = Q; }
+                    }
+                    LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': over {} frames the root's rotation goes at most {:.2f} degrees from its first frame (at frame {}, quaternion {:.4f} {:.4f} {:.4f} {:.4f})", CompiledName, OutFrames, MaxDeg, MaxFrame, MaxQ.m_X, MaxQ.m_Y, MaxQ.m_Z, MaxQ.m_W));
+                }
+            }
 
             if (RootMotion != xanim_package::root_motion_mode::NONE)
             {
