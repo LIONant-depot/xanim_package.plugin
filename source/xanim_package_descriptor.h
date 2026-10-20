@@ -76,6 +76,8 @@ namespace xanim_package_desc
         {
         }
 
+        std::string SuggestedName() const noexcept override { return m_ImportSources.empty() ? std::string{} : NameOfFile(m_ImportSources.front().m_Path); }
+
         void Validate(std::vector<std::string>& Errors) const noexcept override
         {
             if (m_SkeletonRef.empty())
