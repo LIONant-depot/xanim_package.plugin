@@ -7,11 +7,6 @@
 int main( int argc, const char* argv[] )
 {
     //
-    // Initialize the scheduler system with all hardware threads
-    //
-    xscheduler::g_System.Init();
-
-    //
    // Create the compiler instance
    //
     auto AnimPackageCompilerPipeline = xanim_package_compiler::instance::Create();
@@ -56,6 +51,9 @@ int main( int argc, const char* argv[] )
     //
     // Start compilation
     //
+    // The scheduler with the threads the editor gave this compile (-THREADS; every core without it)
+    xscheduler::g_System.Init(AnimPackageCompilerPipeline->getThreadCount());
+
     if (auto Err = AnimPackageCompilerPipeline->Compile(); Err)
     {
         Err.ForEachInChain([&](xerr Error)
