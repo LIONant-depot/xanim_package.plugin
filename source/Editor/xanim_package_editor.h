@@ -17,6 +17,10 @@
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.cpp"        // the resource loader: compiled once, in the host's translation unit
 #include "source/Tools/xgpu_imgui_timeline.h"
+#include "plugins/xretarget.plugin/source/xretarget_descriptor.h"
+#include "plugins/xretarget.plugin/source/xretarget_mapping.h"
+#include "dependencies/xAnimation/source/xanimation.h"
+#include "plugins/xanim_package.plugin/source/Editor/xanim_package_kimodo.h"
 
 #include <charconv>
 
@@ -44,7 +48,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips };
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info };
 
         session&    m_Session;
         kind        m_Kind;
@@ -61,12 +65,18 @@ namespace xanim_package_editor
             case kind::select_clip: m_hA = m_Parser.addOption("Source", "Import source index",       true, 1); m_hB = m_Parser.addOption("Clip", "Clip index in that source", true, 1); break;
             case kind::seek:        m_hA = m_Parser.addOption("Time",   "Seconds from the clip start", true, 1); break;
             case kind::set_speed:   m_hA = m_Parser.addOption("Index",  "Playback speed step (0.25x .. 3x)", true, 1); break;
+            case kind::kimodo_generate:
+                m_hA = m_Parser.addOption("Prompt",  "What the motion is, in words", true, 1);
+                m_hB = m_Parser.addOption("Seconds", "Length in seconds (default 5)", false, 1);
+                m_hC = m_Parser.addOption("Seed",    "Seed (default 1): another seed, another take", false, 1);
+                break;
+            case kind::kimodo_accept: m_hA = m_Parser.addOption("Name", "The clip's file name (default: from the prompt)", false, 1); break;
             default: break;
             }
         }
         std::string Query() noexcept override;
 
-        xcmdline::parser::handle m_hA, m_hB;
+        xcmdline::parser::handle m_hA, m_hB, m_hC;
     };
 
     //--------------------------------------------------------------------------------------------
@@ -99,6 +109,46 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
+
+        // Kimodo (text to motion): one generation at a time; its result previews until accepted or discarded
+        struct kimodo_state
+        {
+            kimodo::job                                 m_Job;
+            kimodo::bvh                                 m_Preview;              // the generated motion, not in the assets yet
+            bool                                        m_bPreview = false;
+            float                                       m_Time = 0.0f;
+            bool                                        m_bPlaying = true;
+            char                                        m_Prompt[1024] = "A person walks forward.";
+            char                                        m_Name[128] = "";
+            float                                       m_Seconds = 5.0f;
+            int                                         m_Seed = 1;
+            std::string                                 m_PromptUsed;           // what the preview was made from
+            float                                       m_SecondsUsed = 0.0f;
+            int                                         m_SeedUsed = 0;
+            std::string                                 m_Status;               // the last result, said in words
+            bool                                        m_bStatusError = false;
+            xrsc::skeleton                              m_SkeletonRef;          // the Kimodo Retarget's Source (SOMA 77): the preview draws on it
+            std::vector<int>                            m_BoneToJoint;          // that skeleton's bone -> the BVH joint of the same name
+            std::vector<xskeleton_editor::bone_world>   m_Bones;
+            std::vector<float>                          m_Pos, m_World;
+
+            // the preview on THIS package's skeleton: the compiler's own retarget path (the Retarget's mapping, ToSkeletonSpace, BakeFrames) run on the BVH
+            struct retarget_ctx
+            {
+                xretarget_desc::descriptor              m_Descriptor;   // the mapping keeps views into its manifests: it lives as long as the mapping
+                xretarget_desc::mapping                 m_Mapping;
+                xanimation::retargeter                  m_Retargeter;
+                std::uint64_t                           m_Key = 0;
+            };
+            std::unique_ptr<retarget_ctx>               m_pRetarget;
+            std::vector<xmath::transform3>              m_Baked;                // [frame][package skeleton bone], local
+            int                                         m_nDst = 0;
+            std::string                                 m_RetargetError;        // why the preview is on Kimodo's skeleton only
+            bool                                        m_bShowSource = false;  // show Kimodo's own skeleton instead of this package's
+            std::vector<xmath::fmat4>                   m_DstWorlds;
+            std::vector<xskeleton_editor::bone_world>   m_DstBones;
+        } m_K;
 
         xskeleton_editor::skeleton_viewport             m_Viewport;             // the shared 3D skeleton panel (the scene is m_Viewport.m_Scene)
         xeditor::camera_toolbar                         m_CameraToolbar;
@@ -137,6 +187,10 @@ namespace xanim_package_editor
             , m_SetSpeed  (m_Undo, *this, playback_cmd::kind::set_speed,   "SetSpeed",   "Sets the playback speed step (0 = 0.25x, 3 = 1x, 7 = 3x). Usage: SetSpeed -Index step")
             , m_Info      (m_Undo, *this, playback_cmd::kind::info,        "PlaybackInfo","The selected clip, the time and whether it plays. Usage: PlaybackInfo")
             , m_ListClips (m_Undo, *this, playback_cmd::kind::list_clips,  "ListClips",  "Every clip with its options and whether it is compiled. Usage: ListClips")
+            , m_KimodoGenerate(m_Undo, *this, playback_cmd::kind::kimodo_generate, "KimodoGenerate", "Generates a motion from text with Kimodo; it previews until KimodoAccept or KimodoDiscard. Usage: KimodoGenerate -Prompt \"A person jumps.\" [-Seconds 5] [-Seed 1]")
+            , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName]")
+            , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved). Usage: KimodoDiscard")
+            , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
@@ -147,6 +201,7 @@ namespace xanim_package_editor
             MergeDetails();
 
             AddPanel("Clips",                dock::right,  [this] { RenderClips(); });
+            AddPanel("Kimodo",               dock::right,  [this] { RenderKimodo(); });
             if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value);
             AddPanel("AnimPackage Viewport", dock::center, [this] { RenderViewport(); }, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             AddPanel("Playback",             dock::bottom, [this] { RenderPlayback(); });
@@ -161,6 +216,7 @@ namespace xanim_package_editor
         {
             xresource::g_Mgr.ReleaseRef(m_Ref);
             xresource::g_Mgr.ReleaseRef(m_SkeletonRef);
+            xresource::g_Mgr.ReleaseRef(m_K.m_SkeletonRef);
             m_Viewport.Release();
         }
 
@@ -193,6 +249,7 @@ namespace xanim_package_editor
         void OnCompileStarted()     noexcept override { LetGo(); }
         void OnCompiled()           noexcept override { MergeDetails(); Reload(); }
 
+        std::uint64_t m_FramedSkeleton = ~0ull;      // the skeleton the camera was last framed for
         void LetGo() noexcept
         {
             xresource::g_Mgr.ReleaseRef(m_Ref);
@@ -233,12 +290,292 @@ namespace xanim_package_editor
             if (!m_RestWorlds.empty()) Center /= float(m_RestWorlds.size());
             float Radius = 0.5f;
             for (auto& M : m_RestWorlds) Radius = std::max(Radius, (M.ExtractPosition() - Center).Length());
-            m_Viewport.m_Scene.m_Center  = Center;
-            m_Viewport.m_Scene.m_Radius  = Radius;
-            m_Viewport.m_Scene.m_bReframe = true;
+            // the camera is framed for a skeleton the first time it is shown, never because the package was saved or compiled: the person's view stays where they put it
+            if (m_FramedSkeleton != pDesc->m_SkeletonRef.m_Instance.m_Value)
+            {
+                m_FramedSkeleton = pDesc->m_SkeletonRef.m_Instance.m_Value;
+                m_Viewport.m_Scene.m_Center  = Center;
+                m_Viewport.m_Scene.m_Radius  = Radius;
+                m_Viewport.m_Scene.m_bReframe = true;
+            }
 
             m_bShowable = true;
             if (m_iSelectedSource >= 0) SelectDescriptorClip(m_iSelectedSource, m_iSelectedDescriptorClip);
+        }
+
+        //----------------------------------------------------------------------------------------
+        // Kimodo: text -> preview -> Accept (asset + descriptor entry, saved) or Discard
+        //----------------------------------------------------------------------------------------
+
+        std::filesystem::path ProjectPath() const noexcept { return std::filesystem::path(m_Document.m_TempDir).parent_path().parent_path(); }    // <project>\Cache\Temp
+
+        // Why nothing can be generated (nullptr: ready)
+        const char* KimodoWhyNot() noexcept
+        {
+            auto* pDesc = Desc();
+            if (!pDesc) return "the descriptor is not loaded";
+            if (pDesc->m_SkeletonRef.empty()) return "set this package's SkeletonRef first";
+            if (pDesc->m_Kimodo.m_Retarget.empty()) return "set Kimodo/Retarget in the Description panel: a Retarget from Kimodo's SOMA 77 skeleton (KimodoSOMA77) to this package's skeleton";
+            if (pDesc->m_Kimodo.m_Folder.empty()) return "set Kimodo/Folder in the Description panel: the asset folder accepted clips go to";
+            return nullptr;
+        }
+
+        // The Retarget's Source skeleton (SOMA 77): read from the Retarget's descriptor, like the compiler does
+        bool KimodoResolveSkeleton(std::string& Error) noexcept
+        {
+            auto* pDesc = Desc();
+            const std::uint64_t Key = pDesc->m_Kimodo.m_Retarget.m_Instance.m_Value;
+            const auto Path = ProjectPath() / std::format(L"Descriptors/Retarget/{:02X}/{:02X}/{:X}.desc/Descriptor.txt", Key & 0xff, (Key & 0xff00) >> 8, Key);
+            xretarget_desc::descriptor R;
+            xproperty::settings::context Context{};
+            if (auto Err = R.Serialize(true, Path.wstring(), Context); Err || R.m_Source.empty()) { Error = "the Kimodo Retarget could not be read (is it saved and are its skeletons compiled?)"; return false; }
+            if (R.m_Destination.m_Instance.m_Value != pDesc->m_SkeletonRef.m_Instance.m_Value) { Error = "the Kimodo Retarget's Destination is not this package's skeleton"; return false; }
+            if (m_K.m_SkeletonRef.m_Instance.m_Value != R.m_Source.m_Instance.m_Value)
+            {
+                xresource::g_Mgr.ReleaseRef(m_K.m_SkeletonRef);
+                m_K.m_SkeletonRef.m_Instance = R.m_Source.m_Instance;
+            }
+            if (!xresource::g_Mgr.getResource(m_K.m_SkeletonRef)) { m_K.m_SkeletonRef.clear(); Error = "the Kimodo Retarget's Source skeleton could not be loaded (compile it)"; return false; }
+            return true;
+        }
+
+        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed) noexcept
+        {
+            if (auto* pWhy = KimodoWhyNot()) return std::string("KimodoGenerate: ") + pWhy;
+            if (m_K.m_Job.m_bRunning) return "KimodoGenerate: a generation is already running";
+            const auto Exe = kimodo::FindExe();
+            if (Exe.empty()) return "KimodoGenerate: xkimodo.exe not found (build dependencies/xKimodo, or set XKIMODO_EXE)";
+            std::string Err;
+            if (!KimodoResolveSkeleton(Err)) return "KimodoGenerate: " + Err;
+            if (!m_K.m_Job.Start(Exe, m_Document.m_TempDir, Prompt, std::clamp(Seconds, 0.5f, 60.0f), Seed, Err)) return "KimodoGenerate: " + Err;
+            m_K.m_PromptUsed = Prompt; m_K.m_SecondsUsed = Seconds; m_K.m_SeedUsed = Seed;
+            m_K.m_Status = "generating..."; m_K.m_bStatusError = false;
+            return "KimodoGenerate: started";
+        }
+
+        // Once a frame: a finished generation becomes the preview
+        void KimodoPoll() noexcept
+        {
+            bool Ok = false; std::string Msg;
+            if (!m_K.m_Job.Poll(Ok, Msg)) return;
+            m_K.m_bStatusError = !Ok;
+            m_K.m_Status = Msg.empty() ? (Ok ? "done" : "xkimodo failed (no message)") : Msg;
+            if (!Ok) return;
+            kimodo::bvh B; std::string Err;
+            if (!B.Load(m_K.m_Job.m_Bvh, Err)) { m_K.m_bStatusError = true; m_K.m_Status = "the generated BVH could not be read: " + Err; return; }
+            auto* pSkel = m_K.m_SkeletonRef.empty() ? nullptr : xresource::g_Mgr.getResource(m_K.m_SkeletonRef);
+            if (!pSkel) { m_K.m_bStatusError = true; m_K.m_Status = "the SOMA skeleton is not loaded"; return; }
+            m_K.m_BoneToJoint.assign(pSkel->getBones().size(), -1);
+            int Missing = 0;
+            for (int j = 0; j < B.nJoints(); ++j)
+                if (const int b = pSkel->findBoneIndex(xstrtool::CRC32(B.m_Names[j])); b >= 0) m_K.m_BoneToJoint[b] = j;
+            for (int v : m_K.m_BoneToJoint) Missing += v < 0;
+            if (Missing) { m_K.m_bStatusError = true; m_K.m_Status = std::format("the SOMA skeleton has {} bones the generated motion does not (is the Retarget's Source Kimodo's skeleton?)", Missing); return; }
+            m_K.m_Preview = std::move(B); m_K.m_bPreview = true; m_K.m_Time = 0.0f; m_K.m_bPlaying = true;
+            std::snprintf(m_K.m_Name, sizeof(m_K.m_Name), "%s", kimodo::NameFromPrompt(m_K.m_PromptUsed).c_str());
+            m_K.m_RetargetError.clear();
+            if (!KimodoRetargetPreview(m_K.m_RetargetError)) m_K.m_Baked.clear();
+        }
+
+        // The generated motion moved onto this package's skeleton exactly as the compile will move it (xanim_package_compiler.cpp RetargetRaw):
+        // the BVH's joints as the importer reads them (centimetres, OFFSET for the rest, the root's channels absolute), into the Retarget source
+        // skeleton's space (its Pre/PostTransform), then baked by the Retarget's retargeter.
+        bool KimodoRetargetPreview(std::string& Error) noexcept
+        {
+            auto* pDesc = Desc();
+            const std::uint64_t Key = pDesc->m_Kimodo.m_Retarget.m_Instance.m_Value;
+            if (!m_K.m_pRetarget || m_K.m_pRetarget->m_Key != Key)
+            {
+                auto Ctx = std::make_unique<kimodo_state::retarget_ctx>();
+                const auto Path = ProjectPath() / std::format(L"Descriptors/Retarget/{:02X}/{:02X}/{:X}.desc/Descriptor.txt", Key & 0xff, (Key & 0xff00) >> 8, Key);
+                xproperty::settings::context Context{};
+                if (auto Err = Ctx->m_Descriptor.Serialize(true, Path.wstring(), Context); Err) { Error = "the Retarget could not be read"; return false; }
+                if (auto Err = xretarget_desc::MakeMapping(Ctx->m_Descriptor, Ctx->m_Mapping); Err) { Error = "the Retarget's mapping could not be made"; return false; }
+                Ctx->m_Retargeter.Init(Ctx->m_Mapping.sourceCalibrated(), Ctx->m_Mapping.destinationCalibrated(), Ctx->m_Mapping.m_Auto.m_Map);
+                Ctx->m_Key = Key;
+                m_K.m_pRetarget = std::move(Ctx);
+            }
+            auto& Ctx = *m_K.m_pRetarget;
+            const auto& Src = Ctx.m_Descriptor.m_ResolvedSource;
+            const auto& Dst = Ctx.m_Descriptor.m_ResolvedDestination;
+            const int nSrc = int(Src.m_Bones.size()), nDst = int(Dst.m_Bones.size());
+            auto* pSkel = xresource::g_Mgr.getResource(m_SkeletonRef);
+            if (!pSkel || int(pSkel->getBones().size()) != nDst) { Error = "this package's skeleton is not loaded (compile the package once)"; return false; }
+
+            const auto& B = m_K.m_Preview;
+            std::vector<int> SrcToJoint(nSrc, -1);
+            for (int s = 0; s < nSrc; ++s)
+                for (int j = 0; j < B.nJoints(); ++j) if (B.m_Names[j] == Src.m_Bones[s].m_Name) { SrcToJoint[s] = j; break; }
+            int iRoot = -1;
+            for (int s = 0; s < nSrc; ++s) if (Src.m_Bones[s].m_iParent < 0) { iRoot = s; break; }
+            if (iRoot < 0 || SrcToJoint[iRoot] < 0) { Error = "the Retarget's Source skeleton is not Kimodo's (no Hips)"; return false; }
+
+            const int nFrames = B.m_nFrames;
+            std::vector<xmath::transform3> Frames(std::size_t(nFrames) * nSrc);
+            for (int f = 0; f < nFrames; ++f)
+                for (int s = 0; s < nSrc; ++s)
+                {
+                    auto& T = Frames[std::size_t(f) * nSrc + s];
+                    const auto& SB = Src.m_Bones[s];
+                    const int j = SrcToJoint[s];
+                    if (j < 0) { T = xmath::transform3{ .m_Scale = SB.m_RestScale, .m_Rotation = xmath::fquat(SB.m_RestRotX, SB.m_RestRotY, SB.m_RestRotZ, SB.m_RestRotW), .m_Position = SB.m_RestPosition }; continue; }
+                    float q[4]; kimodo::MatToQuat(&B.m_Rots[(std::size_t(f) * B.nJoints() + j) * 9], q);
+                    const float* p = (B.m_Parents[j] < 0 && B.m_bRootChannels) ? &B.m_Root[f * 3] : &B.m_Offsets[j * 3];
+                    T = xmath::transform3{ .m_Scale = xmath::fvec3(1, 1, 1), .m_Rotation = xmath::fquat(q[0], q[1], q[2], q[3]), .m_Position = xmath::fvec3(p[0] * 100.0f, p[1] * 100.0f, p[2] * 100.0f) };
+                }
+            auto Corr = [](const xmath::fvec3& S, const xmath::fvec3& R, const xmath::fvec3& T) { xanimation::root_correction C; C.m_Scale = S; C.m_RotationDeg = R; C.m_Translation = T; return C; };
+            xanimation::ToSkeletonSpace(Frames, nSrc, iRoot
+                , Corr(Src.m_PostTransformScale, Src.m_PostTransformRotationDeg, Src.m_PostTransformTranslation)
+                , Corr(Src.m_PreTransformScale,  Src.m_PreTransformRotationDeg,  Src.m_PreTransformTranslation));
+            m_K.m_Baked = xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Frames, nSrc, nFrames, int(std::lround(1.0f / B.m_FrameTime)), false }, nDst);
+            m_K.m_nDst = nDst;
+            return true;
+        }
+
+        void KimodoEvaluateRetargeted() noexcept
+        {
+            auto* pSkel = xresource::g_Mgr.getResource(m_SkeletonRef);
+            if (!pSkel) return;
+            const auto Bones = pSkel->getBones();
+            const int f = std::clamp(int(m_K.m_Time / m_K.m_Preview.m_FrameTime), 0, m_K.m_Preview.m_nFrames - 1);
+            m_K.m_DstWorlds.resize(Bones.size()); m_K.m_DstBones.resize(Bones.size());
+            for (int i = 0; i < int(Bones.size()); ++i)
+            {
+                const auto LocalMat = m_K.m_Baked[std::size_t(f) * m_K.m_nDst + i].toMatrix();
+                m_K.m_DstWorlds[i] = Bones[i].m_iParent < 0 ? LocalMat : m_K.m_DstWorlds[Bones[i].m_iParent] * LocalMat;
+                m_K.m_DstBones[i].m_Position = m_K.m_DstWorlds[i].ExtractPosition();
+                m_K.m_DstBones[i].m_Right    = m_K.m_DstWorlds[i].Right();
+                m_K.m_DstBones[i].m_Up       = m_K.m_DstWorlds[i].Up();
+            }
+        }
+
+        void KimodoEvaluate() noexcept
+        {
+            auto& P = m_K.m_Preview;
+            const int f = std::clamp(int(m_K.m_Time / P.m_FrameTime), 0, P.m_nFrames - 1);
+            P.Pose(f, m_K.m_Pos, m_K.m_World);
+            m_K.m_Bones.resize(m_K.m_BoneToJoint.size());
+            for (std::size_t b = 0; b < m_K.m_Bones.size(); ++b)
+            {
+                const int j = m_K.m_BoneToJoint[b];
+                const float* p = &m_K.m_Pos[j * 3]; const float* R = &m_K.m_World[j * 9];
+                m_K.m_Bones[b].m_Position = xmath::fvec3(p[0], p[1], p[2]);
+                m_K.m_Bones[b].m_Right    = xmath::fvec3(R[0], R[3], R[6]);
+                m_K.m_Bones[b].m_Up       = xmath::fvec3(R[1], R[4], R[7]);
+            }
+        }
+
+        static std::string SafeFileName(std::string N) noexcept
+        {
+            for (auto& c : N) if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') c = '_';
+            return N.empty() ? "KimodoClip" : N;
+        }
+
+        // The preview goes into the assets: the .bvh (+ .kimodo.txt) in the Kimodo folder, an import source entry, the descriptor saved and compiled
+        std::string KimodoAccept(std::string Name) noexcept
+        {
+            auto* pDesc = Desc();
+            if (!m_K.m_bPreview || !pDesc) return "KimodoAccept: nothing to accept (generate first)";
+            if (Name.empty()) Name = m_K.m_Name;
+            Name = SafeFileName(Name);
+            const std::wstring Folder = pDesc->m_Kimodo.m_Folder;
+            const auto Dir = ProjectPath() / Folder;
+            std::error_code Ec;
+            std::filesystem::create_directories(Dir, Ec);
+            std::wstring File = xstrtool::To(Name) + L".bvh";
+            for (int i = 2; std::filesystem::exists(Dir / File); ++i) File = std::format(L"{}_{}.bvh", xstrtool::To(Name), i);
+            std::filesystem::copy_file(m_K.m_Job.m_Bvh, Dir / File, Ec);
+            if (Ec) return "KimodoAccept: could not write " + (Dir / File).string() + ": " + Ec.message();
+            {
+                std::ofstream Info(Dir / (std::filesystem::path(File).stem().wstring() + L".kimodo.txt"));
+                Info << "generator: NVIDIA Kimodo (Kimodo-SOMA-RP-v1.2) through xkimodo\nprompt: " << m_K.m_PromptUsed << "\nseconds: " << m_K.m_SecondsUsed
+                     << "\nseed: " << m_K.m_SeedUsed << "\nsteps: 100\ncfg: 2 2\n";
+            }
+
+            const int n = int(pDesc->m_ImportSources.size());
+            const auto Base = std::format("AnimPackage/ImportSources[G:{}]/", n);
+            const auto Rel  = xstrtool::To(Folder + L"\\" + File);
+            const auto Rt   = std::format("{:016X}, {:016X}", pDesc->m_Kimodo.m_Retarget.m_Instance.m_Value, xrsc::retarget_type_guid_v.m_Value);
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote("AnimPackage/ImportSources[]"), xeditor::Quote(std::to_string(n + 1)), xeditor::Quote(std::to_string(n))));
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Type"), xeditor::Quote("Different skeleton: animation asset")));
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Path"), xeditor::Quote(Rel)));
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Retarget"), xeditor::Quote(Rt)));
+            // the BVH's one take is "Motion": the clip is named after the file (the compile keeps a clip entry whose OriginalName it finds)
+            const auto ClipName = xstrtool::To(std::filesystem::path(File).stem().wstring());
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[]"), xeditor::Quote("1")));
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[G:0]/OriginalName"), xeditor::Quote("Motion")));
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[G:0]/Name"), xeditor::Quote(ClipName)));
+            (void)m_Undo.Query("Save");
+            (void)m_Undo.Query("Compile");
+
+            KimodoDiscard();
+            m_K.m_bStatusError = false;
+            m_K.m_Status = std::format("saved {} and added it as import source {}; the package is compiling", Rel, n);
+            return "KimodoAccept: " + m_K.m_Status;
+        }
+
+        void KimodoDiscard() noexcept
+        {
+            m_K.m_bPreview = false; m_K.m_Preview = {};
+            std::error_code Ec;
+            if (!m_K.m_Job.m_Bvh.empty()) std::filesystem::remove(m_K.m_Job.m_Bvh, Ec);
+        }
+
+        void RenderKimodo() noexcept
+        {
+            ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+            if (auto* pWhy = KimodoWhyNot()) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "To generate: %s.", pWhy); ImGui::PopTextWrapPos(); return; }
+            ImGui::TextDisabled("Describe a motion; it previews on this package's skeleton and goes into the assets only when you accept it.");
+            ImGui::PopTextWrapPos();
+
+            const bool bBusy = m_K.m_Job.m_bRunning;
+            ImGui::BeginDisabled(bBusy);
+            ImGui::InputTextMultiline("##prompt", m_K.m_Prompt, sizeof(m_K.m_Prompt), ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 4));
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("What the motion is, in words: \"A person jumps over an obstacle.\"");
+            ImGui::SetNextItemWidth(120.0f); ImGui::SliderFloat("Seconds", &m_K.m_Seconds, 1.0f, 20.0f, "%.1f");
+            ImGui::SameLine(); ImGui::SetNextItemWidth(90.0f); ImGui::InputInt("Seed", &m_K.m_Seed);
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("Another seed, another take of the same prompt");
+            if (ImGui::Button(m_K.m_bPreview ? "Generate again" : "Generate"))
+            {
+                if (m_K.m_bPreview && m_K.m_Seed == m_K.m_SeedUsed && m_K.m_PromptUsed == m_K.m_Prompt) ++m_K.m_Seed;       // "again" with nothing changed: the next take
+                if (auto R = KimodoGenerate(m_K.m_Prompt, m_K.m_Seconds, m_K.m_Seed); R != "KimodoGenerate: started") { m_K.m_Status = R; m_K.m_bStatusError = true; }
+            }
+            ImGui::EndDisabled();
+            if (bBusy)
+            {
+                ImGui::SameLine(); ImGui::Text("generating... %.0f s", ImGui::GetTime() - m_K.m_Job.m_StartTime);
+                ImGui::SameLine(); if (ImGui::Button("Cancel")) { m_K.m_Job.Cancel(); m_K.m_Status = "cancelled"; }
+            }
+
+            if (m_K.m_bPreview)
+            {
+                ImGui::Separator();
+                ImGui::TextWrapped("Previewing (not in the assets): \"%s\", %.1f s, seed %d", m_K.m_PromptUsed.c_str(), m_K.m_Preview.m_nFrames * m_K.m_Preview.m_FrameTime, m_K.m_SeedUsed);
+                if (m_K.m_Baked.empty())
+                {
+                    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "On Kimodo's skeleton only: %s", m_K.m_RetargetError.c_str());
+                    ImGui::PopTextWrapPos();
+                }
+                else
+                {
+                    ImGui::Checkbox("Show Kimodo's skeleton", &m_K.m_bShowSource);
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text("Off: the motion on this package's skeleton, moved by the Kimodo Retarget exactly as the compile will move it");
+                }
+                ImGui::SetNextItemWidth(-FLT_MIN); ImGui::InputText("##name", m_K.m_Name, sizeof(m_K.m_Name));
+                if (ImGui::IsItemHovered()) xeditor::hint::Text("The clip's file name in %s", xstrtool::To(Desc()->m_Kimodo.m_Folder).c_str());
+                if (ImGui::Button("Accept")) { m_K.m_Status = KimodoAccept(m_K.m_Name); }
+                if (ImGui::IsItemHovered()) xeditor::hint::Text("Saves it in the Kimodo folder, adds it to this package (Retarget: Kimodo/Retarget) and compiles");
+                ImGui::SameLine(); if (ImGui::Button("Discard")) { KimodoDiscard(); m_K.m_Status = "discarded"; m_K.m_bStatusError = false; }
+            }
+            if (!m_K.m_Status.empty())
+            {
+                ImGui::Separator();
+                ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+                if (m_K.m_bStatusError) ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", m_K.m_Status.c_str());
+                else ImGui::TextDisabled("%s", m_K.m_Status.c_str());
+                ImGui::PopTextWrapPos();
+            }
         }
 
         //----------------------------------------------------------------------------------------
@@ -282,9 +619,24 @@ namespace xanim_package_editor
             return (Clip.m_FPS > 0 && Clip.m_nFrames > 0) ? float(Clip.m_nFrames) / float(Clip.m_FPS) : 0.0f;
         }
 
+        // Play from where it is; a clip that played to its end starts again from 0 (the button, the P key and the Play command)
+        void StartPlaying() noexcept
+        {
+            if (auto* pClip = SelectedClip(); pClip && m_TimeSeconds >= ClipLength(*pClip)) { m_TimeSeconds = 0.0f; m_LoopsElapsed = 0; }
+            m_bPlaying = true;
+        }
+        void TogglePlay() noexcept { if (m_bPlaying) m_bPlaying = false; else StartPlaying(); }
+
         // Once a frame, whichever tab is showing: the time advances while playing
         void Render() noexcept override
         {
+            KimodoPoll();
+            if (m_K.m_bPreview && m_K.m_bPlaying)
+            {
+                const float Len = m_K.m_Preview.m_nFrames * m_K.m_Preview.m_FrameTime;
+                m_K.m_Time += ImGui::GetIO().DeltaTime * xgpu::tools::editors::g_PlaybackSpeeds[m_iSpeedIndex];
+                if (Len > 0.0f) m_K.m_Time = std::fmod(m_K.m_Time, Len);
+            }
             if (m_bPlaying)
                 if (auto* pClip = SelectedClip(); pClip && ClipLength(*pClip) > 0.0f)
                     xgpu::tools::editors::AdvancePlayback(m_TimeSeconds, m_LoopsElapsed, m_bPlaying, ClipLength(*pClip), pClip->m_bLoop, ImGui::GetIO().DeltaTime, xgpu::tools::editors::g_PlaybackSpeeds[m_iSpeedIndex]);
@@ -473,6 +825,22 @@ namespace xanim_package_editor
             auto* pHost   = xeditor::host::current();
             auto* pWindow = pHost ? pHost->find<xgpu::window>() : nullptr;
             if (!m_bReady || !pWindow) { ImGui::TextDisabled("The 3D view needs a GPU device (open from the editor)."); return; }
+            if (m_K.m_bPreview && !m_K.m_bShowSource && !m_K.m_Baked.empty())
+                if (auto* pOwn = xresource::g_Mgr.getResource(m_SkeletonRef))
+                {
+                    KimodoEvaluateRetargeted();
+                    const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pOwn, .m_Bones = m_K.m_DstBones };
+                    m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
+                    return;
+                }
+            if (m_K.m_bPreview)
+                if (auto* pSoma = xresource::g_Mgr.getResource(m_K.m_SkeletonRef))
+                {
+                    KimodoEvaluate();
+                    const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSoma, .m_Bones = m_K.m_Bones, .m_NormalColor = 0xFF40C0FFu };
+                    m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
+                    return;
+                }
             if (!m_bShowable) { ImGui::TextWrapped("%s", m_ErrorMessage.empty() ? "Nothing to show." : m_ErrorMessage.c_str()); return; }
             auto* pSkeleton = xresource::g_Mgr.getResource(m_SkeletonRef);
             if (!pSkeleton) return;
@@ -485,12 +853,25 @@ namespace xanim_package_editor
 
         void RenderPlayback() noexcept
         {
+            if (m_K.m_bPreview)
+            {
+                namespace ed = xgpu::tools::editors;
+                const float Length = m_K.m_Preview.m_nFrames * m_K.m_Preview.m_FrameTime;
+                if (ImGui::Button(m_K.m_bPlaying ? ed::g_PauseIcon : ed::g_PlayIcon)) m_K.m_bPlaying = !m_K.m_bPlaying;
+                ImGui::SameLine(); ImGui::SetNextItemWidth(140.0f);
+                ImGui::SliderInt("##speed", &m_iSpeedIndex, 0, ed::g_NumPlaybackSpeeds - 1, ed::g_PlaybackSpeedLabels[m_iSpeedIndex]);
+                ImGui::SameLine(); ImGui::TextColored(ImVec4(0.25f, 0.75f, 1.0f, 1.0f), "Kimodo preview - not in the assets until accepted");
+                const float Footer = ImGui::GetTextLineHeightWithSpacing();
+                xgpu::tools::imgui::timeline::Draw(m_Timeline, m_K.m_Time, Length, 1.0f / m_K.m_Preview.m_FrameTime, {}, "kimodo_timeline", m_K.m_Name, std::max(ImGui::GetContentRegionAvail().y - Footer, 0.0f));
+                ImGui::Text("Frames: %d    FPS: %.0f    Prompt: %s", m_K.m_Preview.m_nFrames, 1.0f / m_K.m_Preview.m_FrameTime, m_K.m_PromptUsed.c_str());
+                return;
+            }
             auto* pClip = SelectedClip();
             if (!pClip) { ImGui::TextDisabled("Select a clip to preview."); return; }
             namespace ed = xgpu::tools::editors;
             const float Length = ClipLength(*pClip);
 
-            if (ImGui::Button(m_bPlaying ? ed::g_PauseIcon : ed::g_PlayIcon)) m_bPlaying = !m_bPlaying;
+            if (ImGui::Button(m_bPlaying ? ed::g_PauseIcon : ed::g_PlayIcon)) TogglePlay();
             if (ImGui::IsItemHovered()) xeditor::hint::Text(m_bPlaying ? "Pause" : "Play");
             ImGui::SameLine();
             if (ImGui::Button(ed::g_GoToStartIcon)) { m_TimeSeconds = 0.0f; m_LoopsElapsed = 0; }
@@ -534,7 +915,7 @@ namespace xanim_package_editor
             if (!S.SelectDescriptorClip(iSource, iClip)) return "SelectClip: no such clip";
             return S.m_iSelectedClip >= 0 ? "SelectClip: selected" : "SelectClip: selected (it has no compiled clip to play: compile, or it is marked for delete)";
         }
-        case kind::play:  if (!S.SelectedClip()) return "Play: no clip is selected"; S.m_bPlaying = true;  return "Play: playing";
+        case kind::play:  if (!S.SelectedClip()) return "Play: no clip is selected"; S.StartPlaying();  return "Play: playing";
         case kind::pause: S.m_bPlaying = false; return "Pause: paused";
         case kind::seek:
         {
@@ -585,12 +966,45 @@ namespace xanim_package_editor
             }
             return Text.empty() ? "(no import sources)" : Text;
         }
+        case kind::kimodo_generate:
+        {
+            std::string Prompt, Secs = "5", Seed = "1";
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Prompt)) return "KimodoGenerate: -Prompt is required";
+            xeditor::cmd_util::GetArg(m_Parser, m_hB, Secs); xeditor::cmd_util::GetArg(m_Parser, m_hC, Seed);
+            float Seconds = 5.0f; int iSeed = 1;
+            std::from_chars(Secs.data(), Secs.data() + Secs.size(), Seconds); std::from_chars(Seed.data(), Seed.data() + Seed.size(), iSeed);
+            std::snprintf(S.m_K.m_Prompt, sizeof(S.m_K.m_Prompt), "%s", Prompt.c_str()); S.m_K.m_Seconds = Seconds; S.m_K.m_Seed = iSeed;
+            return S.KimodoGenerate(Prompt, Seconds, iSeed);
+        }
+        case kind::kimodo_accept:
+        {
+            std::string Name; xeditor::cmd_util::GetArg(m_Parser, m_hA, Name);
+            return S.KimodoAccept(Name);
+        }
+        case kind::kimodo_discard: S.KimodoDiscard(); return "KimodoDiscard: discarded";
+        case kind::kimodo_info:
+        {
+            auto* pDesc = S.Desc();
+            std::string Text = std::format("running: {}\npreview: {}\n", S.m_K.m_Job.m_bRunning ? "yes" : "no", S.m_K.m_bPreview ? "yes" : "no");
+            if (S.m_K.m_bPreview)
+            {
+                Text += std::format("preview frames: {}  prompt: \"{}\"  seed: {}  name: {}\n", S.m_K.m_Preview.m_nFrames, S.m_K.m_PromptUsed, S.m_K.m_SeedUsed, S.m_K.m_Name);
+                Text += S.m_K.m_Baked.empty() ? std::format("preview on: Kimodo's skeleton ({})\n", S.m_K.m_RetargetError)
+                                              : std::format("preview on: {}\n", S.m_K.m_bShowSource ? "Kimodo's skeleton (Show Kimodo's skeleton is on)" : "this package's skeleton (retargeted)");
+            }
+            Text += std::format("status: {}{}\n", S.m_K.m_bStatusError ? "ERROR " : "", S.m_K.m_Status);
+            if (auto* pWhy = S.KimodoWhyNot()) Text += std::format("not ready: {}\n", pWhy);
+            if (pDesc) Text += std::format("retarget: {:016X}  folder: {}\n", pDesc->m_Kimodo.m_Retarget.m_Instance.m_Value, xstrtool::To(pDesc->m_Kimodo.m_Folder));
+            const auto Exe = kimodo::FindExe();
+            Text += std::format("xkimodo: {}\n", Exe.empty() ? std::string("NOT FOUND") : xstrtool::To(Exe));
+            return Text;
+        }
         }
         return {};
     }
 
     inline const char* anim_actions::WhyNoPlayPause() const noexcept { return m_pS->SelectedClip() ? nullptr : "select a clip first"; }
-    inline void anim_actions::PlayPause() noexcept { m_pS->m_bPlaying = !m_pS->m_bPlaying; }
+    inline void anim_actions::PlayPause() noexcept { m_pS->TogglePlay(); }
 
     inline const xeditor::auto_register_resource_editor g_Registration
     { xrsc::anim_package_type_guid_v

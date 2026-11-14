@@ -99,6 +99,23 @@ namespace xanim_package_desc
     };
     XPROPERTY_REG(import_source)
 
+    // Generating clips from text with NVIDIA Kimodo (the editor's Kimodo panel, through xkimodo.exe): the generated motion is on Kimodo's
+    // SOMA 77-bone skeleton, so it needs a Retarget from that skeleton to this package's; an accepted clip is saved as a .bvh in Folder and
+    // added as a "Different skeleton: animation asset" source with that Retarget. Nothing here changes what the package compiles.
+    static constexpr wchar_t        folder_filter_v[]       = L"All\0*\0";
+    struct kimodo_settings
+    {
+        xrsc::retarget  m_Retarget = {};
+        std::wstring    m_Folder   = L"Assets\\Kimodo";
+
+        XPROPERTY_DEF
+        ( "Kimodo", kimodo_settings
+        , obj_member<"Retarget", &kimodo_settings::m_Retarget, member_help<"The Retarget from Kimodo's SOMA 77-bone skeleton (its Source) to this package's skeleton (its Destination): generated clips are moved with it">>
+        , obj_member<"Folder",   &kimodo_settings::m_Folder, member_ui<std::wstring>::folder_dialog<folder_filter_v, true, 1>, member_help<"The asset folder an accepted generated clip is saved in (as a .bvh, with a .kimodo.txt beside it: the prompt, seed and length)">>
+        )
+    };
+    XPROPERTY_REG(kimodo_settings)
+
     struct descriptor : xresource_pipeline::descriptor::base
     {
         using parent = xresource_pipeline::descriptor::base;
@@ -227,6 +244,7 @@ namespace xanim_package_desc
 
         std::vector<import_source>     m_ImportSources         = {};   // the "official list" of source files - each owns its own clips now (see import_source)
         xrsc::skeleton                  m_SkeletonRef           = {};   // required - Validate() errors if empty
+        kimodo_settings                 m_Kimodo                = {};   // editor only: where generated clips go and how they are retargeted
 
         xskeleton_desc::bone_manifest   m_ResolvedSkeletonBones = {};   // NOT saved - populated in Serialize() above
 
@@ -234,6 +252,7 @@ namespace xanim_package_desc
         ( "AnimPackage", descriptor
         , obj_member<"SkeletonRef",             &descriptor::m_SkeletonRef >          // first: the skeleton every source ends up on
         , obj_member<"ImportSources",           &descriptor::m_ImportSources >
+        , obj_member<"Kimodo",                  &descriptor::m_Kimodo >
         , obj_member<"ResolvedSkeletonBones",   &descriptor::m_ResolvedSkeletonBones, member_flags<flags::DONT_SHOW, flags::DONT_SAVE> >
         )
     };
