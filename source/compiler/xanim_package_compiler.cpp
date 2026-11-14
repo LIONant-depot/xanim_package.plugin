@@ -6,6 +6,8 @@
 #include "dependencies/xstrtool/source/xstrtool.h"
 
 #include "../xanim_package_descriptor.h"
+#include "plugins/xretarget.plugin/source/xretarget_mapping.h"
+#include "dependencies/xAnimation/source/xanimation.h"
 #include "../xanim_package.h"
 #include "../xanim_package_details.h"
 
@@ -26,7 +28,18 @@ namespace xanim_package_compiler
         {
             xraw3d::anim   m_Anim;
             std::wstring   m_SourceFile;
+            bool           m_bInSkeletonSpace = false;     // the keys are already the package skeleton's own (retargeted: its Pre/PostTransform are not applied again)
         };
+
+        // The Retarget of an import source: its descriptor read (which reads both skeletons' bone manifests), the mapping resolved and the retargeter made.
+        // Kept for the whole compile: the mapping holds views into the descriptor's manifests.
+        struct retarget_context
+        {
+            xretarget_desc::descriptor      m_Descriptor;
+            xretarget_desc::mapping         m_Mapping;
+            xanimation::retargeter          m_Retargeter;
+        };
+        std::unordered_map<std::uint64_t, std::unique_ptr<retarget_context>> m_Retargets;
 
         //--------------------------------------------------------------------------------------
 
@@ -276,8 +289,11 @@ namespace xanim_package_compiler
                     RootKey.m_Scale    = Scale * RootKey.m_Scale;
                 }
             };
-            ApplyToRoot("PostTransform", Manifest.m_PostTransformScale, Manifest.m_PostTransformRotationDeg, Manifest.m_PostTransformTranslation);
-            ApplyToRoot("PreTransform", Manifest.m_PreTransformScale, Manifest.m_PreTransformRotationDeg, Manifest.m_PreTransformTranslation);
+            if (!Raw.m_bInSkeletonSpace)        // (a retargeted clip is already in this skeleton's space: the retarget put it there)
+            {
+                ApplyToRoot("PostTransform", Manifest.m_PostTransformScale, Manifest.m_PostTransformRotationDeg, Manifest.m_PostTransformTranslation);
+                ApplyToRoot("PreTransform", Manifest.m_PreTransformScale, Manifest.m_PreTransformRotationDeg, Manifest.m_PreTransformTranslation);
+            }
             if (bHaveAnimatedRoot)
             {
                 // where the clip puts the root on its first frame, next to where the frozen pose has it: the two agree when the skeleton, its frozen pose and its animations are in the same space
@@ -375,6 +391,104 @@ namespace xanim_package_compiler
 
         //--------------------------------------------------------------------------------------
 
+        // Folds the clip's nodes into the joints of a skeleton (the skeleton keeps only its runtime joints): the clip's other nodes' motion is baked into the joints below them
+        void FoldRaw(raw_clip& Raw, const std::vector<xskeleton_desc::bone_manifest::bone_entry>& Joints)
+        {
+        // The skeleton keeps only its runtime joints (xraw3d anim::RuntimeJoints): fold the clip's other nodes the same way, so
+        // their motion is baked into the joints below them (documentation/Editors/skeleton_runtime_folding_plan.md)
+        {
+            std::vector<bool> Keep(Raw.m_Anim.m_Bone.size(), false);
+            for (std::size_t r = 0; r < Keep.size(); ++r)
+                Keep[r] = std::any_of(Joints.begin(), Joints.end(), [&](const auto& B) { return B.m_Name == Raw.m_Anim.m_Bone[r].m_Name; });
+            const bool bSyntheticRoot = !Joints.empty() && Joints[0].m_Name == xraw3d::anim::synthetic_root_name_v;
+            const bool bFolds         = bSyntheticRoot || std::find(Keep.begin(), Keep.end(), false) != Keep.end();
+            if (bFolds && std::find(Keep.begin(), Keep.end(), true) != Keep.end())
+            {
+                const auto nBefore = Raw.m_Anim.m_Bone.size();
+                for (auto& Name : Raw.m_Anim.FoldBones(Keep, bSyntheticRoot))
+                    LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': node '{}' kept, folding it would not fit translation/rotation/scale", Raw.m_Anim.m_Name, Name));
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': {} source nodes folded into the skeleton's joints", Raw.m_Anim.m_Name, nBefore - (Raw.m_Anim.m_Bone.size() - (bSyntheticRoot ? 1 : 0))));
+            }
+        }
+        }
+
+        //--------------------------------------------------------------------------------------
+        // A clip made on ANOTHER skeleton (its import source names a Retarget): the clip's keys go into the SOURCE skeleton's space with that skeleton's own
+        // PostTransform then PreTransform (the corrections that link a skeleton and its animations), are transferred to the DESTINATION skeleton (this package's)
+        // by the Retarget's mapping, and come out already in the destination's space. The clip then replaces Raw, named after the destination's bones.
+        xerr RetargetRaw(raw_clip& Raw, const xanim_package_desc::import_source& Source)
+        {
+            const std::uint64_t Key = Source.m_Retarget.m_Instance.m_Value;
+            auto& Slot = m_Retargets[Key];
+            if (!Slot)
+            {
+                auto Ctx = std::make_unique<retarget_context>();
+                xproperty::settings::context Context{};
+                const std::wstring Path = std::format(L"{}/Descriptors/Retarget/{:02X}/{:02X}/{:X}.desc/Descriptor.txt", m_ProjectPaths.m_Project, Key & 0xff, (Key & 0xff00) >> 8, Key);
+                if (auto Err = Ctx->m_Descriptor.Serialize(true, Path, Context); Err)
+                    return xerr::create_f<state, "The Retarget of an import source could not be read (is it compiled? are its skeletons?)">(Err);
+                std::vector<std::string> Errors; Ctx->m_Descriptor.Validate(Errors);
+                if (!Errors.empty()) { for (auto& E : Errors) LogMessage(xresource_pipeline::msg_type::ERROR, std::move(E)); return xerr::create_f<state, "The Retarget of an import source is not valid">(); }
+                if (Ctx->m_Descriptor.m_Destination.m_Instance.m_Value != m_Descriptor.m_SkeletonRef.m_Instance.m_Value)
+                    return xerr::create_f<state, "The Retarget's destination skeleton is not this package's skeleton">();
+                if (auto Err = xretarget_desc::MakeMapping(Ctx->m_Descriptor, Ctx->m_Mapping); Err) return Err;
+                for (const auto& W : Ctx->m_Mapping.m_Auto.m_Warnings) LogMessage(xresource_pipeline::msg_type::WARNING, "Retarget: " + W);
+                Ctx->m_Retargeter.Init(Ctx->m_Mapping.m_Source.rest(), Ctx->m_Mapping.m_Destination.rest(), Ctx->m_Mapping.m_Auto.m_Map);
+                // the package follows the Retarget and the skeleton it moves from: it compiles again when either does
+                m_Dependencies.m_Resources.push_back({ Source.m_Retarget.m_Instance, xrsc::retarget_type_guid_v });
+                m_Dependencies.m_Resources.push_back({ Ctx->m_Descriptor.m_Source.m_Instance, xrsc::skeleton_type_guid_v });
+                m_Dependencies.m_Assets.push_back(xskeleton_desc::ManifestRelativePath(Ctx->m_Descriptor.m_Source.m_Instance.m_Value));
+                Slot = std::move(Ctx);
+            }
+            auto& Ctx = *Slot;
+            const auto& SrcManifest = Ctx.m_Descriptor.m_ResolvedSource;
+            const auto& DstManifest = Ctx.m_Descriptor.m_ResolvedDestination;
+            const int nSrc = static_cast<int>(SrcManifest.m_Bones.size()), nDst = static_cast<int>(DstManifest.m_Bones.size());
+
+            FoldRaw(Raw, SrcManifest.m_Bones);                                          // the clip's nodes into the SOURCE skeleton's joints
+
+            // the source skeleton's frames: the clip's key where it has one (by bone name), the skeleton's rest pose where it has not
+            const int nRaw = static_cast<int>(Raw.m_Anim.m_Bone.size()), nFrames = Raw.m_Anim.m_nFrames;
+            std::vector<int> SrcToRaw(nSrc, -1);
+            for (int s = 0; s < nSrc; ++s)
+                for (int r = 0; r < nRaw; ++r) if (Raw.m_Anim.m_Bone[r].m_Name == SrcManifest.m_Bones[s].m_Name) { SrcToRaw[s] = r; break; }
+            std::vector<xmath::transform3> Frames(static_cast<std::size_t>(nFrames) * nSrc);
+            for (int f = 0; f < nFrames; ++f)
+                for (int s = 0; s < nSrc; ++s)
+                {
+                    const auto& B = SrcManifest.m_Bones[s];
+                    Frames[static_cast<std::size_t>(f) * nSrc + s] = SrcToRaw[s] != -1 ? Raw.m_Anim.m_KeyFrame[static_cast<std::size_t>(f) * nRaw + SrcToRaw[s]]
+                        : xmath::transform3{ .m_Scale = B.m_RestScale, .m_Rotation = xmath::fquat(B.m_RestRotX, B.m_RestRotY, B.m_RestRotZ, B.m_RestRotW), .m_Position = B.m_RestPosition };
+                }
+            int iRoot = -1; for (int s = 0; s < nSrc; ++s) if (SrcManifest.m_Bones[s].m_iParent < 0) { iRoot = s; break; }
+            if (iRoot != -1 && SrcToRaw[iRoot] != -1)                                   // the skeleton's own root, animated by the clip: raw import space -> the skeleton's space
+            {
+                auto Corr = [](const xmath::fvec3& S, const xmath::fvec3& R, const xmath::fvec3& T) { xanimation::root_correction C; C.m_Scale = S; C.m_RotationDeg = R; C.m_Translation = T; return C; };
+                xanimation::ToSkeletonSpace(Frames, nSrc, iRoot
+                    , Corr(SrcManifest.m_PostTransformScale, SrcManifest.m_PostTransformRotationDeg, SrcManifest.m_PostTransformTranslation)
+                    , Corr(SrcManifest.m_PreTransformScale,  SrcManifest.m_PreTransformRotationDeg,  SrcManifest.m_PreTransformTranslation));
+            }
+            else LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}' does not animate the source skeleton's root: the skeleton's corrections were not applied", Raw.m_Anim.m_Name));
+
+            const auto Baked = xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Frames, nSrc, nFrames, Raw.m_Anim.m_FPS, false }, nDst);
+
+            // the clip becomes a clip of the destination skeleton: its bones are the destination's, its keys the baked frames
+            xraw3d::anim Out;
+            Out.m_Name = Raw.m_Anim.m_Name; Out.m_FPS = Raw.m_Anim.m_FPS; Out.m_nFrames = nFrames;
+            Out.m_Bone.resize(nDst);
+            for (int d = 0; d < nDst; ++d) { Out.m_Bone[d] = {}; Out.m_Bone[d].m_Name = DstManifest.m_Bones[d].m_Name; Out.m_Bone[d].m_iParent = DstManifest.m_Bones[d].m_iParent; }
+            Out.m_KeyFrame = Baked;
+            Raw.m_Anim = std::move(Out);
+            Raw.m_bInSkeletonSpace = true;
+            return {};
+        }
+
+        const xanim_package_desc::import_source* FindSource(const std::wstring& Path) const noexcept
+        {
+            for (auto& S : m_Descriptor.m_ImportSources) if (S.m_Path == Path) return &S;
+            return nullptr;
+        }
+
         xerr BuildFinalPackage()
         {
             std::unordered_map<std::wstring, std::unordered_map<std::string, const xanim_package_desc::clip*>> Overrides;
@@ -390,22 +504,11 @@ namespace xanim_package_compiler
 
             for (auto& Raw : m_RawClips)
             {
-                // The skeleton keeps only its runtime joints (xraw3d anim::RuntimeJoints): fold the clip's other nodes the same way, so
-                // their motion is baked into the joints below them (documentation/Editors/skeleton_runtime_folding_plan.md)
+                if (const auto* pSource = FindSource(Raw.m_SourceFile); pSource && !pSource->m_Retarget.empty())
                 {
-                    std::vector<bool> Keep(Raw.m_Anim.m_Bone.size(), false);
-                    for (std::size_t r = 0; r < Keep.size(); ++r)
-                        Keep[r] = std::any_of(ResolvedBones.begin(), ResolvedBones.end(), [&](const auto& B) { return B.m_Name == Raw.m_Anim.m_Bone[r].m_Name; });
-                    const bool bSyntheticRoot = !ResolvedBones.empty() && ResolvedBones[0].m_Name == xraw3d::anim::synthetic_root_name_v;
-                    const bool bFolds         = bSyntheticRoot || std::find(Keep.begin(), Keep.end(), false) != Keep.end();
-                    if (bFolds && std::find(Keep.begin(), Keep.end(), true) != Keep.end())
-                    {
-                        const auto nBefore = Raw.m_Anim.m_Bone.size();
-                        for (auto& Name : Raw.m_Anim.FoldBones(Keep, bSyntheticRoot))
-                            LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': node '{}' kept, folding it would not fit translation/rotation/scale", Raw.m_Anim.m_Name, Name));
-                        LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': {} source nodes folded into the skeleton's joints", Raw.m_Anim.m_Name, nBefore - (Raw.m_Anim.m_Bone.size() - (bSyntheticRoot ? 1 : 0))));
-                    }
+                    if (auto Err = RetargetRaw(Raw, *pSource); Err) return Err;
                 }
+                else FoldRaw(Raw, ResolvedBones);
 
                 const xanim_package_desc::clip* pOv = nullptr;
                 if (auto SourceIt = Overrides.find(Raw.m_SourceFile); SourceIt != Overrides.end())

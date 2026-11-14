@@ -4,6 +4,7 @@
 
 #include "plugins/xskeleton.plugin/source/xskeleton_xgpu_rsc_loader.h"
 #include "plugins/xskeleton.plugin/source/xskeleton_bone_manifest.h"
+#include "plugins/xretarget.plugin/source/xretarget_ref.h"
 #include "xanim_package.h"
 #include "xanim_package_details.h"
 #include "dependencies/xstrtool/source/xstrtool.h"
@@ -59,10 +60,12 @@ namespace xanim_package_desc
     {
         std::wstring       m_Path  = {};
         std::vector<clip>  m_Clips = {};   // every clip found in THIS file, curated
+        xrsc::retarget     m_Retarget = {};// empty: the file's clips are on this package's skeleton. Set: they are on ANOTHER skeleton (the Retarget's source) and are moved onto this package's skeleton (its destination)
 
         XPROPERTY_DEF
         ( "ImportSource", import_source
         , obj_member<"Path",    &import_source::m_Path, member_ui<std::wstring>::file_dialog<mesh_filter_v, true, 1> >
+        , obj_member<"Retarget", &import_source::m_Retarget, member_help<"The Retarget that moves this file's clips from the skeleton they were made on to this package's skeleton. Leave empty when they were made on it">>
         , obj_member<"Clips",   &import_source::m_Clips >
         )
     };

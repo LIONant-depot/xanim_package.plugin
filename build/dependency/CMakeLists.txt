@@ -8,6 +8,7 @@ FetchAndPopulate("https://github.com/LIONant-depot/xblend_unzip.git" "main")
 FetchAndPopulate("https://github.com/LIONant-depot/xresource_pipeline_v2.git" "main")
 FetchAndPopulate("https://github.com/LIONant-depot/xstrtool.git" "main" )
 FetchAndPopulate("https://github.com/LIONant-depot/xscheduler.git" "main")
+FetchAndPopulate("https://github.com/LIONant-depot/xAnimation.git" "main")
 
 
 DefineInterfaceComponent(xanim_package_compiler_ "dependencies"
