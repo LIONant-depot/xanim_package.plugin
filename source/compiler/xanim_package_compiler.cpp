@@ -433,7 +433,7 @@ namespace xanim_package_compiler
                     return xerr::create_f<state, "The Retarget's destination skeleton is not this package's skeleton">();
                 if (auto Err = xretarget_desc::MakeMapping(Ctx->m_Descriptor, Ctx->m_Mapping); Err) return Err;
                 for (const auto& W : Ctx->m_Mapping.m_Auto.m_Warnings) LogMessage(xresource_pipeline::msg_type::WARNING, "Retarget: " + W);
-                Ctx->m_Retargeter.Init(Ctx->m_Mapping.m_Source.rest(), Ctx->m_Mapping.m_Destination.rest(), Ctx->m_Mapping.m_Auto.m_Map);
+                Ctx->m_Retargeter.Init(Ctx->m_Mapping.sourceCalibrated(), Ctx->m_Mapping.destinationCalibrated(), Ctx->m_Mapping.m_Auto.m_Map);
                 // the package follows the Retarget and the skeleton it moves from: it compiles again when either does
                 m_Dependencies.m_Resources.push_back({ Source.m_Retarget.m_Instance, xrsc::retarget_type_guid_v });
                 m_Dependencies.m_Resources.push_back({ Ctx->m_Descriptor.m_Source.m_Instance, xrsc::skeleton_type_guid_v });
@@ -471,6 +471,42 @@ namespace xanim_package_compiler
             else LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}' does not animate the source skeleton's root: the skeleton's corrections were not applied", Raw.m_Anim.m_Name));
 
             const auto Baked = xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Frames, nSrc, nFrames, Raw.m_Anim.m_FPS, false }, nDst);
+
+            // a numeric look at the result (the log is how a retarget is judged without eyes): the hands and feet, relative to the hips and in hip heights, for the source
+            // (in its skeleton space) and the destination (baked), on a few frames. A transfer that works gives the two nearly the same numbers.
+            {
+                auto Worlds = [&](const std::vector<std::int32_t>& Parents, const std::vector<xmath::transform3>& Fr, int nB, int f)
+                {
+                    xanimation::pose P; P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, Fr[static_cast<std::size_t>(f) * nB + b]);
+                    std::vector<xmath::fquat> R; std::vector<xmath::fvec3> Pos;
+                    xanimation::details::WorldRP({ std::span<const std::int32_t>(Parents) }, P, R, Pos);
+                    return Pos;
+                };
+                const auto& Sk = Ctx.m_Mapping.m_Source; const auto& Dk = Ctx.m_Mapping.m_Destination;
+                std::vector<xmath::fquat> Rr; std::vector<xmath::fvec3> SRest, DRest;
+                xanimation::details::WorldRP({ std::span<const std::int32_t>(Sk.m_Parent) }, Ctx.m_Mapping.m_SourceCalibration, Rr, SRest);
+                xanimation::details::WorldRP({ std::span<const std::int32_t>(Dk.m_Parent) }, Ctx.m_Mapping.m_DestinationCalibration, Rr, DRest);
+                const int HS = Ctx.m_Mapping.m_Auto.m_Map.m_SrcHips, HD = Ctx.m_Mapping.m_Auto.m_Map.m_TgtHips;
+                if (HS >= 0 && HD >= 0 && nFrames > 0)
+                {
+                    const float Hs = xanimation::details::HipHeight(SRest, HS), Hd = xanimation::details::HipHeight(DRest, HD);
+                    LogMessage(xresource_pipeline::msg_type::INFO, std::format("Retarget report [{}]: hip height source {:.3f}, destination {:.3f} (ratio {:.4f}); {} frames", Raw.m_Anim.m_Name, Hs, Hd, Hd / std::max(Hs, 1e-9f), nFrames));
+                    for (const int f : { 0, nFrames / 4, nFrames / 2, 3 * nFrames / 4 })
+                    {
+                        auto SP = Worlds(Sk.m_Parent, Frames, nSrc, f); const auto DP = Worlds(Dk.m_Parent, Baked, nDst, f);
+                        for (auto& P : SP) P = Ctx.m_Mapping.m_Auto.m_Map.m_Registration * P;       // the source seen through the registration, in the destination's frame
+                        std::string Line = std::format("  frame {:3d}: hips src ({:.3f} {:.3f} {:.3f}) dst ({:.3f} {:.3f} {:.3f}) |", f, SP[HS].m_X, SP[HS].m_Y, SP[HS].m_Z, DP[HD].m_X, DP[HD].m_Y, DP[HD].m_Z);
+                        for (const auto& Row : Ctx.m_Mapping.m_Auto.m_Rows)
+                        {
+                            const bool bEnd = Row.m_Slot == xanimation::bone_slot::HAND || Row.m_Slot == xanimation::bone_slot::FOOT;
+                            if (!bEnd || Row.m_Side == xanimation::bone_side::NONE) continue;
+                            const auto a = (SP[Row.m_Source] - SP[HS]) * (1.0f / Hs), b = (DP[Row.m_Target] - DP[HD]) * (1.0f / Hd);
+                            Line += std::format(" {}{} src ({:.2f} {:.2f} {:.2f}) dst ({:.2f} {:.2f} {:.2f})", Row.m_Side == xanimation::bone_side::LEFT ? "L" : "R", Row.m_Slot == xanimation::bone_slot::HAND ? "hand" : "foot", a.m_X, a.m_Y, a.m_Z, b.m_X, b.m_Y, b.m_Z);
+                        }
+                        LogMessage(xresource_pipeline::msg_type::INFO, Line);
+                    }
+                }
+            }
 
             // the clip becomes a clip of the destination skeleton: its bones are the destination's, its keys the baked frames
             xraw3d::anim Out;
