@@ -577,6 +577,22 @@ namespace xanim_package_compiler
                         }
                         LogMessage(xresource_pipeline::msg_type::INFO, Line);
                     }
+
+                    // feet planted? Each foot's support intervals (low and slow, in hip heights) found in the source and in the baked clip, and how far the foot slides while in support
+                    // (hip heights per second): a retarget that keeps the contacts has about the same intervals and no more sliding than the source had.
+                    for (const auto& Row : Ctx.m_Mapping.m_Auto.m_Rows)
+                    {
+                        if (Row.m_Slot != xanimation::bone_slot::FOOT || Row.m_Side == xanimation::bone_side::NONE) continue;
+                        std::vector<xmath::fvec3> SF, DF; SF.reserve(nFrames); DF.reserve(nFrames);
+                        for (int f = 0; f < nFrames; ++f)
+                        {
+                            auto SP = Worlds(Sk.m_Parent, Frames, nSrc, f); const auto DP = Worlds(Dk.m_Parent, Baked, nDst, f);
+                            SF.push_back(Ctx.m_Mapping.m_Auto.m_Map.m_Registration * SP[Row.m_Source] * (1.0f / Hs)); DF.push_back(DP[Row.m_Target] * (1.0f / Hd));
+                        }
+                        const auto Sc = xanimation::FindContacts(SF, Raw.m_Anim.m_FPS), Dc = xanimation::FindContacts(DF, Raw.m_Anim.m_FPS);
+                        auto Mean = [](const std::vector<xanimation::contact_interval>& C) { float T = 0; for (const auto& I : C) T += I.m_Skate; return C.empty() ? 0.0f : T / static_cast<float>(C.size()); };
+                        LogMessage(xresource_pipeline::msg_type::INFO, std::format("  {} foot contacts: source {} (skate {:.3f}/s), destination {} (skate {:.3f}/s)", Row.m_Side == xanimation::bone_side::LEFT ? "left" : "right", Sc.size(), Mean(Sc), Dc.size(), Mean(Dc)));
+                    }
                 }
             }
 
