@@ -29,6 +29,7 @@ namespace xanim_package_compiler
             xraw3d::anim   m_Anim;
             std::wstring   m_SourceFile;
             bool           m_bInSkeletonSpace = false;     // the keys are already the package skeleton's own (retargeted: its Pre/PostTransform are not applied again)
+            std::uint64_t  m_FromSkeleton = 0;             // a clip taken from another animation PACKAGE: that package's skeleton (its keys are in that skeleton's space already)
         };
 
         // The Retarget of an import source: its descriptor read (which reads both skeletons' bone manifests), the mapping resolved and the retargeter made.
@@ -59,6 +60,11 @@ namespace xanim_package_compiler
         {
             for (auto& Source : m_Descriptor.m_ImportSources)
             {
+                if (Source.bPackage())
+                {
+                    if (auto Err = LoadPackageSource(Source); Err) return Err;
+                    continue;
+                }
                 xraw3d::assimp_v3::importer             Importer;
                 xraw3d::assimp_v3::importer::settings   Settings;
                 xraw3d::geom                             GeomScratch;
@@ -73,7 +79,7 @@ namespace xanim_package_compiler
                     return xerr::create_f<state, "Failed to import an animation source">(Err);
 
                 for (auto& Anim : AnimList)
-                    m_RawClips.push_back(raw_clip{ .m_Anim = std::move(Anim), .m_SourceFile = Source.m_Path });
+                    m_RawClips.push_back(raw_clip{ .m_Anim = std::move(Anim), .m_SourceFile = Source.key() });
             }
             return {};
         }
@@ -97,7 +103,7 @@ namespace xanim_package_compiler
         {
             m_Details.m_Sources.clear();
             for (auto& Source : m_Descriptor.m_ImportSources)
-                m_Details.m_Sources.push_back({ .m_Path = Source.m_Path });
+                m_Details.m_Sources.push_back({ .m_Path = Source.key() });
 
             for (auto& Raw : m_RawClips)
             {
@@ -133,7 +139,7 @@ namespace xanim_package_compiler
         {
             for (auto& Source : m_Descriptor.m_ImportSources)
             {
-                auto& SourceMap = Map[Source.m_Path];
+                auto& SourceMap = Map[Source.key()];
                 for (auto& C : Source.m_Clips)
                     SourceMap[C.m_OriginalName] = &C;
             }
@@ -413,6 +419,69 @@ namespace xanim_package_compiler
         }
 
         //--------------------------------------------------------------------------------------
+        //--------------------------------------------------------------------------------------
+        // An import source that is another animation PACKAGE: its descriptor lists the animations (their names) and the skeleton they play on; its compiled clips are the
+        // data (already in that skeleton's space: its Pre/PostTransform were applied when it was compiled). Each clip becomes a raw clip named by the descriptor, with the
+        // bones of that package's skeleton; a clip that had its root motion taken out has it put back, so this package decides what to do with it.
+        xerr LoadPackageSource(const xanim_package_desc::import_source& Source)
+        {
+            const std::uint64_t Key = Source.m_Package.m_Instance.m_Value;
+            xanim_package_desc::descriptor Other;
+            {
+                xproperty::settings::context Context{};
+                const std::wstring Path = std::format(L"{}/Descriptors/AnimPackage/{:02X}/{:02X}/{:X}.desc/Descriptor.txt", m_ProjectPaths.m_Project, Key & 0xff, (Key & 0xff00) >> 8, Key);
+                if (auto Err = Other.Serialize(true, Path, Context); Err)
+                    return xerr::create_f<state, "The animation package of an import source could not be read (is it compiled? its skeleton?)">(Err);
+            }
+            if (Other.m_SkeletonRef.empty()) return xerr::create_f<state, "The animation package of an import source has no skeleton">();
+            const std::uint64_t FromSkeleton = Other.m_SkeletonRef.m_Instance.m_Value;
+            if (!Source.bDifferent() && FromSkeleton != m_Descriptor.m_SkeletonRef.m_Instance.m_Value)
+                return xerr::create_f<state, "The package is on another skeleton: use the 'Different skeleton: animation package' kind and a Retarget">();
+            m_Dependencies.m_Assets.push_back(xskeleton_desc::ManifestRelativePath(FromSkeleton));
+            m_Dependencies.m_Resources.push_back({ Other.m_SkeletonRef.m_Instance, xrsc::skeleton_type_guid_v });
+
+            // its compiled data, next to this resource's own output (the same platform folder)
+            if (m_Target.empty()) return xerr::create_f<state, "No output target">();
+            const std::filesystem::path Mine = std::filesystem::path(std::wstring(m_Target[0].m_DataPath));
+            const std::wstring Compiled = (Mine.parent_path().parent_path().parent_path() / std::format(L"{:02X}", Key & 0xff) / std::format(L"{:02X}", (Key & 0xff00) >> 8) / std::format(L"{:X}", Key)).wstring();
+            xanim_package::anim_package* pPackage = nullptr;
+            xserializer::stream Stream;
+            if (auto Err = Stream.Load(Compiled, pPackage); Err || !pPackage)
+                return xerr::create_f<state, "The animation package of an import source is not compiled: compile it first">();
+            struct free_it { xanim_package::anim_package* P; ~free_it() { if (P) xserializer::default_memory_handler_v.Free(xserializer::mem_type{ .m_bUnique = true }, P); } } Free{ pPackage };
+
+            const auto& Bones = Other.m_ResolvedSkeletonBones.m_Bones;
+            if (Bones.size() != pPackage->m_nBones)
+                return xerr::create_f<state, "The package and its skeleton disagree on the bones: compile the package again">();
+            int nTaken = 0;
+            for (auto& OtherSource : Other.m_ImportSources)
+                for (auto& C : OtherSource.m_Clips)
+                {
+                    if (C.m_bDelete) continue;
+                    const std::string Name = C.m_Name.empty() ? C.m_OriginalName : C.m_Name;
+                    const int iClip = pPackage->findClipIndex(xstrtool::CRC32(Name));
+                    if (iClip < 0) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Package clip '{}' is not in its compiled data (compile that package again)", Name)); continue; }
+                    const auto& PC = pPackage->getClips()[iClip];
+                    xraw3d::anim A;
+                    A.m_Name = Name; A.m_FPS = PC.m_FPS; A.m_nFrames = PC.m_nFrames;
+                    A.m_Bone.resize(Bones.size());
+                    for (std::size_t b = 0; b < Bones.size(); ++b) { A.m_Bone[b] = {}; A.m_Bone[b].m_Name = Bones[b].m_Name; A.m_Bone[b].m_iParent = Bones[b].m_iParent; }
+                    A.m_KeyFrame.resize(static_cast<std::size_t>(PC.m_nFrames) * Bones.size());
+                    int iRoot = -1; for (std::size_t b = 0; b < Bones.size(); ++b) if (Bones[b].m_iParent < 0) { iRoot = static_cast<int>(b); break; }
+                    const auto RootMotion = pPackage->getClipRootMotion(iClip);
+                    for (int f = 0; f < PC.m_nFrames; ++f)
+                    {
+                        const auto Frame = pPackage->getClipFrame(iClip, f);
+                        for (std::size_t b = 0; b < Bones.size(); ++b) A.m_KeyFrame[static_cast<std::size_t>(f) * Bones.size() + b] = Frame[b];
+                        if (!RootMotion.empty() && iRoot >= 0) A.m_KeyFrame[static_cast<std::size_t>(f) * Bones.size() + iRoot].m_Position += RootMotion[f];   // the motion the package took out of the root
+                    }
+                    m_RawClips.push_back(raw_clip{ .m_Anim = std::move(A), .m_SourceFile = Source.key(), .m_bInSkeletonSpace = true, .m_FromSkeleton = FromSkeleton });
+                    ++nTaken;
+                }
+            LogMessage(xresource_pipeline::msg_type::INFO, std::format("Animation package source: {} clips taken", nTaken));
+            return {};
+        }
+
         // A clip made on ANOTHER skeleton (its import source names a Retarget): the clip's keys go into the SOURCE skeleton's space with that skeleton's own
         // PostTransform then PreTransform (the corrections that link a skeleton and its animations), are transferred to the DESTINATION skeleton (this package's)
         // by the Retarget's mapping, and come out already in the destination's space. The clip then replaces Raw, named after the destination's bones.
@@ -445,7 +514,9 @@ namespace xanim_package_compiler
             const auto& DstManifest = Ctx.m_Descriptor.m_ResolvedDestination;
             const int nSrc = static_cast<int>(SrcManifest.m_Bones.size()), nDst = static_cast<int>(DstManifest.m_Bones.size());
 
-            FoldRaw(Raw, SrcManifest.m_Bones);                                          // the clip's nodes into the SOURCE skeleton's joints
+            if (!Raw.m_bInSkeletonSpace) FoldRaw(Raw, SrcManifest.m_Bones);             // the clip's nodes into the SOURCE skeleton's joints (a package clip has them: it IS the skeleton's)
+            else if (Raw.m_FromSkeleton != Ctx.m_Descriptor.m_Source.m_Instance.m_Value)
+                return xerr::create_f<state, "The package's skeleton is not the Retarget's source skeleton">();
 
             // the source skeleton's frames: the clip's key where it has one (by bone name), the skeleton's rest pose where it has not
             const int nRaw = static_cast<int>(Raw.m_Anim.m_Bone.size()), nFrames = Raw.m_Anim.m_nFrames;
@@ -461,7 +532,8 @@ namespace xanim_package_compiler
                         : xmath::transform3{ .m_Scale = B.m_RestScale, .m_Rotation = xmath::fquat(B.m_RestRotX, B.m_RestRotY, B.m_RestRotZ, B.m_RestRotW), .m_Position = B.m_RestPosition };
                 }
             int iRoot = -1; for (int s = 0; s < nSrc; ++s) if (SrcManifest.m_Bones[s].m_iParent < 0) { iRoot = s; break; }
-            if (iRoot != -1 && SrcToRaw[iRoot] != -1)                                   // the skeleton's own root, animated by the clip: raw import space -> the skeleton's space
+            if (Raw.m_bInSkeletonSpace) {}                                              // a package clip: already in its skeleton's space (its own Pre/PostTransform were applied when it was compiled)
+            else if (iRoot != -1 && SrcToRaw[iRoot] != -1)                              // the skeleton's own root, animated by the clip: raw import space -> the skeleton's space
             {
                 auto Corr = [](const xmath::fvec3& S, const xmath::fvec3& R, const xmath::fvec3& T) { xanimation::root_correction C; C.m_Scale = S; C.m_RotationDeg = R; C.m_Translation = T; return C; };
                 xanimation::ToSkeletonSpace(Frames, nSrc, iRoot
@@ -521,7 +593,7 @@ namespace xanim_package_compiler
 
         const xanim_package_desc::import_source* FindSource(const std::wstring& Path) const noexcept
         {
-            for (auto& S : m_Descriptor.m_ImportSources) if (S.m_Path == Path) return &S;
+            for (auto& S : m_Descriptor.m_ImportSources) if (S.key() == Path) return &S;
             return nullptr;
         }
 
@@ -540,11 +612,11 @@ namespace xanim_package_compiler
 
             for (auto& Raw : m_RawClips)
             {
-                if (const auto* pSource = FindSource(Raw.m_SourceFile); pSource && !pSource->m_Retarget.empty())
+                if (const auto* pSource = FindSource(Raw.m_SourceFile); pSource && pSource->bDifferent())
                 {
-                    if (auto Err = RetargetRaw(Raw, *pSource); Err) return Err;
+                    if (auto Err = RetargetRaw(Raw, *pSource); Err) return Err;           // (a package clip is in its skeleton's space already: RetargetRaw knows)
                 }
-                else FoldRaw(Raw, ResolvedBones);
+                else if (!Raw.m_bInSkeletonSpace) FoldRaw(Raw, ResolvedBones);            // an asset on this skeleton: its nodes folded into this skeleton's joints
 
                 const xanim_package_desc::clip* pOv = nullptr;
                 if (auto SourceIt = Overrides.find(Raw.m_SourceFile); SourceIt != Overrides.end())
@@ -629,7 +701,10 @@ namespace xanim_package_compiler
             // Every source file is a dependency of this resource, registered BEFORE loading them (a broken link still shows as a dependent of the file): it is what the Assets tab counts
             // (the #N of the file) and lists (Find Resource / Open Resource), and what makes a change of a file compile this resource again.
             for (auto& Source : m_Descriptor.m_ImportSources)
-                if (!Source.m_Path.empty()) m_Dependencies.m_Assets.push_back(Source.m_Path);
+            {
+                if (Source.bAsset() && !Source.m_Path.empty()) m_Dependencies.m_Assets.push_back(Source.m_Path);
+                if (Source.bPackage() && !Source.m_Package.empty()) m_Dependencies.m_Resources.push_back({ Source.m_Package.m_Instance, xrsc::anim_package_type_guid_v });     // it follows the package it takes animations from
+            }
 
             // The package follows its skeleton (its PreTransform is applied to the root's keys, its bones are what the curves bind to): it compiles again whenever the skeleton does
             if (!m_Descriptor.m_SkeletonRef.empty())

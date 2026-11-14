@@ -6,6 +6,7 @@
 #include "plugins/xskeleton.plugin/source/xskeleton_bone_manifest.h"
 #include "plugins/xretarget.plugin/source/xretarget_ref.h"
 #include "xanim_package.h"
+#include "xanim_package_xgpu_rsc_loader.h"
 #include "xanim_package_details.h"
 #include "dependencies/xstrtool/source/xstrtool.h"
 #include <functional>
@@ -22,6 +23,17 @@ namespace xanim_package_desc
     { xproperty::settings::enum_item("None",    xanim_package::root_motion_mode::NONE)
     , xproperty::settings::enum_item("XZ Only", xanim_package::root_motion_mode::XZ_ONLY)
     , xproperty::settings::enum_item("XYZ",     xanim_package::root_motion_mode::XYZ)
+    };
+
+    // Where an import source's animations come from (Tomas 2026-11-15). Each entry of the package's input list says which:
+    //   an animation ASSET (an fbx or any file the importer reads) made on THIS package's skeleton, or on ANOTHER skeleton (then a Retarget resource moves it);
+    //   another animation PACKAGE (its descriptor lists the animations, its compiled clips are the data) on this package's skeleton, or on another (a Retarget again).
+    enum class import_kind : std::uint8_t { SAME_SKELETON_ASSET, DIFFERENT_SKELETON_ASSET, SAME_SKELETON_PACKAGE, DIFFERENT_SKELETON_PACKAGE };
+    static constexpr auto import_kind_v = std::array
+    { xproperty::settings::enum_item("Same skeleton: animation asset",         import_kind::SAME_SKELETON_ASSET)
+    , xproperty::settings::enum_item("Different skeleton: animation asset",    import_kind::DIFFERENT_SKELETON_ASSET)
+    , xproperty::settings::enum_item("Same skeleton: animation package",       import_kind::SAME_SKELETON_PACKAGE)
+    , xproperty::settings::enum_item("Different skeleton: animation package",  import_kind::DIFFERENT_SKELETON_PACKAGE)
     };
 
     // A sparse override entry for one imported clip, matched BY m_OriginalName against its OWNING
@@ -58,14 +70,30 @@ namespace xanim_package_desc
     // entry here (see MergeWithDetails), curated per-file rather than in one cross-file pool.
     struct import_source
     {
-        std::wstring       m_Path  = {};
-        std::vector<clip>  m_Clips = {};   // every clip found in THIS file, curated
-        xrsc::retarget     m_Retarget = {};// empty: the file's clips are on this package's skeleton. Set: they are on ANOTHER skeleton (the Retarget's source) and are moved onto this package's skeleton (its destination)
+        import_kind        m_Kind    = import_kind::SAME_SKELETON_ASSET;
+        std::wstring       m_Path    = {};      // the animation asset (the two asset kinds)
+        xrsc::anim_package m_Package = {};      // the animation package (the two package kinds): its descriptor lists the animations, its compiled clips are the data
+        xrsc::retarget     m_Retarget = {};     // the two DIFFERENT kinds: the Retarget from the skeleton the animations were made on to this package's skeleton
+        std::vector<clip>  m_Clips   = {};      // every clip found in THIS source, curated
+
+        // The kind as it counts: a source saved before kinds existed that names a Retarget is a different-skeleton asset
+        import_kind kind(void) const noexcept { return (m_Kind == import_kind::SAME_SKELETON_ASSET && !m_Retarget.empty()) ? import_kind::DIFFERENT_SKELETON_ASSET : m_Kind; }
+        bool bAsset  (void) const noexcept { return kind() == import_kind::SAME_SKELETON_ASSET || kind() == import_kind::DIFFERENT_SKELETON_ASSET; }
+        bool bPackage(void) const noexcept { return !bAsset(); }
+        bool bDifferent(void) const noexcept { return kind() == import_kind::DIFFERENT_SKELETON_ASSET || kind() == import_kind::DIFFERENT_SKELETON_PACKAGE; }
+
+        // What names this source in the details (the compiler's list of what each source holds): the file, or the package
+        std::wstring key(void) const { return bAsset() ? m_Path : std::format(L"package:{:X}", m_Package.m_Instance.m_Value); }
 
         XPROPERTY_DEF
         ( "ImportSource", import_source
-        , obj_member<"Path",    &import_source::m_Path, member_ui<std::wstring>::file_dialog<mesh_filter_v, true, 1> >
-        , obj_member<"Retarget", &import_source::m_Retarget, member_help<"The Retarget that moves this file's clips from the skeleton they were made on to this package's skeleton. Leave empty when they were made on it">>
+        , obj_member<"Type", &import_source::m_Kind, member_enum_span<import_kind_v>, member_help<"Where this source's animations come from: an animation asset or another animation package, made on this package's skeleton or on another one (then a Retarget moves them)">>
+        , obj_member<"Path", &import_source::m_Path, member_ui<std::wstring>::file_dialog<mesh_filter_v, true, 1>
+            , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bAsset(); return F; }> >
+        , obj_member<"Package", &import_source::m_Package, member_help<"The animation package whose animations are brought in (its descriptor lists them)">
+            , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bPackage(); return F; }> >
+        , obj_member<"Retarget", &import_source::m_Retarget, member_help<"The Retarget resource that moves these animations from the skeleton they were made on (its Source) to this package's skeleton (its Destination)">
+            , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bDifferent(); return F; }> >
         , obj_member<"Clips",   &import_source::m_Clips >
         )
     };
@@ -93,12 +121,19 @@ namespace xanim_package_desc
             {
                 Errors.push_back(std::format("No import sources - nothing to compile"));
             }
+            for (int i = 0; i < static_cast<int>(m_ImportSources.size()); ++i)
+            {
+                const auto& S = m_ImportSources[i];
+                if (S.bAsset() && S.m_Path.empty())           Errors.push_back(std::format("Import source {}: an animation asset kind needs its Path", i));
+                if (S.bPackage() && S.m_Package.empty())      Errors.push_back(std::format("Import source {}: an animation package kind needs its Package", i));
+                if (S.bDifferent() && S.m_Retarget.empty())   Errors.push_back(std::format("Import source {}: a different-skeleton kind needs its Retarget", i));
+            }
         }
 
         int findImportSource(std::wstring_view Path) const noexcept
         {
             for (auto& E : m_ImportSources)
-                if (E.m_Path == Path) return static_cast<int>(&E - m_ImportSources.data());
+                if (E.key() == Path) return static_cast<int>(&E - m_ImportSources.data());
             return -1;
         }
 
@@ -117,7 +152,7 @@ namespace xanim_package_desc
 
             for (auto& Source : m_ImportSources)
             {
-                const int iDetailsSource = Details.findSource(Source.m_Path);
+                const int iDetailsSource = Details.findSource(Source.key());
                 if (iDetailsSource == -1) continue;
                 const auto& DetailsSource = Details.m_Sources[iDetailsSource];
 
@@ -197,8 +232,8 @@ namespace xanim_package_desc
 
         XPROPERTY_VDEF
         ( "AnimPackage", descriptor
+        , obj_member<"SkeletonRef",             &descriptor::m_SkeletonRef >          // first: the skeleton every source ends up on
         , obj_member<"ImportSources",           &descriptor::m_ImportSources >
-        , obj_member<"SkeletonRef",             &descriptor::m_SkeletonRef >
         , obj_member<"ResolvedSkeletonBones",   &descriptor::m_ResolvedSkeletonBones, member_flags<flags::DONT_SHOW, flags::DONT_SAVE> >
         )
     };
