@@ -11,7 +11,7 @@
 #include "dependencies/xeditor/include/xeditor/hint.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_inspector_pickers.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_resources.h"
-#include "plugins/xskeleton.plugin/source/Editor/xskeleton_editor_scene.h"
+#include "plugins/xskeleton.plugin/source/Editor/xskeleton_viewport.h"
 #include "plugins/xanim_package.plugin/source/xanim_package.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_descriptor.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.h"
@@ -100,7 +100,7 @@ namespace xanim_package_editor
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
 
-        xskeleton_editor::scene                         m_Scene;
+        xskeleton_editor::skeleton_viewport             m_Viewport;             // the shared 3D skeleton panel (the scene is m_Viewport.m_Scene)
         xeditor::camera_toolbar                         m_CameraToolbar;
         xeditor::camera_cmds                            m_CameraCmds;
         xrsc::anim_package                              m_Ref;
@@ -137,7 +137,7 @@ namespace xanim_package_editor
             , m_SetSpeed  (m_Undo, *this, playback_cmd::kind::set_speed,   "SetSpeed",   "Sets the playback speed step (0 = 0.25x, 3 = 1x, 7 = 3x). Usage: SetSpeed -Index step")
             , m_Info      (m_Undo, *this, playback_cmd::kind::info,        "PlaybackInfo","The selected clip, the time and whether it plays. Usage: PlaybackInfo")
             , m_ListClips (m_Undo, *this, playback_cmd::kind::list_clips,  "ListClips",  "Every clip with its options and whether it is compiled. Usage: ListClips")
-            , m_CameraCmds(m_Undo, m_Scene.Camera())
+            , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
             m_Document.m_TolerateReadError = [](const xresource_pipeline::descriptor::base& D) { return !static_cast<const desc&>(D).m_SkeletonRef.empty(); };
@@ -152,7 +152,8 @@ namespace xanim_package_editor
             AddPanel("Playback",             dock::bottom, [this] { RenderPlayback(); });
             AddPanel("Description",          dock::left,   [this] { m_DescriptorInspector.Show(); });
 
-            m_bReady = pDevice && m_Scene.Init(*pDevice);
+            m_Viewport.m_pOpen = &m_bOpen;
+            m_bReady = pDevice && m_Viewport.Init(*pDevice);
             Reload();
         }
 
@@ -160,7 +161,7 @@ namespace xanim_package_editor
         {
             xresource::g_Mgr.ReleaseRef(m_Ref);
             xresource::g_Mgr.ReleaseRef(m_SkeletonRef);
-            m_Scene.Release();
+            m_Viewport.Release();
         }
 
         bool m_bReady = false;
@@ -232,9 +233,9 @@ namespace xanim_package_editor
             if (!m_RestWorlds.empty()) Center /= float(m_RestWorlds.size());
             float Radius = 0.5f;
             for (auto& M : m_RestWorlds) Radius = std::max(Radius, (M.ExtractPosition() - Center).Length());
-            m_Scene.m_Center  = Center;
-            m_Scene.m_Radius  = Radius;
-            m_Scene.m_bReframe = true;
+            m_Viewport.m_Scene.m_Center  = Center;
+            m_Viewport.m_Scene.m_Radius  = Radius;
+            m_Viewport.m_Scene.m_bReframe = true;
 
             m_bShowable = true;
             if (m_iSelectedSource >= 0) SelectDescriptorClip(m_iSelectedSource, m_iSelectedDescriptorClip);
@@ -464,7 +465,7 @@ namespace xanim_package_editor
 
         void RenderViewport() noexcept
         {
-            m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Scene.m_State, [this] { RenderViewportBody(); });
+            m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Viewport.m_Scene.m_State, [this] { RenderViewportBody(); });
         }
 
         void RenderViewportBody() noexcept
@@ -476,28 +477,10 @@ namespace xanim_package_editor
             auto* pSkeleton = xresource::g_Mgr.getResource(m_SkeletonRef);
             if (!pSkeleton) return;
 
-            const ImVec2 Avail = ImGui::GetContentRegionAvail();
-            const ImVec2 Min   = ImGui::GetCursorScreenPos();
-            ImGui::GetWindowDrawList()->AddRectFilled(Min, ImVec2(Min.x + Avail.x, Min.y + Avail.y), IM_COL32(115, 115, 115, 255));        // the depth tint fades toward this
-            ImGui::InvisibleButton("##AnimViewport", Avail, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
-            xeditor::PreviewGestures();
-            m_Scene.HandleInput();
             // Play / pause is the AnimPackage/Preview/PlayPause action (P; Space belongs to the drawer).
-
-            m_Scene.UpdateView(Min, Avail.x, Avail.y);
             EvaluatePose(*pSkeleton);
-
-            const std::vector<bool> NoTwist;
-            const std::set<int>     NoSelection;
-            xskeleton_editor::BuildWedgeGeometry(*pSkeleton, m_PoseBones, NoTwist, m_Scene.Style(), NoSelection, m_Scene.m_Radius
-                , xskeleton_editor::render_color_mode::NORMAL_RENDER, -1, -1, m_Lines, true);
-            m_Scene.SetLines(m_Lines);
-
-            xgpu::tools::imgui::AddCustomRenderCallback([this](xgpu::cmd_buffer& CmdBuffer, const ImVec2&, const ImVec2&)
-            {
-                if (m_bOpen) m_Scene.Draw(CmdBuffer);
-            });
-            m_Scene.DrawOverlay();
+            const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSkeleton, .m_Bones = m_PoseBones };
+            m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
         }
 
         void RenderPlayback() noexcept
