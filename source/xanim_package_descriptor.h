@@ -15,7 +15,7 @@ namespace xanim_package_desc
 {
     inline static constexpr auto    resource_type_guid_v    = xresource::type_guid(xresource::guid_generator::Instance64FromString("xAnimPackage"));
 
-    static constexpr wchar_t        mesh_filter_v[]         = L"Animation\0 *.fbx; *.obj\0Any Thing\0 *.*\0";
+    static constexpr wchar_t        mesh_filter_v[]         = L"Animation\0 *.fbx; *.obj; *.blend\0Any Thing\0 *.*\0";
 
     static constexpr auto root_motion_mode_v = std::array
     { xproperty::settings::enum_item("None",    xanim_package::root_motion_mode::NONE)
