@@ -36,6 +36,112 @@ namespace xanim_package_desc
     , xproperty::settings::enum_item("Different skeleton: animation package",  import_kind::DIFFERENT_SKELETON_PACKAGE)
     };
 
+    //----------------------------------------------------------------------------------------------
+    // Animation layers (the layered edit mode, xLION_Docs animation_layered_edit_design_v2_2026-11-15.md; evaluation: xAnimation
+    // blend/xanimation_layers.h). A clip's layers sit on top of the clip as imported (its SOURCE, never a compiled output) and are baked into
+    // it by the compile, before its trim / downsample / root motion. A clip with no layers compiles exactly as before.
+    // L1: Clip layers only; a layer's source is a clip of one of THIS package's import sources (so a file, a Retargeted file or another
+    // package's clips: whatever the package imports); masks are bone entries (skeleton regions later).
+    //----------------------------------------------------------------------------------------------
+    enum class layer_mode : std::uint8_t { OVERRIDE, ADDITIVE };
+    static constexpr auto layer_mode_v = std::array
+    { xproperty::settings::enum_item("Override", layer_mode::OVERRIDE)
+    , xproperty::settings::enum_item("Additive", layer_mode::ADDITIVE)
+    };
+    enum class additive_reference : std::uint8_t { REST_POSE, SOURCE_FRAME };
+    static constexpr auto additive_reference_v = std::array
+    { xproperty::settings::enum_item("Rest pose",             additive_reference::REST_POSE)
+    , xproperty::settings::enum_item("A frame of the source", additive_reference::SOURCE_FRAME)
+    };
+    enum class layer_root : std::uint8_t { INHERIT_BELOW, FROM_LAYER };
+    static constexpr auto layer_root_v = std::array
+    { xproperty::settings::enum_item("Inherit below", layer_root::INHERIT_BELOW)
+    , xproperty::settings::enum_item("From layer",    layer_root::FROM_LAYER)
+    };
+
+    // A bone entry of a layer's mask: this bone (and, inheriting, its descendants until a nearer entry) at Value; BlendDepth > 0 ramps the
+    // value in down the branch: Value * min(1, (depth + 1) / BlendDepth). Nothing listed = the layer touches nothing.
+    struct layer_mask_entry
+    {
+        std::string     m_Bone       = {};
+        float           m_Value      = 1.0f;
+        bool            m_bInherit   = true;
+        int             m_BlendDepth = 0;
+
+        XPROPERTY_DEF
+        ( "MaskEntry", layer_mask_entry
+        , obj_member<"Bone",       &layer_mask_entry::m_Bone >
+        , obj_member<"Value",      &layer_mask_entry::m_Value >
+        , obj_member<"Inherit",    &layer_mask_entry::m_bInherit >
+        , obj_member<"BlendDepth", &layer_mask_entry::m_BlendDepth >
+        )
+    };
+    XPROPERTY_REG(layer_mask_entry)
+
+    struct layer_weight_key
+    {
+        std::int64_t    m_Tick  = 0;            // 6000 per second (xanimation::ticks_per_second_v)
+        float           m_Value = 1.0f;
+        bool            m_bStep = false;        // hold this value until the next key (else linear)
+
+        XPROPERTY_DEF
+        ( "WeightKey", layer_weight_key
+        , obj_member<"Tick",  &layer_weight_key::m_Tick >
+        , obj_member<"Value", &layer_weight_key::m_Value >
+        , obj_member<"Step",  &layer_weight_key::m_bStep >
+        )
+    };
+    XPROPERTY_REG(layer_weight_key)
+
+    struct clip_layer
+    {
+        std::uint64_t       m_Id          = 0;          // stable identity (commands, undo, reports); 0 = not given yet (the editor gives one)
+        std::string         m_Name        = {};
+        bool                m_bEnabled    = true;       // a disabled layer is not in the build (solo is the editor's, never stored)
+        layer_mode          m_Mode        = layer_mode::OVERRIDE;
+        additive_reference  m_Reference   = additive_reference::REST_POSE;
+        std::int64_t        m_ReferenceTick = 0;        // SOURCE_FRAME: the source time of the reference frame (ticks)
+        std::wstring        m_SourceKey   = {};         // the import source of this package (its key: the path, or package:HEX)
+        std::string         m_SourceClip  = {};         // the clip there (its original name)
+        std::int64_t        m_Start       = 0;          // composition span [Start, End) in ticks; End -1 = the clip's end
+        std::int64_t        m_End         = -1;
+        std::int64_t        m_TrimIn      = 0;          // the source span [TrimIn, TrimOut] in ticks; TrimOut -1 = the source's end
+        std::int64_t        m_TrimOut     = -1;
+        double              m_Rate        = 1.0;        // >= 0; 0 = hold
+        bool                m_bReverse    = false;
+        float               m_Weight      = 1.0f;       // used when there are no weight keys
+        std::vector<layer_weight_key>   m_WeightKeys = {};
+        std::vector<layer_mask_entry>   m_Mask       = {};
+        bool                m_bRotation   = true;       // the channels the layer brings
+        bool                m_bPosition   = false;
+        layer_root          m_Root        = layer_root::INHERIT_BELOW;
+
+        XPROPERTY_DEF
+        ( "Layer", clip_layer
+        , obj_member<"Id",            &clip_layer::m_Id, member_flags<flags::SHOW_READONLY> >
+        , obj_member<"Name",          &clip_layer::m_Name >
+        , obj_member<"Enabled",       &clip_layer::m_bEnabled >
+        , obj_member<"Mode",          &clip_layer::m_Mode, member_enum_span<layer_mode_v> >
+        , obj_member<"Reference",     &clip_layer::m_Reference, member_enum_span<additive_reference_v> >
+        , obj_member<"ReferenceTick", &clip_layer::m_ReferenceTick >
+        , obj_member<"SourceKey",     &clip_layer::m_SourceKey >
+        , obj_member<"SourceClip",    &clip_layer::m_SourceClip >
+        , obj_member<"Start",         &clip_layer::m_Start >
+        , obj_member<"End",           &clip_layer::m_End >
+        , obj_member<"TrimIn",        &clip_layer::m_TrimIn >
+        , obj_member<"TrimOut",       &clip_layer::m_TrimOut >
+        , obj_member<"Rate",          &clip_layer::m_Rate >
+        , obj_member<"Reverse",       &clip_layer::m_bReverse >
+        , obj_member<"Weight",        &clip_layer::m_Weight >
+        , obj_member<"WeightKeys",    &clip_layer::m_WeightKeys >
+        , obj_member<"Mask",          &clip_layer::m_Mask >
+        , obj_member<"Rotation",      &clip_layer::m_bRotation >
+        , obj_member<"Position",      &clip_layer::m_bPosition >
+        , obj_member<"Root",          &clip_layer::m_Root, member_enum_span<layer_root_v> >
+        )
+    };
+    XPROPERTY_REG(clip_layer)
+
     // A sparse override entry for one imported clip, matched BY m_OriginalName against its OWNING
     // import_source's own details::source::m_ClipList - a raw clip's name is only ever guaranteed
     // unique WITHIN the file it came from (see xanim_package_details.h's own comment on why), so this
@@ -50,6 +156,7 @@ namespace xanim_package_desc
         int                               m_TrimStartFrame = -1;   // frame index, in the FINAL (post-resample) domain; -1 = from the start
         int                               m_TrimEndFrame   = -1;   // frame index; -1 = to the end
         xanim_package::root_motion_mode   m_RootMotion     = xanim_package::root_motion_mode::NONE;
+        std::vector<clip_layer>           m_Layers         = {};   // the layered edit mode: baked into this clip before its trim/downsample/root motion
 
         XPROPERTY_DEF
         ( "Clip", clip
@@ -61,6 +168,7 @@ namespace xanim_package_desc
         , obj_member<"TrimStartFrame",  &clip::m_TrimStartFrame >
         , obj_member<"TrimEndFrame",    &clip::m_TrimEndFrame >
         , obj_member<"RootMotion",      &clip::m_RootMotion, member_enum_span<root_motion_mode_v> >
+        , obj_member<"Layers",          &clip::m_Layers >
         )
     };
     XPROPERTY_REG(clip)
@@ -144,6 +252,16 @@ namespace xanim_package_desc
                 if (S.bAsset() && S.m_Path.empty())           Errors.push_back(std::format("Import source {}: an animation asset kind needs its Path", i));
                 if (S.bPackage() && S.m_Package.empty())      Errors.push_back(std::format("Import source {}: an animation package kind needs its Package", i));
                 if (S.bDifferent() && S.m_Retarget.empty())   Errors.push_back(std::format("Import source {}: a different-skeleton kind needs its Retarget", i));
+                for (const auto& C : S.m_Clips)
+                    for (const auto& L : C.m_Layers)
+                    {
+                        const auto Where = std::format("Clip '{}', layer '{}'", C.m_Name, L.m_Name);
+                        if (L.m_SourceKey.empty() || L.m_SourceClip.empty())   Errors.push_back(Where + ": no source clip (SourceKey and SourceClip)");
+                        else if (findImportSource(L.m_SourceKey) == -1)        Errors.push_back(Where + ": its source is not one of this package's import sources");
+                        if (!(L.m_Rate >= 0.0))                                Errors.push_back(Where + ": a negative rate (use Reverse to play backwards)");
+                        if (L.m_End >= 0 && L.m_End <= L.m_Start)              Errors.push_back(Where + ": it ends before it starts");
+                        if (L.m_TrimOut >= 0 && L.m_TrimOut < L.m_TrimIn)      Errors.push_back(Where + ": trim out is before trim in");
+                    }
             }
         }
 

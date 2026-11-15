@@ -8,6 +8,7 @@
 #include "../xanim_package_descriptor.h"
 #include "plugins/xretarget.plugin/source/xretarget_mapping.h"
 #include "dependencies/xAnimation/source/xanimation.h"
+#include "dependencies/xAnimation/source/blend/xanimation_layers.h"
 #include "../xanim_package.h"
 #include "../xanim_package_details.h"
 
@@ -155,8 +156,174 @@ namespace xanim_package_compiler
         }
 
         //--------------------------------------------------------------------------------------
+        // Layers (the layered edit mode): a raw clip in the skeleton's bone order AND space, every source frame (no trim, no resample):
+        // the same mapping and root corrections BuildCompiledClip applies, done once for the whole clip so layers can sample it.
+        static std::vector<xmath::transform3> SkeletonFrames(const raw_clip& Raw, const xskeleton_desc::bone_manifest& Manifest)
+        {
+            const auto& Bones = Manifest.m_Bones;
+            const int nSkel = static_cast<int>(Bones.size()), nRaw = static_cast<int>(Raw.m_Anim.m_Bone.size()), nFrames = Raw.m_Anim.m_nFrames;
+            std::vector<int> SkelToRaw(nSkel, -1);
+            for (int s = 0; s < nSkel; ++s)
+                for (int r = 0; r < nRaw; ++r) if (Raw.m_Anim.m_Bone[r].m_Name == Bones[s].m_Name) { SkelToRaw[s] = r; break; }
+            std::vector<xmath::transform3> Out(static_cast<std::size_t>(nFrames) * nSkel);
+            for (int f = 0; f < nFrames; ++f)
+                for (int s = 0; s < nSkel; ++s)
+                    Out[static_cast<std::size_t>(f) * nSkel + s] = SkelToRaw[s] != -1 ? Raw.m_Anim.m_KeyFrame[static_cast<std::size_t>(f) * nRaw + SkelToRaw[s]]
+                        : xmath::transform3{ .m_Scale = Bones[s].m_RestScale, .m_Rotation = xmath::fquat(Bones[s].m_RestRotX, Bones[s].m_RestRotY, Bones[s].m_RestRotZ, Bones[s].m_RestRotW), .m_Position = Bones[s].m_RestPosition };
+            int iRoot = -1;
+            for (int s = 0; s < nSkel; ++s) if (Bones[s].m_iParent < 0) { iRoot = s; break; }
+            if (!Raw.m_bInSkeletonSpace && iRoot != -1 && SkelToRaw[iRoot] != -1)
+            {
+                auto Apply = [&](const xmath::fvec3& Scale, const xmath::fvec3& RotationDeg, const xmath::fvec3& Translation)
+                {
+                    if (Scale == xmath::fvec3::fromOne() && RotationDeg == xmath::fvec3::fromZero() && Translation == xmath::fvec3::fromZero()) return;
+                    xmath::radian3 Rot;
+                    Rot.m_Roll  = xmath::radian{ xmath::DegToRad(RotationDeg.m_Z) };
+                    Rot.m_Pitch = xmath::radian{ xmath::DegToRad(RotationDeg.m_X) };
+                    Rot.m_Yaw   = xmath::radian{ xmath::DegToRad(RotationDeg.m_Y) };
+                    const xmath::fquat Quat(Rot);
+                    const xmath::fmat4 M(Scale, Quat, Translation);
+                    for (int f = 0; f < nFrames; ++f)
+                    {
+                        auto& K = Out[static_cast<std::size_t>(f) * nSkel + iRoot];
+                        K.m_Position = M * K.m_Position; K.m_Rotation = Quat * K.m_Rotation; K.m_Scale = Scale * K.m_Scale;
+                    }
+                };
+                Apply(Manifest.m_PostTransformScale, Manifest.m_PostTransformRotationDeg, Manifest.m_PostTransformTranslation);
+                Apply(Manifest.m_PreTransformScale,  Manifest.m_PreTransformRotationDeg,  Manifest.m_PreTransformTranslation);
+            }
+            return Out;
+        }
+
+        // The clip's layers baked onto its source frames (xAnimation blend/xanimation_layers.h), with the isolation report in the log:
+        // per layer what it wrote, and over the clip how much changed OUTSIDE every layer's mask (must be 0) and the root's travel.
+        xerr ComposeClip(const raw_clip& Base, const xanim_package_desc::clip& Ov, const xskeleton_desc::bone_manifest& Manifest, std::vector<xmath::transform3>& Out)
+        {
+            const auto& Bones = Manifest.m_Bones;
+            const int nSkel = static_cast<int>(Bones.size()), nFrames = Base.m_Anim.m_nFrames, FPS = std::max(1, Base.m_Anim.m_FPS);
+            std::vector<std::int32_t> Parents(nSkel);
+            int iRoot = 0;
+            for (int s = 0; s < nSkel; ++s) { Parents[s] = Bones[s].m_iParent; if (Bones[s].m_iParent < 0) iRoot = s; }
+            const xanimation::skeleton_view Skel{ Parents };
+            const std::vector<xmath::transform3> BaseFrames = SkeletonFrames(Base, Manifest);
+            Out = BaseFrames;
+            auto ToTick = [](double Seconds) { return static_cast<xanimation::tick>(std::llround(Seconds * double(xanimation::ticks_per_second_v))); };
+
+            struct prepared
+            {
+                const xanim_package_desc::clip_layer*   m_pDesc;
+                std::vector<xmath::transform3>          m_Frames;
+                xanimation::clip_view                   m_View;
+                xanimation::section_time                m_Time;
+                std::vector<float>                      m_Mask;
+                std::vector<xanimation::weight_key>     m_Keys;
+                xanimation::layer_sample                m_Reference;
+                std::uint8_t                            m_Channels = 0;
+                std::size_t                             m_Written = 0, m_WrittenOutside = 0;
+            };
+            std::vector<prepared> Layers;
+            Layers.reserve(Ov.m_Layers.size());
+            std::vector<float> Union(nSkel, 0.0f);
+            for (const auto& L : Ov.m_Layers)
+            {
+                if (!L.m_bEnabled) continue;
+                const raw_clip* pSrc = nullptr;
+                for (const auto& R : m_RawClips) if (R.m_SourceFile == L.m_SourceKey && R.m_Anim.m_Name == L.m_SourceClip) { pSrc = &R; break; }
+                if (!pSrc)
+                {
+                    LogMessage(xresource_pipeline::msg_type::ERROR, std::format("Clip '{}', layer '{}': its source clip '{}' of '{}' was not found", Ov.m_Name, L.m_Name, L.m_SourceClip, xstrtool::To(L.m_SourceKey)));
+                    return xerr::create_f<state, "A layer's source clip was not found">();
+                }
+                auto& P = Layers.emplace_back();
+                P.m_pDesc  = &L;
+                P.m_Frames = SkeletonFrames(*pSrc, Manifest);
+                P.m_View   = xanimation::clip_view{ P.m_Frames, nSkel, pSrc->m_Anim.m_nFrames, std::max(1, pSrc->m_Anim.m_FPS), false };
+                const xanimation::tick SourceEnd = ToTick(double(std::max(0, pSrc->m_Anim.m_nFrames - 1)) / P.m_View.m_FPS);
+                P.m_Time = { .m_Start = L.m_Start, .m_End = L.m_End >= 0 ? L.m_End : ToTick(double(nFrames) / FPS)
+                           , .m_TrimIn = L.m_TrimIn, .m_TrimOut = L.m_TrimOut >= 0 ? L.m_TrimOut : SourceEnd, .m_Rate = L.m_Rate, .m_bReverse = L.m_bReverse };
+                if (std::string Why; !xanimation::ValidateSection(P.m_Time, &Why))
+                {
+                    LogMessage(xresource_pipeline::msg_type::ERROR, std::format("Clip '{}', layer '{}': {}", Ov.m_Name, L.m_Name, Why));
+                    return xerr::create_f<state, "A layer's time span is not valid">();
+                }
+                xanimation::mask_rules Rules;
+                for (const auto& E : L.m_Mask)
+                {
+                    int b = -1;
+                    for (int s = 0; s < nSkel; ++s) if (Bones[s].m_Name == E.m_Bone) { b = s; break; }
+                    if (b < 0) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}', layer '{}': mask bone '{}' is not in the skeleton (ignored)", Ov.m_Name, L.m_Name, E.m_Bone)); continue; }
+                    Rules.m_Entries.push_back({ .m_Bone = b, .m_Value = E.m_Value, .m_bInherit = E.m_bInherit, .m_BlendDepth = E.m_BlendDepth });
+                }
+                P.m_Mask = xanimation::FlattenMask(Skel, Rules);
+                for (int s = 0; s < nSkel; ++s) Union[s] = std::max(Union[s], P.m_Mask[s]);
+                for (const auto& K : L.m_WeightKeys)
+                    P.m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Value = K.m_Value, .m_Interp = K.m_bStep ? xanimation::weight_key::interp::STEP : xanimation::weight_key::interp::LINEAR });
+                std::sort(P.m_Keys.begin(), P.m_Keys.end(), [](const auto& A, const auto& B) { return A.m_Tick < B.m_Tick; });
+                P.m_Channels = (L.m_bRotation ? xanimation::CHANNEL_ROTATION : 0) | (L.m_bPosition ? xanimation::CHANNEL_POSITION : 0);
+                if (L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE)
+                {
+                    P.m_Reference.resize(nSkel, P.m_Channels);
+                    if (L.m_Reference == xanim_package_desc::additive_reference::SOURCE_FRAME)
+                        xanimation::SampleLocal(P.m_View, float(xanimation::TicksToSeconds(L.m_ReferenceTick)), P.m_Reference.m_Pose);
+                    else
+                        for (int s = 0; s < nSkel; ++s)
+                            P.m_Reference.m_Pose.set(s, xmath::transform3{ .m_Scale = Bones[s].m_RestScale, .m_Rotation = xmath::fquat(Bones[s].m_RestRotX, Bones[s].m_RestRotY, Bones[s].m_RestRotZ, Bones[s].m_RestRotW), .m_Position = Bones[s].m_RestPosition });
+                }
+            }
+
+            xanimation::pose Pose; Pose.resize(nSkel);
+            xanimation::layer_sample Sample; Sample.resize(nSkel);
+            std::vector<std::uint8_t> Written;
+            for (int f = 0; f < nFrames; ++f)
+            {
+                for (int s = 0; s < nSkel; ++s) Pose.set(s, Out[static_cast<std::size_t>(f) * nSkel + s]);
+                const xanimation::tick T = ToTick(double(f) / FPS);
+                for (auto& P : Layers)
+                {
+                    if (!xanimation::SampleSection(P.m_View, P.m_Time, T, P.m_Channels, Sample)) continue;
+                    xanimation::layer_apply A;
+                    A.m_Mode = P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? xanimation::layer_mode::ADDITIVE : xanimation::layer_mode::OVERRIDE;
+                    A.m_Weight = xanimation::EvaluateWeight(P.m_Keys, T, P.m_pDesc->m_Weight);
+                    A.m_Mask = P.m_Mask;
+                    A.m_pReference = A.m_Mode == xanimation::layer_mode::ADDITIVE ? &P.m_Reference : nullptr;
+                    A.m_Root = P.m_pDesc->m_Root == xanim_package_desc::layer_root::FROM_LAYER ? xanimation::root_policy::FROM_LAYER : xanimation::root_policy::INHERIT_BELOW;
+                    A.m_RootBone = iRoot;
+                    xanimation::ApplyLayer(Pose, Sample, A, &Written);
+                    for (int s = 0; s < nSkel; ++s)
+                        if (Written[s]) { ++P.m_Written; if (P.m_Mask[s] <= 0.0f) ++P.m_WrittenOutside; }
+                }
+                for (int s = 0; s < nSkel; ++s) Out[static_cast<std::size_t>(f) * nSkel + s] = Pose.get(s);
+            }
+
+            // the isolation report (G-40): what each layer wrote; what changed outside every mask (bitwise); the root's travel
+            for (const auto& P : Layers)
+            {
+                int nIn = 0; for (float M : P.m_Mask) nIn += M > 0.0f;
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Layers [{}] '{}' ({}, {}): {} bones in its mask; bone-frames written {}, outside its mask {}"
+                    , Ov.m_Name, P.m_pDesc->m_Name, P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "additive" : "override", xstrtool::To(P.m_pDesc->m_SourceKey) + ":" + P.m_pDesc->m_SourceClip, nIn, P.m_Written, P.m_WrittenOutside));
+            }
+            std::size_t nChangedOutside = 0; float MaxRootMove = 0.0f; std::string FirstOutside;
+            for (int f = 0; f < nFrames; ++f)
+                for (int s = 0; s < nSkel; ++s)
+                {
+                    const auto& A = Out[static_cast<std::size_t>(f) * nSkel + s]; const auto& B = BaseFrames[static_cast<std::size_t>(f) * nSkel + s];
+                    if (s == iRoot) MaxRootMove = std::max(MaxRootMove, (A.m_Position - B.m_Position).Length());
+                    // component by component (never memcmp: xmath vectors may carry padding - methodology lessons 2026-10-29)
+                    const bool bSame = A.m_Position.m_X == B.m_Position.m_X && A.m_Position.m_Y == B.m_Position.m_Y && A.m_Position.m_Z == B.m_Position.m_Z
+                                    && A.m_Rotation == B.m_Rotation
+                                    && A.m_Scale.m_X == B.m_Scale.m_X && A.m_Scale.m_Y == B.m_Scale.m_Y && A.m_Scale.m_Z == B.m_Scale.m_Z;
+                    if (Union[s] <= 0.0f && !bSame) { if (!nChangedOutside) FirstOutside = std::format(" (first: bone '{}' frame {})", Bones[s].m_Name, f); ++nChangedOutside; }
+                }
+            LogMessage(nChangedOutside ? xresource_pipeline::msg_type::ERROR : xresource_pipeline::msg_type::INFO
+                , std::format("Layers [{}] isolation: {} layer(s) over {} frames; bone-frames changed outside every mask {}{}; root travel change {:.6f} m", Ov.m_Name, Layers.size(), nFrames, nChangedOutside, FirstOutside, MaxRootMove));
+            return {};
+        }
+
+        //--------------------------------------------------------------------------------------
         // Builds one compiled clip from a raw import + its (possibly null) descriptor override.
         // Returns false (via Skip) if the clip is ignored.
+        // pComposed: the clip's layers already baked (ComposeClip: skeleton order and space, every source frame); null = no layers, the
+        // path below is the one every clip took before layers existed.
         //
         // Bone-order-synced by construction: the output curve is laid out in the REFERENCED
         // SKELETON's own compiled bone order/width (ResolvedBones), not the raw file's own bone
@@ -176,6 +343,7 @@ namespace xanim_package_compiler
         , xanim_package::clip&                                Out
         , std::vector<xmath::transform3>&                     AllKeyFrames
         , std::vector<xmath::fvec3>&                          AllRootMotion
+        , const std::vector<xmath::transform3>*               pComposed = nullptr
         )
         {
             const auto& ResolvedBones = Manifest.m_Bones;
@@ -240,6 +408,11 @@ namespace xanim_package_compiler
             for (int f = 0; f < OutFrames; ++f)
             {
                 const int SrcFrame = std::clamp(ResampleFrameIndex(StartFrame + f, SourceFPS, FinalFPS), 0, SourceFrames - 1);
+                if (pComposed)          // layers baked: the frames are already in the skeleton's order and space
+                {
+                    std::copy_n(pComposed->begin() + static_cast<std::ptrdiff_t>(SrcFrame) * nSkelBones, nSkelBones, AllKeyFrames.begin() + static_cast<std::ptrdiff_t>(KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones));
+                    continue;
+                }
                 for (int s = 0; s < nSkelBones; ++s)
                 {
                     const int iRaw = SkelToRaw[s];
@@ -295,7 +468,7 @@ namespace xanim_package_compiler
                     RootKey.m_Scale    = Scale * RootKey.m_Scale;
                 }
             };
-            if (!Raw.m_bInSkeletonSpace)        // (a retargeted clip is already in this skeleton's space: the retarget put it there)
+            if (!Raw.m_bInSkeletonSpace && !pComposed)        // (a retargeted clip is already in this skeleton's space: the retarget put it there; composed frames too: SkeletonFrames did it)
             {
                 ApplyToRoot("PostTransform", Manifest.m_PostTransformScale, Manifest.m_PostTransformRotationDeg, Manifest.m_PostTransformTranslation);
                 ApplyToRoot("PreTransform", Manifest.m_PreTransformScale, Manifest.m_PreTransformRotationDeg, Manifest.m_PreTransformTranslation);
@@ -626,6 +799,7 @@ namespace xanim_package_compiler
             std::vector<xmath::transform3>          AllKeyFrames;
             std::vector<xmath::fvec3>               AllRootMotion;
 
+            // every raw clip on this skeleton first (retargeted or folded): a clip's layers may take any other clip of the package as their source
             for (auto& Raw : m_RawClips)
             {
                 if (const auto* pSource = FindSource(Raw.m_SourceFile); pSource && pSource->bDifferent())
@@ -633,7 +807,10 @@ namespace xanim_package_compiler
                     if (auto Err = RetargetRaw(Raw, *pSource); Err) return Err;           // (a package clip is in its skeleton's space already: RetargetRaw knows)
                 }
                 else if (!Raw.m_bInSkeletonSpace) FoldRaw(Raw, ResolvedBones);            // an asset on this skeleton: its nodes folded into this skeleton's joints
+            }
 
+            for (auto& Raw : m_RawClips)
+            {
                 const xanim_package_desc::clip* pOv = nullptr;
                 if (auto SourceIt = Overrides.find(Raw.m_SourceFile); SourceIt != Overrides.end())
                 {
@@ -641,9 +818,15 @@ namespace xanim_package_compiler
                         pOv = ClipIt->second;
                 }
 
+                // the clip's layers (the layered edit mode) baked onto its source frames, before its trim / downsample / root motion
+                std::vector<xmath::transform3> Composed;
+                const bool bLayers = pOv && !pOv->m_bDelete && std::any_of(pOv->m_Layers.begin(), pOv->m_Layers.end(), [](const auto& L) { return L.m_bEnabled; });
+                if (bLayers)
+                    if (auto Err = ComposeClip(Raw, *pOv, Manifest, Composed); Err) return Err;
+
                 bool                  Skip = false;
                 xanim_package::clip   Compiled{};
-                if (auto Err = BuildCompiledClip(Raw, pOv, Manifest, Skip, Compiled, AllKeyFrames, AllRootMotion); Err)
+                if (auto Err = BuildCompiledClip(Raw, pOv, Manifest, Skip, Compiled, AllKeyFrames, AllRootMotion, bLayers ? &Composed : nullptr); Err)
                     return Err;
                 if (Skip) continue;
 
@@ -657,8 +840,17 @@ namespace xanim_package_compiler
             if (auto Err = CheckClipNameCollisions(Clips, Names); Err) return Err;
 
             m_FinalPackage.m_nClips = static_cast<std::uint16_t>(Clips.size());
+            // zeroed, then field by field: the file's bytes follow from the content only (xserializer copies a struct's raw bytes before its
+            // fields, so padding - after the enum, the vector's unused lane - would carry whatever memory held)
             m_FinalPackage.m_pClips = new xanim_package::clip[Clips.size()];
-            std::copy(Clips.begin(), Clips.end(), m_FinalPackage.m_pClips);
+            std::memset(static_cast<void*>(m_FinalPackage.m_pClips), 0, sizeof(xanim_package::clip) * Clips.size());
+            for (std::size_t i = 0; i < Clips.size(); ++i)
+            {
+                auto& D = m_FinalPackage.m_pClips[i]; const auto& S = Clips[i];
+                D.m_NameHash = S.m_NameHash; D.m_FPS = S.m_FPS; D.m_nFrames = S.m_nFrames; D.m_bLoop = S.m_bLoop; D.m_RootMotionMode = S.m_RootMotionMode;
+                D.m_LoopDisplacement.m_X = S.m_LoopDisplacement.m_X; D.m_LoopDisplacement.m_Y = S.m_LoopDisplacement.m_Y; D.m_LoopDisplacement.m_Z = S.m_LoopDisplacement.m_Z;
+                D.m_iFirstKeyFrame = S.m_iFirstKeyFrame; D.m_iFirstRootMotion = S.m_iFirstRootMotion;
+            }
 
             m_FinalPackage.m_nBones = static_cast<std::uint32_t>(ResolvedBones.size());
             m_FinalPackage.m_pBoneNameHashes = new std::uint32_t[ResolvedBones.size()];
@@ -670,8 +862,26 @@ namespace xanim_package_compiler
             std::copy(AllKeyFrames.begin(), AllKeyFrames.end(), m_FinalPackage.m_pKeyFrame);
 
             m_FinalPackage.m_nTotalRootMotionFrames = static_cast<std::uint32_t>(AllRootMotion.size());
-            m_FinalPackage.m_pRootMotion = new xmath::fvec3[AllRootMotion.size()];
+            // an empty array is nullptr: new T[0] is a real heap address, and xserializer wrote it into the file as 8 raw bytes (count 0) - two
+            // compiles of the same package without root motion differed by those 8 bytes (2026-11-15)
+            m_FinalPackage.m_pRootMotion = AllRootMotion.empty() ? nullptr : new xmath::fvec3[AllRootMotion.size()];
             std::copy(AllRootMotion.begin(), AllRootMotion.end(), m_FinalPackage.m_pRootMotion);
+
+            // the content's fingerprint, field by field (never the struct bytes: padding): two compiles of the same input print the same numbers
+            {
+                std::uint64_t H = 1469598103934665603ull;
+                auto Mix = [&H](const void* p, std::size_t n) { for (std::size_t i = 0; i < n; ++i) { H ^= static_cast<const std::uint8_t*>(p)[i]; H *= 1099511628211ull; } };
+                auto F = [&](float v) { Mix(&v, sizeof(v)); };
+                std::uint64_t HClips, HKeys, HRoot;
+                H = 1469598103934665603ull;
+                for (const auto& C : Clips) { Mix(&C.m_NameHash, 4); Mix(&C.m_FPS, 4); Mix(&C.m_nFrames, 4); Mix(&C.m_bLoop, 1); Mix(&C.m_RootMotionMode, 1); F(C.m_LoopDisplacement.m_X); F(C.m_LoopDisplacement.m_Y); F(C.m_LoopDisplacement.m_Z); Mix(&C.m_iFirstKeyFrame, 4); Mix(&C.m_iFirstRootMotion, 4); }
+                HClips = H; H = 1469598103934665603ull;
+                for (const auto& K : AllKeyFrames) { F(K.m_Scale.m_X); F(K.m_Scale.m_Y); F(K.m_Scale.m_Z); F(K.m_Rotation.m_X); F(K.m_Rotation.m_Y); F(K.m_Rotation.m_Z); F(K.m_Rotation.m_W); F(K.m_Position.m_X); F(K.m_Position.m_Y); F(K.m_Position.m_Z); }
+                HKeys = H; H = 1469598103934665603ull;
+                for (const auto& R : AllRootMotion) { F(R.m_X); F(R.m_Y); F(R.m_Z); }
+                HRoot = H;
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Package content: {} clips {:016X}, {} keyframes {:016X}, {} root motion {:016X}", Clips.size(), HClips, AllKeyFrames.size(), HKeys, AllRootMotion.size(), HRoot));
+            }
 
             return {};
         }
