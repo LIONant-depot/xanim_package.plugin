@@ -22,6 +22,7 @@
 #include "dependencies/xAnimation/source/xanimation.h"
 #include "plugins/xanim_package.plugin/source/Editor/xanim_package_kimodo.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_layers.h"
+#include "plugins/xskeleton.plugin/source/xskeleton_joints.h"
 
 #include <charconv>
 
@@ -49,7 +50,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key };
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept };
 
         session&    m_Session;
         kind        m_Kind;
@@ -84,6 +85,17 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Time",   "Seconds", true, 1);
                 m_hD = m_Parser.addOption("Turn",   "\"x y z\" degrees: the key's pose = this turn (parent side) applied to the layers below at that time (default 0 0 0: the pose below)", false, 1);
                 m_hE = m_Parser.addOption("Offset", "1: store the turn itself as an offset key (additive layers) instead of the absolute pose", false, 1);
+                break;
+            case kind::suggest_pose:
+                m_hA = m_Parser.addOption("Time",   "Seconds: the key", true, 1);
+                m_hB = m_Parser.addOption("Move",   "\"Bone dx dy dz\": a handle moved, centimetres in the model frame (Bone: a bone name or LeftHand/RightHand/LeftFoot/RightFoot)", false, 1);
+                m_hC = m_Parser.addOption("Pin",    "Handles held where they are (default \"LeftFoot RightFoot\"; \"none\" for none)", false, 1);
+                m_hD = m_Parser.addOption("Seeds",  "\"1 2 3\": one candidate per seed (default 1)", false, 1);
+                m_hE = m_Parser.addOption("Prompt", "What the pose is, in words (default: none)", false, 1);
+                break;
+            case kind::suggest_pose_accept:
+                m_hA = m_Parser.addOption("Layer",     "The Pose layer the keys go on (the top layer of the clip)", true, 1);
+                m_hB = m_Parser.addOption("Candidate", "Which candidate (default 0)", false, 1);
                 break;
             case kind::layer_mask:
                 m_hA = m_Parser.addOption("Layer", "The layer's index in the selected clip", true, 1);
@@ -129,7 +141,7 @@ namespace xanim_package_editor
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
-        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey;
+        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept;
 
         // Layers (the layered edit mode): the compiler's layer-sources cache, the selected clip's live composition (same function as the compile)
         std::vector<xanim_package_layers::source_frames> m_LayerSources;
@@ -174,6 +186,8 @@ namespace xanim_package_editor
                 xretarget_desc::descriptor              m_Descriptor;   // the mapping keeps views into its manifests: it lives as long as the mapping
                 xretarget_desc::mapping                 m_Mapping;
                 xanimation::retargeter                  m_Retargeter;
+                xanimation::retarget_map                m_ReverseMap;   // Suggest Pose: this package's skeleton -> SOMA (the same links reversed)
+                xanimation::retargeter                  m_Reverse;
                 std::uint64_t                           m_Key = 0;
             };
             std::unique_ptr<retarget_ctx>               m_pRetarget;
@@ -184,6 +198,24 @@ namespace xanim_package_editor
             std::vector<xmath::fmat4>                   m_DstWorlds;
             std::vector<xskeleton_editor::bone_world>   m_DstBones;
         } m_K;
+
+        // Suggest Pose (posing v2 step S): candidates only - nothing reaches the descriptor before SuggestPoseAccept
+        struct suggest_candidate
+        {
+            int                                 m_Seed = 0;
+            std::vector<xmath::transform3>      m_Pose;         // [bone] local: Kimodo's pose, corrected on this skeleton (pins, goals, limits)
+            std::string                         m_Report;
+        };
+        struct suggest_state
+        {
+            std::vector<suggest_candidate>      m_Candidates;
+            std::vector<std::uint8_t>           m_Owned;        // the bones a candidate may key (mapped to SOMA, rotation only)
+            std::vector<xmath::transform3>      m_Original;     // the clip's pose at the key
+            double                              m_Time = 0;
+            std::string                         m_Sig;          // the clip and its layers when asked: a candidate is stale once they change
+            std::string                         m_MovedBone;
+            xmath::fvec3                        m_Target{ 0, 0, 0 };
+        } m_Suggest;
 
         xskeleton_editor::skeleton_viewport             m_Viewport;             // the shared 3D skeleton panel (the scene is m_Viewport.m_Scene)
         xeditor::camera_toolbar                         m_CameraToolbar;
@@ -230,6 +262,8 @@ namespace xanim_package_editor
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there. Usage: LayerMask -Layer n -Bone name [-Only 1]")
             , m_LayersInfo    (m_Undo, *this, playback_cmd::kind::layers_info,     "LayersInfo",     "The selected clip's layers, the live composition's isolation report and its parity with the compiled clip. Usage: LayersInfo")
             , m_PoseKey       (m_Undo, *this, playback_cmd::kind::pose_key,        "PoseKey",        "Sets a key on a Pose layer: the bone's pose at a time = the layers below turned by -Turn (absolute target), or the turn as an offset key. Usage: PoseKey -Layer n -Bone name -Time s [-Turn \"x y z\"] [-Offset 1]")
+            , m_SuggestPose   (m_Undo, *this, playback_cmd::kind::suggest_pose,    "SuggestPose",    "Suggests a natural pose at a time with Kimodo for the handles moved and pinned: a CANDIDATE (nothing is written) and its report. Usage: SuggestPose -Time s [-Move \"LeftHand 0 0 15\"] [-Pin \"LeftFoot RightFoot\"] [-Seeds \"1 2\"] [-Prompt text]")
+            , m_SuggestPoseAccept(m_Undo, *this, playback_cmd::kind::suggest_pose_accept, "SuggestPoseAccept", "Writes a Suggest Pose candidate as keys on a Pose layer (the bones it changes). Usage: SuggestPoseAccept -Layer n [-Candidate i]")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
@@ -851,7 +885,8 @@ namespace xanim_package_editor
         // The generated motion moved onto this package's skeleton exactly as the compile will move it (xanim_package_compiler.cpp RetargetRaw):
         // the BVH's joints as the importer reads them (centimetres, OFFSET for the rest, the root's channels absolute), into the Retarget source
         // skeleton's space (its Pre/PostTransform), then baked by the Retarget's retargeter.
-        bool KimodoRetargetPreview(std::string& Error) noexcept
+        // The package's Kimodo Retarget, read once: its mapping, the retargeter (SOMA -> this skeleton) and the reverse one (this skeleton -> SOMA)
+        kimodo_state::retarget_ctx* KimodoRetargetCtx(std::string& Error) noexcept
         {
             auto* pDesc = Desc();
             const std::uint64_t Key = pDesc->m_Kimodo.m_Retarget.m_Instance.m_Value;
@@ -860,12 +895,20 @@ namespace xanim_package_editor
                 auto Ctx = std::make_unique<kimodo_state::retarget_ctx>();
                 const auto Path = ProjectPath() / std::format(L"Descriptors/Retarget/{:02X}/{:02X}/{:X}.desc/Descriptor.txt", Key & 0xff, (Key & 0xff00) >> 8, Key);
                 xproperty::settings::context Context{};
-                if (auto Err = Ctx->m_Descriptor.Serialize(true, Path.wstring(), Context); Err) { Error = "the Retarget could not be read"; return false; }
-                if (auto Err = xretarget_desc::MakeMapping(Ctx->m_Descriptor, Ctx->m_Mapping); Err) { Error = "the Retarget's mapping could not be made"; return false; }
+                if (auto Err = Ctx->m_Descriptor.Serialize(true, Path.wstring(), Context); Err) { Error = "the Retarget could not be read"; return nullptr; }
+                if (auto Err = xretarget_desc::MakeMapping(Ctx->m_Descriptor, Ctx->m_Mapping); Err) { Error = "the Retarget's mapping could not be made"; return nullptr; }
                 Ctx->m_Retargeter.Init(Ctx->m_Mapping.sourceCalibrated(), Ctx->m_Mapping.destinationCalibrated(), Ctx->m_Mapping.m_Auto.m_Map);
+                Ctx->m_ReverseMap = xanimation::ReverseMap(Ctx->m_Mapping.m_Auto.m_Map, int(Ctx->m_Descriptor.m_ResolvedSource.m_Bones.size()));
+                Ctx->m_Reverse.Init(Ctx->m_Mapping.destinationCalibrated(), Ctx->m_Mapping.sourceCalibrated(), Ctx->m_ReverseMap);
                 Ctx->m_Key = Key;
                 m_K.m_pRetarget = std::move(Ctx);
             }
+            return m_K.m_pRetarget.get();
+        }
+
+        bool KimodoRetargetPreview(std::string& Error) noexcept
+        {
+            if (!KimodoRetargetCtx(Error)) return false;
             auto& Ctx = *m_K.m_pRetarget;
             const auto& Src = Ctx.m_Descriptor.m_ResolvedSource;
             const auto& Dst = Ctx.m_Descriptor.m_ResolvedDestination;
@@ -934,6 +977,330 @@ namespace xanim_package_editor
                 m_K.m_Bones[b].m_Right    = xmath::fvec3(R[0], R[3], R[6]);
                 m_K.m_Bones[b].m_Up       = xmath::fvec3(R[1], R[4], R[7]);
             }
+        }
+
+        //----------------------------------------------------------------------------------------
+        // Suggest Pose (posing v2 step S): the handles (one moved, some pinned) at a key -> a Kimodo window around it with the key's hands and feet
+        // as end-effector constraints, two sparse full-body anchors from the clip and the clip's root path -> Kimodo's pose at the key, brought
+        // back to this skeleton and corrected by body_ik (pins exact, the moved handle as a goal, the skeleton's joint limits) -> a CANDIDATE with
+        // its report. Rotation only: Pose layer keys do not carry the hips' translation, so the clip's translation is kept.
+        //----------------------------------------------------------------------------------------
+
+        std::string SuggestSignature() noexcept
+        {
+            auto* pOv = SelectedOv();
+            return pOv ? std::format("{}:{}:{}", m_iSelectedSource, m_iSelectedDescriptorClip, LayerSignature(*pOv)) : std::string{};
+        }
+
+        // The selected clip as the authoring stack has it: its live composition, or its source frames when it has no layer on
+        bool SuggestClipFrames(const std::vector<xmath::transform3>*& pFrames, int& FPS, int& nFrames, std::string& Error) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pS = SelectedSource();
+            if (!pOv || !pS) { Error = "select a clip first (SelectClip)"; return false; }
+            UpdateLiveLayers();
+            if (!m_LayerError.empty() && m_LayerComposed.empty() && std::any_of(pOv->m_Layers.begin(), pOv->m_Layers.end(), [](const auto& L) { return L.m_bEnabled; })) { Error = m_LayerError; return false; }
+            if (!m_LayerComposed.empty()) { pFrames = &m_LayerComposed; FPS = m_LayerComposedFPS; nFrames = m_LayerComposedFrames; return true; }
+            const auto* pBase = FindLayerSource(pS->key(), pOv->m_OriginalName);
+            if (!pBase) { Error = m_LayerSources.empty() ? "no layer sources yet: compile the package once" : "this clip is not in the layer sources: compile the package"; return false; }
+            pFrames = &pBase->m_Frames; FPS = std::max(1, pBase->m_FPS); nFrames = pBase->m_nFrames;
+            return true;
+        }
+
+        static std::vector<xmath::transform3> SamplePose(const std::vector<xmath::transform3>& Frames, int FPS, int nFrames, int nB, double Seconds) noexcept
+        {
+            const double FT = std::clamp(Seconds * FPS, 0.0, double(std::max(0, nFrames - 1)));
+            const int A = int(FT), B = std::min(A + 1, nFrames - 1);
+            const float T = float(FT - A);
+            std::vector<xmath::transform3> P(nB);
+            for (int i = 0; i < nB; ++i) P[i] = xmath::transform3::fromBlend(Frames[std::size_t(A) * nB + i], Frames[std::size_t(B) * nB + i], T);
+            return P;
+        }
+        static float AngleDeg(const xmath::fquat& A, const xmath::fquat& B) noexcept
+        {
+            return 2.0f * std::acos(std::min(1.0f, std::abs(xmath::fquat::Dot(A.NormalizeCopy(), B.NormalizeCopy())))) * 57.29578f;
+        }
+
+        std::string SuggestPose(double Seconds, const std::string& Move, const std::string& Pins, const std::string& Seeds, const std::string& Prompt) noexcept
+        {
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            auto ms = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            auto* pDesc = Desc();
+            if (!pDesc) return "SuggestPose: nothing loaded";
+            if (auto* pWhy = KimodoWhyNot()) return std::string("SuggestPose: ") + pWhy;
+            const auto Exe = kimodo::FindExe();
+            if (Exe.empty()) return "SuggestPose: xkimodo.exe not found (build dependencies/xKimodo, or set XKIMODO_EXE)";
+            std::string Err;
+            auto* pCtx = KimodoRetargetCtx(Err);
+            if (!pCtx) return "SuggestPose: " + Err;
+            auto& Ctx = *pCtx;
+            const std::vector<xmath::transform3>* pFrames = nullptr; int FPS = 30, nF = 0;
+            if (!SuggestClipFrames(pFrames, FPS, nF, Err)) return "SuggestPose: " + Err;
+
+            // this skeleton
+            const auto& Man = pDesc->m_ResolvedSkeletonBones.m_Bones;
+            const int nB = int(Man.size());
+            if (nB == 0 || int(pFrames->size()) != nF * nB || int(Ctx.m_Descriptor.m_ResolvedDestination.m_Bones.size()) != nB) return "SuggestPose: the clip, the skeleton and the Retarget disagree on the bones (compile the package)";
+            std::vector<std::int32_t> Parents(nB); std::vector<std::string> Names(nB); std::vector<std::string_view> Views(nB); xanimation::pose Rest; Rest.resize(nB);
+            for (int b = 0; b < nB; ++b)
+            {
+                Parents[b] = Man[b].m_iParent; Names[b] = Man[b].m_Name;
+                Rest.m_Position[b] = Man[b].m_RestPosition; Rest.m_Scale[b] = Man[b].m_RestScale;
+                Rest.m_Rotation[b] = xmath::fquat(Man[b].m_RestRotX, Man[b].m_RestRotY, Man[b].m_RestRotZ, Man[b].m_RestRotW).NormalizeSafeCopy();
+            }
+            for (int b = 0; b < nB; ++b) Views[b] = Names[b];
+            const xanimation::skeleton_view SV{ Parents };
+            const auto Slots = xanimation::details::BuildSlots(SV, Views, Rest);
+            auto SlotBone = [&](xanimation::bone_slot S, xanimation::bone_side D) { const auto It = Slots.m_Bones.find({ S, D }); return It == Slots.m_Bones.end() ? -1 : It->second[0]; };
+            auto Handle = [&](std::string_view N) -> int
+            {
+                using xanimation::bone_slot; using xanimation::bone_side;
+                if (N == "LeftHand")  return SlotBone(bone_slot::HAND, bone_side::LEFT);
+                if (N == "RightHand") return SlotBone(bone_slot::HAND, bone_side::RIGHT);
+                if (N == "LeftFoot")  return SlotBone(bone_slot::FOOT, bone_side::LEFT);
+                if (N == "RightFoot") return SlotBone(bone_slot::FOOT, bone_side::RIGHT);
+                for (int b = 0; b < nB; ++b) if (Names[b] == N) return b;
+                return -1;
+            };
+            const int LH = Handle("LeftHand"), RH = Handle("RightHand"), LF = Handle("LeftFoot"), RF = Handle("RightFoot");
+            if (LH < 0 || RH < 0 || LF < 0 || RF < 0) return "SuggestPose: this skeleton's hands and feet were not recognized from the bone names";
+
+            // the request: the key pose, the moved handle and the pins
+            const auto P0 = SamplePose(*pFrames, FPS, nF, nB, Seconds);
+            xanimation::body_ik Solver;
+            std::vector<xanimation::joint_limit> Limits;
+            if (auto* pSk = xresource::g_Mgr.getResource(m_SkeletonRef); pSk && int(pSk->getJoints().size()) == nB)
+            {
+                Limits.resize(nB);
+                for (int b = 0; b < nB; ++b) Limits[b] = xskeleton_joints::FromRuntime(pSk->getJoints()[b], Rest.m_Rotation[b]);
+            }
+            std::vector<xanimation::two_bone_chain> Limbs;
+            for (int E : { LH, RH, LF, RF }) if (const int p = Parents[E]; p >= 0 && Parents[p] >= 0) Limbs.push_back({ Parents[p], p, E });
+            Solver.Setup(Parents, Limits, {}, Limbs);
+            std::vector<std::uint8_t> Owned(nB, 0);
+            for (int t = 0; t < nB; ++t) Owned[t] = t < int(Ctx.m_Mapping.m_Auto.m_Map.m_SourceOf.size()) && Ctx.m_Mapping.m_Auto.m_Map.m_SourceOf[t] >= 0;
+            xanimation::pose Pose0; Pose0.resize(nB); for (int b = 0; b < nB; ++b) Pose0.set(b, P0[b]);
+            Solver.ComputeWorld(Pose0);
+
+            std::vector<xanimation::ik_task> Tasks; std::vector<std::string> TaskName;
+            int iMoved = -1; xmath::fvec3 Target(0, 0, 0);
+            if (!Move.empty())
+            {
+                char Bone[128] = {}; float d[3] = {};
+                if (std::sscanf(Move.c_str(), "%127s %f %f %f", Bone, &d[0], &d[1], &d[2]) != 4) return "SuggestPose: -Move is \"Bone dx dy dz\" (centimetres)";
+                iMoved = Handle(Bone);
+                if (iMoved < 0) return std::format("SuggestPose: no bone or handle '{}'", Bone);
+                Target = Solver.WorldPosition(iMoved) + xmath::fvec3(d[0], d[1], d[2]) * 0.01f;
+                xanimation::ik_task T; T.m_Bone = iMoved; T.m_bPosition = true; T.m_Position = Target;
+                Tasks.push_back(T); TaskName.push_back(std::format("{} (moved)", Names[iMoved]));
+            }
+            if (Pins != "none")
+            {
+                std::istringstream In(Pins); std::string N;
+                while (In >> N)
+                {
+                    const int b = Handle(N);
+                    if (b < 0) return std::format("SuggestPose: no bone or handle '{}' to pin", N);
+                    if (b == iMoved) continue;
+                    xanimation::ik_task T; T.m_Bone = b; T.m_bPosition = true; T.m_Position = Solver.WorldPosition(b);
+                    T.m_bOrientation = true; T.m_Orientation = Solver.WorldRotation(b); T.m_bHard = true;
+                    Tasks.push_back(T); TaskName.push_back(std::format("{} (pinned)", Names[b]));
+                }
+            }
+            if (Tasks.empty()) return "SuggestPose: nothing to do (no -Move and no pins)";
+            std::vector<xanimation::ik_task_report> Rep(Tasks.size());
+            xanimation::pose PoseIK;
+            const auto ResIK = Solver.Solve(Pose0, Owned, Tasks, Rep, PoseIK);
+            const auto t1 = clock::now();
+
+            // the Kimodo window: 2 s at 30 fps centred on the key (clamped at the clip's ends: those frames repeat the first / last pose)
+            constexpr int W = 60, K = 30, A0 = K - 22, A1 = K + 22;
+            std::vector<xmath::transform3> Win(std::size_t(W) * nB);
+            int nClamped = 0;
+            const double Len = double(std::max(1, nF - 1)) / FPS;
+            for (int i = 0; i < W; ++i)
+            {
+                const double t = Seconds + double(i - K) / 30.0;
+                nClamped += t < 0 || t > Len;
+                const auto P = i == K ? std::vector<xmath::transform3>{} : SamplePose(*pFrames, FPS, nF, nB, t);
+                for (int b = 0; b < nB; ++b) Win[std::size_t(i) * nB + b] = i == K ? PoseIK.get(b) : P[b];
+            }
+            const auto& Src = Ctx.m_Descriptor.m_ResolvedSource;
+            const int nSrc = int(Src.m_Bones.size());
+            auto Soma = xanimation::BakeFrames(Ctx.m_Reverse, xanimation::clip_view{ Win, nB, W, 30, false }, nSrc);
+            int iRoot = -1;
+            for (int s = 0; s < nSrc; ++s) if (Src.m_Bones[s].m_iParent < 0) { iRoot = s; break; }
+            if (iRoot < 0) return "SuggestPose: the Retarget's Source skeleton has no root";
+            auto Corr = [](const xmath::fvec3& S, const xmath::fvec3& R, const xmath::fvec3& T) { xanimation::root_correction C; C.m_Scale = S; C.m_RotationDeg = R; C.m_Translation = T; return C; };
+            const auto Post = Corr(Src.m_PostTransformScale, Src.m_PostTransformRotationDeg, Src.m_PostTransformTranslation);
+            const auto Pre  = Corr(Src.m_PreTransformScale,  Src.m_PreTransformRotationDeg,  Src.m_PreTransformTranslation);
+            xanimation::FromSkeletonSpace(Soma, nSrc, iRoot, Post, Pre);
+
+            // Kimodo's frame: the window's first root at the origin, facing +Z (its generations start there)
+            const auto& R0 = Soma[iRoot];
+            const auto F0 = R0.m_Rotation * xmath::fvec3(0, 0, 1);
+            const float Heading = std::atan2(F0.m_X, F0.m_Z);
+            const xmath::fquat Norm = xanimation::details::AxisAngle(xmath::fvec3(0, 1, 0), -Heading), Denorm = Norm.ConjugateCopy();
+            const xmath::fvec3 Origin(R0.m_Position.m_X, 0, R0.m_Position.m_Z);       // cm (the raw space)
+            std::vector<int> SrcOfJoint(77, -1);
+            for (int j = 0; j < 77; ++j) for (int s = 0; s < nSrc; ++s) if (Src.m_Bones[s].m_Name == kimodo::soma77_names_v[j]) { SrcOfJoint[j] = s; break; }
+            if (SrcOfJoint[0] != iRoot) return "SuggestPose: the Retarget's Source is not Kimodo's SOMA 77 skeleton (its root is not Hips)";
+            auto SomaPose = [&](int i)
+            {
+                kimodo::soma_pose P;
+                for (int j = 0; j < 77; ++j)
+                {
+                    const int s = SrcOfJoint[j];
+                    if (s < 0) continue;
+                    const auto& T = Soma[std::size_t(i) * nSrc + s];
+                    const auto Q = j == 0 ? (Norm * T.m_Rotation) : T.m_Rotation;
+                    const auto V = xanimation::details::LogQ(Q);
+                    P.m_Rot[j][0] = V.m_X; P.m_Rot[j][1] = V.m_Y; P.m_Rot[j][2] = V.m_Z;
+                }
+                const auto Rp = Norm * (Soma[std::size_t(i) * nSrc + iRoot].m_Position - Origin) * 0.01f;
+                P.m_Root[0] = Rp.m_X; P.m_Root[1] = Rp.m_Y; P.m_Root[2] = Rp.m_Z;
+                return P;
+            };
+            std::vector<kimodo::soma_pose> SP(W);
+            for (int i = 0; i < W; ++i) SP[i] = SomaPose(i);
+            std::vector<kimodo::constraint_set> Sets;
+            for (const char* Type : { "left-hand", "right-hand", "left-foot", "right-foot" })
+                Sets.push_back({ Type, { K }, { SP[K] }, { { SP[K].m_Root[0], SP[K].m_Root[2] } } });
+            Sets.push_back({ "fullbody", { A0, A1 }, { SP[A0], SP[A1] }, { { SP[A0].m_Root[0], SP[A0].m_Root[2] }, { SP[A1].m_Root[0], SP[A1].m_Root[2] } } });
+            kimodo::constraint_set Path{ "root2d", {}, {}, {} };
+            for (int i = 0; i < W; ++i) { Path.m_Frames.push_back(i); Path.m_Smooth.push_back({ SP[i].m_Root[0], SP[i].m_Root[2] }); }
+            Sets.push_back(std::move(Path));
+            static int s_Count = 0;
+            const auto Stem = std::format(L"{}\\suggest_{}_{}", m_Document.m_TempDir, GetCurrentProcessId(), ++s_Count);
+            std::filesystem::create_directories(m_Document.m_TempDir);
+            if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return "SuggestPose: " + Err;
+            const auto t2 = clock::now();
+
+            std::string Text = std::format("SuggestPose at {:.3f} s ({} fps clip, {} bones; {} of them keyable)\n", Seconds, FPS, nB, std::count(Owned.begin(), Owned.end(), 1));
+            Text += std::format("request (Kimodo, SOMA 77, 2 s at 30 fps, key = frame {}{}):\n", K, nClamped ? std::format("; {} frames past the clip's ends repeat its first/last pose", nClamped) : "");
+            Text += std::format("  explicit: left-hand, right-hand, left-foot, right-foot at frame {} from the IK-only pose (moved: {}; pinned: {})\n", K, iMoved >= 0 ? Names[iMoved] : "none", Pins);
+            Text += std::format("  implicit: root path (x, z) at all {} frames from the clip; root height and heading at the key from the hand/foot sets; full-body anchors at frames {} and {} (+-0.73 s) from the clip\n", W, A0, A1);
+            Text += std::format("  prompt: {}; 10 steps; raw output (no foot clean-up)\n", Prompt.empty() ? "(none)" : "\"" + Prompt + "\"");
+            Text += std::format("IK-only pose (the baseline): {} iterations, all reached {}\n", ResIK.m_Iterations, ResIK.m_bAllReached);
+
+            // the candidates
+            m_Suggest = {};
+            m_Suggest.m_Owned = Owned; m_Suggest.m_Original = P0; m_Suggest.m_Time = Seconds; m_Suggest.m_Sig = SuggestSignature();
+            m_Suggest.m_MovedBone = iMoved >= 0 ? Names[iMoved] : ""; m_Suggest.m_Target = Target;
+            std::istringstream SeedIn(Seeds); int Seed = 0;
+            while (SeedIn >> Seed)
+            {
+                const auto s0 = clock::now();
+                const auto Bvh = std::format(L"{}_s{}.bvh", Stem, Seed);
+                std::wstring P = xstrtool::To(Prompt.empty() ? std::string("A person.") : Prompt);
+                for (auto& c : P) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
+                const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --steps 10 --seed {} --no-postprocess --constraints \"{}.json\" --bvh \"{}\"", P, W, Seed, Stem, Bvh);
+                if (!kimodo::RunBlocking(Exe, Args, Stem + L".log", 180000, Err)) return Text + "SuggestPose: " + Err;
+                const auto s1 = clock::now();
+                kimodo::bvh B;
+                if (!B.Load(Bvh, Err)) return Text + "SuggestPose: the generated BVH could not be read: " + Err;
+                if (B.m_nFrames <= K) return Text + "SuggestPose: the generated window is too short";
+
+                // back: Kimodo's frame undone, into the SOMA skeleton's space, retargeted by the compile's own path, frame K
+                std::vector<int> SrcToJoint(nSrc, -1);
+                for (int s = 0; s < nSrc; ++s) for (int j = 0; j < B.nJoints(); ++j) if (B.m_Names[j] == Src.m_Bones[s].m_Name) { SrcToJoint[s] = j; break; }
+                std::vector<xmath::transform3> Gen(std::size_t(B.m_nFrames) * nSrc);
+                for (int f = 0; f < B.m_nFrames; ++f)
+                    for (int s = 0; s < nSrc; ++s)
+                    {
+                        auto& T = Gen[std::size_t(f) * nSrc + s];
+                        const auto& SB = Src.m_Bones[s];
+                        const int j = SrcToJoint[s];
+                        if (j < 0) { T = xmath::transform3{ .m_Scale = SB.m_RestScale, .m_Rotation = xmath::fquat(SB.m_RestRotX, SB.m_RestRotY, SB.m_RestRotZ, SB.m_RestRotW), .m_Position = SB.m_RestPosition }; continue; }
+                        float q[4]; kimodo::MatToQuat(&B.m_Rots[(std::size_t(f) * B.nJoints() + j) * 9], q);
+                        xmath::fquat Q(q[0], q[1], q[2], q[3]);
+                        const bool bRoot = B.m_Parents[j] < 0 && B.m_bRootChannels;
+                        const float* p = bRoot ? &B.m_Root[f * 3] : &B.m_Offsets[j * 3];
+                        xmath::fvec3 Pos(p[0] * 100.0f, p[1] * 100.0f, p[2] * 100.0f);
+                        if (bRoot) { Q = Denorm * Q; Pos = Denorm * Pos + Origin; }
+                        T = xmath::transform3{ .m_Scale = xmath::fvec3(1, 1, 1), .m_Rotation = Q, .m_Position = Pos };
+                    }
+                xanimation::ToSkeletonSpace(Gen, nSrc, iRoot, Post, Pre);
+                const auto Back = xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Gen, nSrc, B.m_nFrames, 30, false }, nB);
+
+                // Kimodo's rotations on the clip's translations (keys are rotation only), then corrected on this skeleton
+                xanimation::pose Kim = Pose0;
+                for (int b = 0; b < nB; ++b) if (Owned[b]) Kim.m_Rotation[b] = Back[std::size_t(K) * nB + b].m_Rotation;
+                Solver.ComputeWorld(Kim);
+                std::vector<float> KimMiss(Tasks.size());
+                for (std::size_t t = 0; t < Tasks.size(); ++t) KimMiss[t] = (Solver.WorldPosition(Tasks[t].m_Bone) - Tasks[t].m_Position).Length();
+                xanimation::pose Fixed;
+                const auto ResC = Solver.Solve(Kim, Owned, Tasks, Rep, Fixed);
+                float CMax = 0, CSum = 0; int CN = 0; std::string CBone;
+                for (int b = 0; b < nB; ++b) if (Owned[b]) { const float a = AngleDeg(Kim.m_Rotation[b], Fixed.m_Rotation[b]); CSum += a; ++CN; if (a > CMax) { CMax = a; CBone = Names[b]; } }
+
+                // continuity: the key frame replaced in the clip; the second difference (acceleration) around it against the clip's own
+                auto Positions = [&](const xanimation::pose& P) { Solver.ComputeWorld(P); std::vector<xmath::fvec3> V(nB); for (int b = 0; b < nB; ++b) V[b] = Solver.WorldPosition(b); return V; };
+                auto PoseAt = [&](double t) { xanimation::pose P; P.resize(nB); const auto S = SamplePose(*pFrames, FPS, nF, nB, t); for (int b = 0; b < nB; ++b) P.set(b, S[b]); return P; };
+                const double dt = 1.0 / FPS;
+                const auto Pm = Positions(PoseAt(Seconds - dt)), Pp = Positions(PoseAt(Seconds + dt)), Po = Positions(Pose0), Pc = Positions(Fixed);
+                float AccO = 0, AccC = 0, Jump = 0; std::string AccBone;
+                for (int b = 0; b < nB; ++b)
+                {
+                    if (!Owned[b]) continue;
+                    const float ao = (Pp[b] - Po[b] * 2.0f + Pm[b]).Length() / float(dt * dt), ac = (Pp[b] - Pc[b] * 2.0f + Pm[b]).Length() / float(dt * dt);
+                    AccO = std::max(AccO, ao);
+                    if (ac > AccC) { AccC = ac; AccBone = Names[b]; }
+                    Jump = std::max(Jump, (Pc[b] - Po[b]).Length());
+                }
+                const auto s2 = clock::now();
+
+                suggest_candidate C; C.m_Seed = Seed;
+                C.m_Pose.resize(nB); for (int b = 0; b < nB; ++b) C.m_Pose[b] = Fixed.get(b);
+                std::string R = std::format("candidate {} (seed {}): Kimodo {:.0f} ms, back + correction {:.0f} ms\n", m_Suggest.m_Candidates.size(), Seed, ms(s0, s1), ms(s1, s2));
+                for (std::size_t t = 0; t < Tasks.size(); ++t)
+                    R += std::format("  {}: Kimodo's pose misses by {:.2f} cm; after correction {:.3f} cm{}\n", TaskName[t], KimMiss[t] * 100.0f, Rep[t].m_PosMiss * 100.0f
+                        , Rep[t].m_Status == xanimation::ik_status::REACHED ? "" : std::format(" (MISSED, reasons {})", int(Rep[t].m_Reasons)));
+                R += std::format("  correction: max {:.1f} deg ({}), mean {:.2f} deg over {} bones; all reached {}\n", CMax, CBone, CN ? CSum / CN : 0.0f, CN, ResC.m_bAllReached);
+                R += std::format("  continuity: the key's acceleration (key replaced, neighbours from the clip) {:.1f} m/s^2 at {} (the clip's own: {:.1f}); largest move from the clip's pose {:.1f} cm\n", AccC, AccBone, AccO, Jump * 100.0f);
+                C.m_Report = R;
+                Text += R;
+                m_Suggest.m_Candidates.push_back(std::move(C));
+            }
+            if (m_Suggest.m_Candidates.empty()) return Text + "SuggestPose: no seed given";
+            Text += std::format("stages: IK-only {:.0f} ms, request {:.0f} ms, total {:.0f} ms. A candidate is nothing yet: SuggestPoseAccept -Layer n writes it.", ms(t0, t1), ms(t1, t2), ms(t0, clock::now()));
+            return Text;
+        }
+
+        // A candidate as keys on a Pose layer: every keyable bone it turns by more than 0.05 degrees from the pose below that layer.
+        // ponytail: one PoseKey per bone, each a few undo steps (the count is returned); a single grouped step needs an xundo group
+        std::string SuggestPoseAccept(int iLayer, int iCand) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || !pDesc) return "SuggestPoseAccept: select a clip first";
+            if (iCand < 0 || iCand >= int(m_Suggest.m_Candidates.size())) return "SuggestPoseAccept: no such candidate (SuggestPose first)";
+            if (m_Suggest.m_Sig != SuggestSignature()) return "SuggestPoseAccept: the candidate is stale (the clip or its layers changed since): SuggestPose again";
+            if (iLayer < 0 || iLayer >= int(pOv->m_Layers.size()) || pOv->m_Layers[iLayer].m_Kind != xanim_package_desc::layer_kind::POSE) return "SuggestPoseAccept: -Layer is not a Pose layer of the selected clip";
+            if (iLayer != int(pOv->m_Layers.size()) - 1) return "SuggestPoseAccept: the Pose layer must be the clip's top layer (a layer above it would change the result)";
+            const auto& C = m_Suggest.m_Candidates[iCand];
+            const auto& Man = pDesc->m_ResolvedSkeletonBones.m_Bones;
+            const int nB = int(Man.size());
+            if (int(C.m_Pose.size()) != nB) return "SuggestPoseAccept: the skeleton changed since the candidate";
+            int nSteps = 0;
+            int nKeys = 0; std::string Err;
+            for (int b = 0; b < nB; ++b)
+            {
+                if (!m_Suggest.m_Owned[b]) continue;
+                xmath::fquat Below;
+                if (!RotationBelow(iLayer, b, m_Suggest.m_Time, Below, Err)) return "SuggestPoseAccept: " + Err;
+                if (AngleDeg(Below, C.m_Pose[b].m_Rotation) < 0.05f) continue;
+                const auto R = PoseKey(iLayer, Man[b].m_Name, m_Suggest.m_Time, (C.m_Pose[b].m_Rotation * Below.ConjugateCopy()).NormalizeCopy(), false);
+                if (!R.starts_with("PoseKey: layer")) return "SuggestPoseAccept: " + R;
+                ++nKeys; nSteps += R.find(" added ") != std::string::npos ? 7 : 4;      // PoseKey's SetProperty steps (a new key: size, tick, bone, x y z w)
+            }
+            // what the stack now plays at the key, against the candidate
+            const std::vector<xmath::transform3>* pFrames = nullptr; int FPS = 30, nF = 0;
+            if (!SuggestClipFrames(pFrames, FPS, nF, Err)) return std::format("SuggestPoseAccept: {} keys written ({} undo steps); the check could not run: {}", nKeys, nSteps, Err);
+            const auto Now = SamplePose(*pFrames, FPS, nF, nB, m_Suggest.m_Time);
+            float Max = 0; std::string MaxBone;
+            for (int b = 0; b < nB; ++b) if (m_Suggest.m_Owned[b]) { const float a = AngleDeg(Now[b].m_Rotation, C.m_Pose[b].m_Rotation); if (a > Max) { Max = a; MaxBone = Man[b].m_Name; } }
+            m_Suggest.m_Sig = SuggestSignature();      // the keys just written are the candidate's own
+            return std::format("SuggestPoseAccept: {} keys on layer {} ({} undo steps); the stack at the key against the candidate: max {:.4f} deg ({})", nKeys, iLayer, nSteps, Max, MaxBone);
         }
 
         static std::string SafeFileName(std::string N) noexcept
@@ -1496,6 +1863,20 @@ namespace xanim_package_editor
             xeditor::cmd_util::GetArg(m_Parser, m_hC, Only);
             S.m_iLayer = iL;
             return S.LayerMaskToggle(iL, Bone, Only == "1" || Only == "true");
+        }
+        case kind::suggest_pose:
+        {
+            std::string Time, Move, Pin, Seeds, Prompt; double Secs = 0;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Time) || std::from_chars(Time.data(), Time.data() + Time.size(), Secs).ec != std::errc() || Secs < 0) return "SuggestPose: -Time is seconds (>= 0)";
+            xeditor::cmd_util::GetArg(m_Parser, m_hB, Move); xeditor::cmd_util::GetArg(m_Parser, m_hC, Pin); xeditor::cmd_util::GetArg(m_Parser, m_hD, Seeds); xeditor::cmd_util::GetArg(m_Parser, m_hE, Prompt);
+            return S.SuggestPose(Secs, Move, Pin.empty() ? "LeftFoot RightFoot" : Pin, Seeds.empty() ? "1" : Seeds, Prompt);
+        }
+        case kind::suggest_pose_accept:
+        {
+            std::string L, C; int iL = -1, iC = 0;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "SuggestPoseAccept: bad arguments";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, C) && std::from_chars(C.data(), C.data() + C.size(), iC).ec != std::errc()) return "SuggestPoseAccept: -Candidate is an index";
+            return S.SuggestPoseAccept(iL, iC);
         }
         case kind::layers_info: return S.LayersInfo();
         case kind::kimodo_info:

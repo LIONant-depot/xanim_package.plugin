@@ -11,6 +11,7 @@
 // its models: XKIMODO_MODELS, else xkimodo's own default (its folder's models\).
 
 #include <windows.h>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -204,6 +205,90 @@ namespace xanim_package_editor::kimodo
 
         ~job() { Cancel(); }
     };
+
+    //--------------------------------------------------------------------------------------------
+    // Constraints (Suggest Pose): Kimodo's own JSON (kimodo/constraints.py get_save_info), so one file drives Python and xkimodo alike
+    //--------------------------------------------------------------------------------------------
+    // Kimodo's SOMA 77 joints in its own index order (Kimodo-SOMA-RP-v1.2; the BVH xkimodo writes lists them in this order too)
+    // ponytail: the model's skeleton as a constant; read it from the model if another skeleton family is ever generated
+    inline constexpr const char* soma77_names_v[77] =
+    { "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw", "LeftEye", "RightEye", "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand"
+    , "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd", "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd"
+    , "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd", "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4"
+    , "LeftHandRingEnd", "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd", "RightShoulder", "RightArm", "RightForeArm", "RightHand"
+    , "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd", "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd"
+    , "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd", "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4"
+    , "RightHandRingEnd", "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd", "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase"
+    , "LeftToeEnd", "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd" };
+
+    struct soma_pose { float m_Rot[77][3] = {}; float m_Root[3] = {}; };      // local axis-angle per joint, root (Hips) position in metres
+    struct constraint_set
+    {
+        std::string                         m_Type;         // "left-hand", "right-hand", "left-foot", "right-foot", "fullbody", "root2d"
+        std::vector<int>                    m_Frames;
+        std::vector<soma_pose>              m_Poses;        // one per frame (not for root2d)
+        std::vector<std::array<float, 2>>   m_Smooth;       // the root's (x, z) per frame
+    };
+
+    inline bool WriteConstraints(const std::wstring& Path, const std::vector<constraint_set>& Sets, std::string& Error)
+    {
+        std::ofstream F{ std::filesystem::path(Path) };
+        if (!F) { Error = "cannot write the constraints file"; return false; }
+        F.precision(9);
+        F << "[\n";
+        for (std::size_t s = 0; s < Sets.size(); ++s)
+        {
+            const auto& C = Sets[s];
+            F << "  {\"type\": \"" << C.m_Type << "\", \"frame_indices\": [";
+            for (std::size_t i = 0; i < C.m_Frames.size(); ++i) F << (i ? ", " : "") << C.m_Frames[i];
+            F << "]";
+            if (!C.m_Poses.empty())
+            {
+                F << ", \"local_joints_rot\": [";
+                for (std::size_t i = 0; i < C.m_Poses.size(); ++i)
+                {
+                    F << (i ? ", " : "") << "[";
+                    for (int j = 0; j < 77; ++j) F << (j ? ", " : "") << "[" << C.m_Poses[i].m_Rot[j][0] << ", " << C.m_Poses[i].m_Rot[j][1] << ", " << C.m_Poses[i].m_Rot[j][2] << "]";
+                    F << "]";
+                }
+                F << "], \"root_positions\": [";
+                for (std::size_t i = 0; i < C.m_Poses.size(); ++i) F << (i ? ", " : "") << "[" << C.m_Poses[i].m_Root[0] << ", " << C.m_Poses[i].m_Root[1] << ", " << C.m_Poses[i].m_Root[2] << "]";
+                F << "]";
+            }
+            F << ", \"smooth_root_2d\": [";
+            for (std::size_t i = 0; i < C.m_Smooth.size(); ++i) F << (i ? ", " : "") << "[" << C.m_Smooth[i][0] << ", " << C.m_Smooth[i][1] << "]";
+            F << "]}" << (s + 1 < Sets.size() ? ",\n" : "\n");
+        }
+        F << "]\n";
+        if (!F) { Error = "the constraints file could not be written"; return false; }
+        return true;
+    }
+
+    // One xkimodo client run, waited on (Suggest Pose: a short window, 0.1-0.3 s warm; the first run also starts the server)
+    inline bool RunBlocking(const std::wstring& Exe, const std::wstring& Args, const std::wstring& Log, DWORD TimeoutMs, std::string& Error)
+    {
+        std::wstring Cmd = std::format(L"\"{}\" {}", Exe, Args);
+        if (const wchar_t* M = _wgetenv(L"XKIMODO_MODELS"); M && *M) Cmd += std::format(L" --models \"{}\"", M);
+        SECURITY_ATTRIBUTES SA{ sizeof(SA), nullptr, TRUE };
+        HANDLE hLog = CreateFileW(Log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &SA, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        STARTUPINFOW SI{ sizeof(SI) };
+        SI.dwFlags = STARTF_USESTDHANDLES; SI.hStdOutput = hLog; SI.hStdError = hLog; SI.hStdInput = nullptr;
+        PROCESS_INFORMATION PI{};
+        const BOOL Ok = CreateProcessW(nullptr, Cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &SI, &PI);
+        if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+        if (!Ok) { Error = std::format("xkimodo could not start (error {})", GetLastError()); return false; }
+        const DWORD W = WaitForSingleObject(PI.hProcess, TimeoutMs);
+        DWORD Code = 1;
+        if (W == WAIT_OBJECT_0) GetExitCodeProcess(PI.hProcess, &Code); else TerminateProcess(PI.hProcess, 1);
+        CloseHandle(PI.hProcess); CloseHandle(PI.hThread);
+        if (W != WAIT_OBJECT_0) { Error = "xkimodo did not answer in time"; return false; }
+        if (Code != 0)
+        {
+            std::ifstream L{ std::filesystem::path(Log) }; std::stringstream S; S << L.rdbuf();
+            Error = "xkimodo failed: " + S.str(); return false;
+        }
+        return true;
+    }
 
     // "A person walks forward and waves." -> "WalksForwardAndWaves" (a file name from the prompt's words, without the subject)
     inline std::string NameFromPrompt(const std::string& Prompt) noexcept
