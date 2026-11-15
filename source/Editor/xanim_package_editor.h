@@ -1281,6 +1281,11 @@ namespace xanim_package_editor
             const auto& Man = pDesc->m_ResolvedSkeletonBones.m_Bones;
             const int nB = int(Man.size());
             if (int(C.m_Pose.size()) != nB) return "SuggestPoseAccept: the skeleton changed since the candidate";
+            // One undo step for the whole accept: the keys are written one by one (each reads the stack the previous ones made), then those
+            // steps are rolled back and replayed as one snapshot edit (the snapshot keeps enums since C57)
+            const int UndoAt = m_Undo.GetUndoIndex();
+            xproperty::settings::context SnapCtx;
+            const auto Before = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), SnapCtx);
             int nSteps = 0;
             int nKeys = 0; std::string Err;
             for (int b = 0; b < nB; ++b)
@@ -1292,6 +1297,14 @@ namespace xanim_package_editor
                 const auto R = PoseKey(iLayer, Man[b].m_Name, m_Suggest.m_Time, (C.m_Pose[b].m_Rotation * Below.ConjugateCopy()).NormalizeCopy(), false);
                 if (!R.starts_with("PoseKey: layer")) return "SuggestPoseAccept: " + R;
                 ++nKeys; nSteps += R.find(" added ") != std::string::npos ? 7 : 4;      // PoseKey's SetProperty steps (a new key: size, tick, bone, x y z w)
+            }
+            if (m_Undo.GetUndoIndex() > UndoAt)
+            {
+                const auto After = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), SnapCtx);
+                while (m_Undo.GetUndoIndex() > UndoAt) m_Undo.Undo();
+                if (auto E = m_Undo.Execute(std::format("SnapshotEdit -Label {} -Before {} -After {}", xeditor::Quote(std::format("Suggest Pose: {} keys", nKeys)), xeditor::Quote(Before), xeditor::Quote(After))); !E.empty())
+                    return "SuggestPoseAccept: the keys could not be made one undo step: " + E;
+                nSteps = 1;
             }
             // what the stack now plays at the key, against the candidate
             const std::vector<xmath::transform3>* pFrames = nullptr; int FPS = 30, nF = 0;
