@@ -299,7 +299,8 @@ namespace xanim_package_editor
             AddPanel("Layers",               dock::right,  [this] { RenderLayers(); });
             if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value);
             AddPanel("AnimPackage Viewport", dock::center, [this] { RenderViewport(); }, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            AddPanel("Playback",             dock::bottom, [this] { RenderPlayback(); });
+            AddPanel("Timeline",             dock::bottom_wide, [this] { RenderPlayback(); });       // under the viewport and the side columns
+            m_TLView.m_HeaderWidth = 380;                                                               // name + weight + mode + mask + eye/solo/lock
             AddPanel("Description",          dock::left,   [this] { m_DescriptorInspector.Show(); });
 
             m_Viewport.m_pOpen = &m_bOpen;
@@ -496,8 +497,7 @@ namespace xanim_package_editor
                 const bool bPose = L.m_Kind == xanim_package_desc::layer_kind::POSE;
                 xeditor::timeline::row_desc R;
                 R.m_Id = TLLayerRow(L, i); R.m_Type = bPose ? tl_pose : tl_clip;
-                R.m_Name = std::format("{}  {} {}{}", L.m_Name.empty() ? "(unnamed)" : L.m_Name, L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "Add" : "Ovr"
-                    , L.m_WeightKeys.empty() ? std::format("{:.2f}", L.m_Weight) : std::string("~w"), L.m_Mask.empty() ? (bPose ? "" : "  no mask") : std::format("  mask {}", L.m_Mask.size()));
+                R.m_Name = L.m_Name.empty() ? "(unnamed)" : L.m_Name;         // weight, mode and mask are the row's header widgets
                 R.m_bMute = !L.m_bEnabled; R.m_bLock = L.m_bLock;
                 R.m_Color = bPose ? IM_COL32(210, 150, 70, 255) : IM_COL32(86, 132, 210, 255);
                 std::vector<std::string> Bones;
@@ -508,16 +508,17 @@ namespace xanim_package_editor
                 for (const auto& B : Bones)
                 {
                     xeditor::timeline::row_desc C; C.m_Id = TLBoneRow(R.m_Id, B); C.m_Type = tl_bone; C.m_Depth = 1; C.m_Name = B;
-                    C.m_bMute = R.m_bMute; C.m_bLock = R.m_bLock; C.m_Color = IM_COL32(190, 140, 80, 255);
+                    C.m_bMute = R.m_bMute; C.m_bLock = R.m_bLock; C.m_Color = IM_COL32(190, 140, 80, 255); C.m_bToggles = false;    // its layer's
                     Out.push_back(C); m_TLRows[C.m_Id] = { i, B };
                 }
             }
-            xeditor::timeline::row_desc Base; Base.m_Id = tl_base_row_v; Base.m_Type = tl_base; Base.m_Name = std::format("Clip: {}", pOv->m_Name); Base.m_Color = IM_COL32(150, 150, 160, 255);
+            xeditor::timeline::row_desc Base; Base.m_Id = tl_base_row_v; Base.m_Type = tl_base; Base.m_Name = std::format("Clip: {}", pOv->m_Name); Base.m_Color = IM_COL32(150, 150, 160, 255); Base.m_bToggles = false;
             Out.push_back(Base);
         }
 
         // ops: a timeline plan ("rev N; seg row item start end offset ease_in ease_out; key row item tick") or row ops separated by ';':
-        // "mute row 0|1", "lock row 0|1", "move row above_row" (0: the bottom), "delete row item" (pose keys)
+        // "mute row 0|1", "lock row 0|1", "move row above_row" (0: the bottom), "delete row item" (pose keys), "weight row 0..1",
+        // "mode row 0|1" (0 override, 1 additive)
         std::string TLApply(const std::string& Ops) noexcept
         {
             namespace tl = xeditor::timeline;
@@ -564,8 +565,10 @@ namespace xanim_package_editor
             std::vector<std::function<std::string()>> Steps;
             for (const auto& Part : Parts)
             {
-                char W[16] = {}; unsigned long long R = 0, X = 0;
-                const int n = std::sscanf(Part.c_str(), " %15s %llu %llu", W, &R, &X);
+                char W[16] = {}, A[40] = {}; unsigned long long R = 0;
+                const int n = std::sscanf(Part.c_str(), " %15s %llu %39s", W, &R, A);
+                const unsigned long long X = std::strtoull(A, nullptr, 10);    // a flag, or a row id (64 bits: not through a double)
+                const double             F = std::strtod(A, nullptr);         // a weight
                 if (n <= 0) continue;
                 const std::string_view Op(W);
                 const auto* pR = RowOf(R);
@@ -574,6 +577,18 @@ namespace xanim_package_editor
                 const auto& L = pOv->m_Layers[iL];
                 if (Op == "mute" && n == 3) Steps.push_back([=, this] { return Set(iL, "Enabled", X ? "false" : "true", SelectedOv()->m_Layers[iL].m_bEnabled ? "true" : "false"); });
                 else if (Op == "lock" && n == 3) Steps.push_back([=, this] { return Set(iL, "Lock", X ? "true" : "false", SelectedOv()->m_Layers[iL].m_bLock ? "true" : "false"); });
+                else if (Op == "weight" && n == 3)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    if (!L.m_WeightKeys.empty()) return std::format("layer '{}' has a weight curve: edit its keys", L.m_Name);
+                    if (F < 0 || F > 1) return "a weight is 0..1";
+                    Steps.push_back([=, this] { return Set(iL, "Weight", std::format("{}", float(F)), std::format("{}", SelectedOv()->m_Layers[iL].m_Weight)); });
+                }
+                else if (Op == "mode" && n == 3)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    Steps.push_back([=, this] { return Set(iL, "Mode", X ? "Additive" : "Override", SelectedOv()->m_Layers[iL].m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "Additive" : "Override"); });
+                }
                 else if (Op == "delete" && n == 3)
                 {
                     if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
@@ -747,8 +762,79 @@ namespace xanim_package_editor
                 D.AddTriangleFilled({ A.X(T1), y0 }, { A.X(T1 + F), y1 }, { A.X(T1), y1 }, IM_COL32(210, 150, 70, 55));
                 if (T1 > T0) D.AddRectFilled({ A.X(T0), y0 }, { A.X(T1), y1 }, IM_COL32(210, 150, 70, 25));
             }
+
+            // a layer row's header widgets: its weight (a slider: dragging previews, the release is ONE command), its mode, its mask chip
+            static constexpr float weight_w_v = 70, mode_w_v = 40, mask_w_v = 58;
+            float HeaderWidth(const xeditor::timeline::row_desc& R) override { return (R.m_Type == tl_clip || R.m_Type == tl_pose) ? weight_w_v + mode_w_v + mask_w_v + 8 : 0; }
+            void  Header(const xeditor::timeline::row_desc& R, xeditor::timeline::document&, const ImRect& Box) override
+            {
+                auto* pOv = m_S.SelectedOv(); auto* pDesc = m_S.Desc(); const auto It = m_S.m_TLRows.find(R.m_Id);
+                if (!pOv || !pDesc || It == m_S.m_TLRows.end()) return;
+                const int iL = It->second.m_iLayer;
+                auto& L = pOv->m_Layers[iL];
+                const float h = Box.GetHeight();
+                m_S.m_TLHeaderBoxes[R.m_Id] = Box;                          // tests drive the widgets with the virtual mouse
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { 4, std::max(0.0f, (h - ImGui::GetTextLineHeight()) * 0.5f - 1) });
+
+                // the weight
+                ImGui::SetCursorScreenPos(Box.Min);
+                const bool bCurve = !L.m_WeightKeys.empty();
+                ImGui::BeginDisabled(bCurve || L.m_bLock);
+                float W = L.m_Weight;
+                ImGui::SetNextItemWidth(weight_w_v);
+                ImGui::SliderFloat("##weight", &W, 0.0f, 1.0f, bCurve ? "curve" : "%.2f");
+                if (ImGui::IsItemActivated()) { m_S.m_TLWeightRow = R.m_Id; m_S.m_TLWeightOrig = L.m_Weight; }
+                if (ImGui::IsItemActive() && m_S.m_TLWeightRow == R.m_Id)
+                {
+                    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { L.m_Weight = m_S.m_TLWeightOrig; m_S.m_TLWeightRow = 0; ImGui::ClearActiveID(); }
+                    else L.m_Weight = W;                                    // the preview: the live composition follows; restored before the command
+                }
+                if (ImGui::IsItemDeactivated() && m_S.m_TLWeightRow == R.m_Id)
+                {
+                    const float New = L.m_Weight; L.m_Weight = m_S.m_TLWeightOrig; m_S.m_TLWeightRow = 0;
+                    if (New != m_S.m_TLWeightOrig) m_S.m_TLView.m_Reply = m_S.TLRun(std::format("weight {} {}", R.m_Id, New));
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(bCurve ? "Weight: animated by a curve (edit its keys)" : L.m_bLock ? "Weight (the layer is locked)" : "Weight: how much of this layer is mixed in (drag: preview; release: one undo step)");
+
+                // the mode
+                ImGui::SetCursorScreenPos({ Box.Min.x + weight_w_v + 4, Box.Min.y });
+                const bool bAdd = L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE;
+                ImGui::BeginDisabled(L.m_bLock);
+                ImGui::PushStyleColor(ImGuiCol_Button, bAdd ? IM_COL32(70, 120, 90, 255) : IM_COL32(60, 75, 110, 255));
+                if (ImGui::Button(bAdd ? "Add" : "Over", { mode_w_v, h })) m_S.m_TLView.m_Reply = m_S.TLRun(std::format("mode {} {}", R.m_Id, bAdd ? 0 : 1));
+                ImGui::PopStyleColor();
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(bAdd ? "Additive: adds its motion on top of the layers below (click: Override)" : "Override: replaces the layers below where its mask covers (click: Additive)");
+
+                // the mask chip: how many bones it covers; hover shows them in the viewport, a click edits the mask there
+                const auto M = xanim_package_layers::LayerMask(L, pDesc->m_ResolvedSkeletonBones);
+                int nOn = 0; for (float v : M) nOn += v > 0.0f;
+                const bool bAll = L.m_Mask.empty();
+                const std::string Chip = bAll ? (R.m_Type == tl_pose ? "keyed" : "all") : std::format("{} b", nOn);
+                ImGui::SetCursorScreenPos({ Box.Min.x + weight_w_v + mode_w_v + 8, Box.Min.y });
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 62, 90, 255));
+                if (ImGui::Button(std::format("{}##mask", Chip).c_str(), { mask_w_v, h })) { m_S.m_iLayer = iL; m_S.m_bMaskEdit = true; }
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                {
+                    m_S.m_iMaskHoverNext = iL;
+                    ImGui::SetTooltip("Mask: %s\nShown in the viewport while hovered. Click: edit it there (click bones; Shift: one bone).",
+                        bAll ? (R.m_Type == tl_pose ? "the keyed bones" : "the whole body") : std::format("{} of {} bones", nOn, M.size()).c_str());
+                }
+                ImGui::PopStyleVar();
+            }
         };
         tl_rows                                         m_TLRowType{ *this };
+        std::uint64_t                                   m_TLWeightRow = 0;      // the weight slider being dragged (its row) and the value before
+        float                                           m_TLWeightOrig = 0;
+        int                                             m_iMaskHover = -1, m_iMaskHoverNext = -1;   // a mask chip hovered: its layer's bones shown
+        std::map<std::uint64_t, ImRect>                 m_TLHeaderBoxes;        // the last frame's header widget box per layer row
+
+        std::string TLRun(const std::string& Ops) { return m_Undo.Query(std::format("LayerTimelineEdit -Ops {}", xeditor::Quote(Ops))); }
+        int LayoutVersion() const noexcept override { return 1; }    // 1: the Timeline along the whole bottom
 
         // The timeline under the viewport: the transport is the editor's playback (the playhead = m_TimeSeconds)
         void RenderLayerTimeline(float Height) noexcept
@@ -757,6 +843,8 @@ namespace xanim_package_editor
             static_assert(tl_tps_v == tl::animation_ticks_per_second_v);
             const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType } };
             tl_document Doc(*this);
+            m_iMaskHover = m_iMaskHoverNext; m_iMaskHoverNext = -1;          // last frame's hovered mask chip (the viewport draws before this panel)
+            m_TLHeaderBoxes.clear();
             m_TLView.m_View.m_TPS = tl_tps_v;
             if (auto* pC = SelectedClip(); pC && !m_TLView.m_bFramed) { m_TLView.m_View.m_RateNum = std::max(1, int(pC->m_FPS)); m_TLView.m_View.m_RateDen = 1; }
             m_TLTransport.m_Time = tl::tick(std::llround(double(m_TimeSeconds) * tl_tps_v));
@@ -783,6 +871,10 @@ namespace xanim_package_editor
             const auto& S = m_TLView;
             T += std::format("body {:.1f},{:.1f}..{:.1f},{:.1f} ruler {:.1f},{:.1f}..{:.1f},{:.1f}; reply {}\n", S.m_Body.Min.x, S.m_Body.Min.y, S.m_Body.Max.x, S.m_Body.Max.y, S.m_Ruler.Min.x, S.m_Ruler.Min.y, S.m_Ruler.Max.x, S.m_Ruler.Max.y, S.m_Reply);
             for (const auto& [Id, R] : S.m_RowRects) T += std::format("rowrect {} at y {:.1f}..{:.1f}\n", Id, R.Min.y, R.Max.y);
+            for (const auto& [Id, R] : m_TLHeaderBoxes) T += std::format("hdr {} {:.1f} {:.1f} {:.1f} {:.1f}\n", Id, R.Min.x, R.Min.y, R.Max.x, R.Max.y);
+            T += std::format("header width {:.1f}\n", S.m_HeaderWidth);
+            if (auto* pOv = SelectedOv()) for (int i = 0; i < int(pOv->m_Layers.size()); ++i)
+                T += std::format("layer {} weight {} mode {}\n", TLLayerRow(pOv->m_Layers[i], i), pOv->m_Layers[i].m_Weight, pOv->m_Layers[i].m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "Additive" : "Override");
             for (const auto& R : Rows)
             {
                 T += std::format("row {} {} {} {} {} {}{}\n", R.m_Id, R.m_Type, R.m_Depth, int(R.m_bMute), int(R.m_bLock), R.m_Name, m_TLView.m_Folded.count(R.m_Id) ? " (folded)" : "");
@@ -1040,8 +1132,9 @@ namespace xanim_package_editor
         {
             m_MaskShown.clear();
             auto* pOv = SelectedOv(); auto* pDesc = Desc();
-            if (!pOv || !pDesc || m_iLayer < 0 || m_iLayer >= int(pOv->m_Layers.size())) return;
-            const auto M = xanim_package_layers::LayerMask(pOv->m_Layers[m_iLayer], pDesc->m_ResolvedSkeletonBones);
+            const int iL = m_iMaskHover >= 0 ? m_iMaskHover : m_iLayer;      // a hovered mask chip shows its layer's bones
+            if (!pOv || !pDesc || iL < 0 || iL >= int(pOv->m_Layers.size())) return;
+            const auto M = xanim_package_layers::LayerMask(pOv->m_Layers[iL], pDesc->m_ResolvedSkeletonBones);
             for (int b = 0; b < int(M.size()); ++b) if (M[b] > 0.0f) m_MaskShown.insert(b);
         }
 
