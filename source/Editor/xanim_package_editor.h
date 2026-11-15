@@ -1170,10 +1170,20 @@ namespace xanim_package_editor
             auto* pOv = SelectedOv(); auto* pS = SelectedSource(); auto* pDesc = Desc();
             const auto* pBase = FindLayerSource(pS->key(), pOv->m_OriginalName);
             if (!pBase) { Error = "this clip is not in the layer sources: compile the package"; return false; }
-            xanim_package_desc::clip Below = *pOv;
-            Below.m_Layers.resize(iLayer);
-            std::vector<xmath::transform3> Out; xanim_package_layers::report R;
-            if (!xanim_package_layers::Compose(*pBase, Below, pDesc->m_ResolvedSkeletonBones, [this](const std::wstring& K, const std::string& C) { return FindLayerSource(K, C); }, Out, R, Error)) return false;
+            // the stack exactly as the layer sees it when the clip composes (inside a group: the group's own sub-stack); a disabled layer
+            // does not run, so for it the layers before it in the list
+            auto FindSrc = [this](const std::wstring& K, const std::string& C) { return FindLayerSource(K, C); };
+            std::vector<xmath::transform3> Out, Full; xanim_package_layers::report R;
+            if (iLayer < int(pOv->m_Layers.size()))
+            {
+                if (!xanim_package_layers::Compose(*pBase, *pOv, pDesc->m_ResolvedSkeletonBones, FindSrc, Full, R, Error, &pOv->m_Layers[iLayer], &Out)) return false;
+            }
+            if (Out.empty())
+            {
+                xanim_package_desc::clip Below = *pOv;
+                Below.m_Layers.resize(std::min<std::size_t>(iLayer, Below.m_Layers.size()));
+                if (!xanim_package_layers::Compose(*pBase, Below, pDesc->m_ResolvedSkeletonBones, FindSrc, Out, R, Error)) return false;
+            }
             const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size()), nF = pBase->m_nFrames;
             const double FT = std::clamp(Seconds * std::max(1, pBase->m_FPS), 0.0, double(nF - 1));
             const int A = int(FT), B = std::min(A + 1, nF - 1);

@@ -83,9 +83,13 @@ namespace xanim_package_layers
     }
 
     // Base (the clip's own source frames) + the clip's enabled layers -> Out (same size as Base). False with Error when a layer cannot run.
+    // pBelowOf / pBelow: also the stack exactly as that layer sees it (the frames just before it is applied: inside a group, the group's own
+    // sub-stack) - what an absolute pose key is anchored against. *pBelow stays empty when that layer does not run (disabled).
     inline bool Compose(const source_frames& Base, const xanim_package_desc::clip& Ov, const xskeleton_desc::bone_manifest& Manifest, const find_source& Find
-                       , std::vector<xmath::transform3>& Out, report& Report, std::string& Error)
+                       , std::vector<xmath::transform3>& Out, report& Report, std::string& Error
+                       , const xanim_package_desc::clip_layer* pBelowOf = nullptr, std::vector<xmath::transform3>* pBelow = nullptr)
     {
+        if (pBelow) pBelow->clear();
         const auto& Bones = Manifest.m_Bones;
         const int nSkel = static_cast<int>(Bones.size()), nFrames = Base.m_nFrames, FPS = std::max(1, Base.m_FPS);
         Report = {};
@@ -249,6 +253,7 @@ namespace xanim_package_layers
             {
                 if (PreparedParent[i] != ParentId) continue;
                 auto& P = Layers[i];
+                if (pBelow && P.m_pDesc == pBelowOf) *pBelow = Out;
                 const auto K = P.m_pDesc->m_Kind;
                 if (K == kind::FOLDER) { Eval(P.m_pDesc->m_Id, Out); continue; }
                 if (K != kind::GROUP) { ApplyOne(P, Out); continue; }
