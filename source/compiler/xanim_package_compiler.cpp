@@ -621,7 +621,7 @@ namespace xanim_package_compiler
             }
             else LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}' does not animate the source skeleton's root: the skeleton's corrections were not applied", Raw.m_Anim.m_Name));
 
-            const auto Baked = xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Frames, nSrc, nFrames, Raw.m_Anim.m_FPS, false }, nDst);
+            auto Baked = xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Frames, nSrc, nFrames, Raw.m_Anim.m_FPS, false }, nDst);
 
             // a numeric look at the result (the log is how a retarget is judged without eyes): the hands and feet, relative to the hips and in hip heights, for the source
             // (in its skeleton space) and the destination (baked), on a few frames. A transfer that works gives the two nearly the same numbers.
@@ -670,7 +670,32 @@ namespace xanim_package_compiler
                         }
                         const auto Sc = xanimation::FindContacts(SF, Raw.m_Anim.m_FPS), Dc = xanimation::FindContacts(DF, Raw.m_Anim.m_FPS);
                         auto Mean = [](const std::vector<xanimation::contact_interval>& C) { float T = 0; for (const auto& I : C) T += I.m_Skate; return C.empty() ? 0.0f : T / static_cast<float>(C.size()); };
-                        LogMessage(xresource_pipeline::msg_type::INFO, std::format("  {} foot contacts: source {} (skate {:.3f}/s), destination {} (skate {:.3f}/s)", Row.m_Side == xanimation::bone_side::LEFT ? "left" : "right", Sc.size(), Mean(Sc), Dc.size(), Mean(Dc)));
+                        const char* pSide = Row.m_Side == xanimation::bone_side::LEFT ? "left" : "right";
+                        LogMessage(xresource_pipeline::msg_type::INFO, std::format("  {} foot contacts: source {} (skate {:.3f}/s), destination {} (skate {:.3f}/s)", pSide, Sc.size(), Mean(Sc), Dc.size(), Mean(Dc)));
+
+                        // the contact fix-up (the Retarget's PlantFeet): the destination foot held over the SOURCE's contacts (the intent), then measured again
+                        // over those same intervals (skate in hip heights per second, like above)
+                        if (Ctx.m_Descriptor.m_bPlantFeet && !Sc.empty())
+                        {
+                            xanimation::leg_chain Leg; Leg.m_Foot = Row.m_Target;
+                            for (const auto& R2 : Ctx.m_Mapping.m_Auto.m_Rows)
+                                if (R2.m_Side == Row.m_Side) { if (R2.m_Slot == xanimation::bone_slot::THIGH) Leg.m_Thigh = R2.m_Target; else if (R2.m_Slot == xanimation::bone_slot::CALF) Leg.m_Calf = R2.m_Target; }
+                            auto Skate = [&](const std::vector<xmath::fvec3>& P)
+                            {
+                                float T = 0; for (const auto& I : Sc) { float Path = 0; for (int f = I.m_First + 1; f <= I.m_Last; ++f) Path += std::hypot(P[f].m_X - P[f - 1].m_X, P[f].m_Z - P[f - 1].m_Z);
+                                                                        T += I.m_Last > I.m_First ? Path * Raw.m_Anim.m_FPS / float(I.m_Last - I.m_First) : 0.0f; }
+                                return T / float(Sc.size());
+                            };
+                            const float Before = Skate(DF);
+                            const auto Res = xanimation::PlantFoot(Baked, nDst, Dk.m_Parent, Leg, Sc);
+                            if (!Res.m_bOk) LogMessage(xresource_pipeline::msg_type::WARNING, std::format("  {} foot: PlantFeet skipped (the leg is not thigh -> calf -> foot in the destination)", pSide));
+                            else
+                            {
+                                for (int f = 0; f < nFrames; ++f) DF[f] = Worlds(Dk.m_Parent, Baked, nDst, f)[Row.m_Target] * (1.0f / Hd);
+                                LogMessage(xresource_pipeline::msg_type::INFO, std::format("  {} foot planted over the source's {} contacts: skate {:.4f}/s -> {:.4f}/s; {} frames solved, largest miss {:.4f} hip heights"
+                                    , pSide, Sc.size(), Before, Skate(DF), Res.m_nFrames, Res.m_MaxMiss / Hd));
+                            }
+                        }
                     }
                 }
             }
