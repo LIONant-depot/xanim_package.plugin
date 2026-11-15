@@ -56,6 +56,19 @@ namespace xanim_package_layers
     inline std::vector<float> LayerMask(const xanim_package_desc::clip_layer& L, const xskeleton_desc::bone_manifest& Manifest, std::vector<std::string>* pWarnings = nullptr)
     {
         const auto& Bones = Manifest.m_Bones;
+        if (!L.m_SharedMask.empty())        // contract v3: a skeleton mask group by name replaces the layer's own entries
+        {
+            std::vector<float> W(Bones.size(), 0.0f);
+            const auto It = std::find_if(Manifest.m_Masks.begin(), Manifest.m_Masks.end(), [&](const auto& M) { return M.m_Name == L.m_SharedMask; });
+            if (It == Manifest.m_Masks.end())
+            {
+                if (pWarnings) pWarnings->push_back(std::format("ERROR layer '{}': the skeleton has no mask group '{}' - the layer contributes nothing until it is fixed", L.m_Name, L.m_SharedMask));
+                return W;
+            }
+            for (const auto& E : It->m_Bones)
+                for (int s = 0; s < int(Bones.size()); ++s) if (Bones[s].m_Name == E.m_Bone) { W[s] = E.m_Weight; break; }
+            return W;
+        }
         std::vector<std::int32_t> Parents(Bones.size());
         for (std::size_t s = 0; s < Bones.size(); ++s) Parents[s] = Bones[s].m_iParent;
         xanimation::mask_rules Rules;
@@ -96,16 +109,43 @@ namespace xanim_package_layers
             std::uint8_t                            m_Channels = 0;
             std::size_t                             m_Written = 0, m_WrittenOutside = 0;
         };
+        // contract v3: each layer's effective parent (its folder or group, or 0 = top level) and whether it is in at all (its own Enabled and
+        // every ancestor's). A parent that names nothing, names a layer that is not a folder/group, or loops: the top level, with a warning.
+        using kind = xanim_package_desc::layer_kind;
+        const auto& LL = Ov.m_Layers;
+        auto Container = [&](std::uint64_t Id) -> const xanim_package_desc::clip_layer* { if (!Id) return nullptr; for (const auto& L : LL) if (L.m_Id == Id && (L.m_Kind == kind::FOLDER || L.m_Kind == kind::GROUP)) return &L; return nullptr; };
+        std::vector<std::uint64_t> Parent(LL.size(), 0);
+        std::vector<char> In(LL.size(), 0);
+        for (std::size_t i = 0; i < LL.size(); ++i)
+        {
+            const auto* pP = Container(LL[i].m_Parent);
+            if (LL[i].m_Parent && !pP) Report.m_Warnings.push_back(std::format("layer '{}': its parent {} is not a folder or group of this clip (taken as top level)", LL[i].m_Name, LL[i].m_Parent));
+            bool bLoop = false, bOn = LL[i].m_bEnabled;
+            int Steps = 0;
+            for (const auto* pA = pP; pA; pA = Container(pA->m_Parent)) { if (++Steps > int(LL.size()) || pA == &LL[i]) { bLoop = true; break; } bOn = bOn && pA->m_bEnabled; }
+            if (bLoop) { Report.m_Warnings.push_back(std::format("layer '{}': its parents loop (taken as top level)", LL[i].m_Name)); pP = nullptr; bOn = LL[i].m_bEnabled; }
+            Parent[i] = pP ? pP->m_Id : 0;
+            In[i] = bOn;
+        }
+
         std::vector<prepared> Layers;
         Layers.reserve(Ov.m_Layers.size());
+        std::vector<std::uint64_t> PreparedParent;
         std::vector<float> Union(nSkel, 0.0f);
-        for (const auto& L : Ov.m_Layers)
+        for (std::size_t li = 0; li < LL.size(); ++li)
         {
-            if (!L.m_bEnabled) continue;
+            const auto& L = LL[li];
+            if (!In[li]) continue;
             auto& P = Layers.emplace_back();
+            PreparedParent.push_back(Parent[li]);
             P.m_pDesc = &L;
             const xanimation::tick ClipEnd = ToTick(double(nFrames) / FPS);
-            if (L.m_Kind == xanim_package_desc::layer_kind::POSE)
+            if (L.m_Kind == kind::FOLDER || L.m_Kind == kind::GROUP)
+            {
+                // a folder has nothing of its own; a group: its mask (empty = the whole body) and its weight (keys below)
+                if (L.m_Kind == kind::GROUP) P.m_Mask = (L.m_Mask.empty() && L.m_SharedMask.empty()) ? std::vector<float>(nSkel, 1.0f) : LayerMask(L, Manifest, &Report.m_Warnings);
+            }
+            else if (L.m_Kind == xanim_package_desc::layer_kind::POSE)
             {
                 // a Pose layer: tracks from its keys (bones by name); its mask, when empty, is the whole body (the keys decide)
                 P.m_Time = { .m_Start = L.m_Start, .m_End = L.m_End >= 0 ? L.m_End : ClipEnd };
@@ -159,7 +199,9 @@ namespace xanim_package_layers
         xanimation::pose Pose; Pose.resize(nSkel);
         xanimation::layer_sample Sample; Sample.resize(nSkel);
         std::vector<std::uint8_t> Written;
-        for (auto& P : Layers)
+        // contract v3: the top level in list order; a folder's children at its place onto the same stack (pass-through); a group's children over
+        // a copy of the stack below it, the result applied with the group's weight and mask (isolated)
+        auto ApplyOne = [&](prepared& P, std::vector<xmath::transform3>& Out)
         {
             const bool bPose = P.m_pDesc->m_Kind == xanim_package_desc::layer_kind::POSE;
             const bool bAdd  = P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE;
@@ -200,14 +242,40 @@ namespace xanim_package_layers
                 for (int s = 0; s < nSkel; ++s)
                     if (Written[s]) { ++P.m_Written; if (P.m_Mask[s] <= 0.0f) ++P.m_WrittenOutside; Out[static_cast<std::size_t>(f) * nSkel + s] = Pose.get(s); }
             }
-        }
+        };
+        std::function<void(std::uint64_t, std::vector<xmath::transform3>&)> Eval = [&](std::uint64_t ParentId, std::vector<xmath::transform3>& Out)
+        {
+            for (std::size_t i = 0; i < Layers.size(); ++i)
+            {
+                if (PreparedParent[i] != ParentId) continue;
+                auto& P = Layers[i];
+                const auto K = P.m_pDesc->m_Kind;
+                if (K == kind::FOLDER) { Eval(P.m_pDesc->m_Id, Out); continue; }
+                if (K != kind::GROUP) { ApplyOne(P, Out); continue; }
+                std::vector<xmath::transform3> R = Out;           // the group's base: the stack below it
+                Eval(P.m_pDesc->m_Id, R);
+                xanimation::pose GR; GR.resize(nSkel);
+                for (int f = 0; f < nFrames; ++f)
+                {
+                    const xanimation::tick T = ToTick(double(f) / FPS);
+                    for (int s = 0; s < nSkel; ++s) { Pose.set(s, Out[static_cast<std::size_t>(f) * nSkel + s]); GR.set(s, R[static_cast<std::size_t>(f) * nSkel + s]); }
+                    xanimation::ApplyGroupResult(Pose, GR, xanimation::EvaluateWeight(P.m_Keys, T, P.m_pDesc->m_Weight), P.m_Mask, &Written);
+                    for (int s = 0; s < nSkel; ++s)
+                        if (Written[s]) { ++P.m_Written; if (P.m_Mask[s] <= 0.0f) ++P.m_WrittenOutside; Out[static_cast<std::size_t>(f) * nSkel + s] = Pose.get(s); }
+                }
+            }
+        };
+        Eval(0, Out);
 
         for (const auto& P : Layers)
         {
             auto& R = Report.m_Layers.emplace_back();
             R.m_Name = P.m_pDesc->m_Name;
-            R.m_Source = P.m_pDesc->m_Kind == xanim_package_desc::layer_kind::POSE ? std::format("pose: {} keys on {} bones", P.m_pDesc->m_Keys.size(), P.m_Tracks.size())
-                                                                                  : xstrtool::To(P.m_pDesc->m_SourceKey) + ":" + P.m_pDesc->m_SourceClip;
+            const auto K = P.m_pDesc->m_Kind;
+            R.m_Source = K == kind::POSE ? std::format("pose: {} keys on {} bones", P.m_pDesc->m_Keys.size(), P.m_Tracks.size())
+                       : K == kind::FOLDER ? std::string("folder (pass-through)")
+                       : K == kind::GROUP  ? std::string("group (isolated)")
+                       : xstrtool::To(P.m_pDesc->m_SourceKey) + ":" + P.m_pDesc->m_SourceClip;
             R.m_bAdditive = P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE;
             if (P.m_pDesc->m_Kind == xanim_package_desc::layer_kind::POSE) for (const auto& T : P.m_Tracks) R.m_nMaskBones += P.m_Mask[T.m_Bone] > 0.0f;   // its write set
             else for (float M : P.m_Mask) R.m_nMaskBones += M > 0.0f;

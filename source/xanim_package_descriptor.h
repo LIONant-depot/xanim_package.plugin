@@ -59,10 +59,12 @@ namespace xanim_package_desc
     , xproperty::settings::enum_item("From layer",    layer_root::FROM_LAYER)
     };
 
-    enum class layer_kind : std::uint8_t { CLIP, POSE };
+    enum class layer_kind : std::uint8_t { CLIP, POSE, FOLDER, GROUP };      // FOLDER: pass-through organization; GROUP: isolated (contract v3)
     static constexpr auto layer_kind_v = std::array
     { xproperty::settings::enum_item("Clip", layer_kind::CLIP)
     , xproperty::settings::enum_item("Pose", layer_kind::POSE)
+    , xproperty::settings::enum_item("Folder", layer_kind::FOLDER)
+    , xproperty::settings::enum_item("Group", layer_kind::GROUP)
     };
 
     // A Pose layer's key: one bone's local rotation at a time. Absolute target by default (the pose to reach: in an Additive layer its offset is
@@ -192,6 +194,8 @@ namespace xanim_package_desc
         bool                m_bSmooth     = false;      // Pose layers: a smooth curve through the keys (new pose layers: on; off = linear, as layers made before)
         float               m_Falloff     = 0.0f;       // Pose layers: seconds the layer eases in before its first key and out after its last (new pose layers: 0.5; 0 = ramp to the section ends)
         std::vector<layer_take> m_Takes   = {};         // Pose layers: the generated takes (Kimodo) some of the keys came from (provenance; nothing composes from it)
+        std::uint64_t       m_Parent      = 0;          // the Id of the folder or group this layer is in; 0 = the top level (contract v3)
+        std::string         m_SharedMask  = {};         // a skeleton mask group by name: replaces Mask; a name the skeleton lacks = the layer contributes nothing (an error)
 
         XPROPERTY_DEF
         ( "Layer", clip_layer
@@ -222,6 +226,8 @@ namespace xanim_package_desc
         , obj_member<"Smooth",        &clip_layer::m_bSmooth >
         , obj_member<"Falloff",       &clip_layer::m_Falloff >
         , obj_member<"Takes",         &clip_layer::m_Takes >
+        , obj_member<"Parent",        &clip_layer::m_Parent >
+        , obj_member<"SharedMask",    &clip_layer::m_SharedMask >
         )
     };
     XPROPERTY_REG(clip_layer)
@@ -426,11 +432,15 @@ namespace xanim_package_desc
                 return Err;
 
             if (not isReading) return {};
-            if (m_SkeletonRef.empty()) return {};
+            return LoadSkeletonManifest(FileName);
+        }
 
-            // Cross-plugin dependency: read the Skeleton compiler's own bone-manifest export (its
-            // final, post-merge bone order/hashes) - not its compiled binary. RunAfter in this
-            // plugin's Plugin.config guarantees this file already exists by the time we get here.
+        // Cross-plugin dependency: read the Skeleton compiler's own bone-manifest export (its final, post-merge bone order/hashes, its mask
+        // groups) - not its compiled binary. RunAfter in this plugin's Plugin.config guarantees this file already exists by the time we
+        // get here. The editor calls it again after a compile: the skeleton may have changed (a mask group edit, contract v3).
+        xerr LoadSkeletonManifest(std::wstring_view FileName) noexcept
+        {
+            if (m_SkeletonRef.empty()) return {};
             std::wstring ManifestPath;
             if (auto Err = getSkeletonBoneManifestPath(ManifestPath, FileName); Err)
                 return Err;

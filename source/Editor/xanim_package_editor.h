@@ -54,7 +54,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit };
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent };
 
         session&    m_Session;
         kind        m_Kind;
@@ -81,7 +81,7 @@ namespace xanim_package_editor
                 m_hA = m_Parser.addOption("Source", "The import source's key (its path, as ListClips shows it); not for -Kind Pose", false, 1);
                 m_hB = m_Parser.addOption("Clip",   "The clip there (its original name); not for -Kind Pose", false, 1);
                 m_hC = m_Parser.addOption("Name",   "The layer's name", false, 1);
-                m_hD = m_Parser.addOption("Kind",   "Clip (default) or Pose", false, 1);
+                m_hD = m_Parser.addOption("Kind",   "Clip (default), Pose, Folder (organizes: pass-through) or Group (isolated: its children mix, then it blends with its weight and mask)", false, 1);
                 break;
             case kind::pose_key:
                 m_hA = m_Parser.addOption("Layer",  "The Pose layer's index in the selected clip", true, 1);
@@ -116,8 +116,13 @@ namespace xanim_package_editor
                 break;
             case kind::layer_mask:
                 m_hA = m_Parser.addOption("Layer", "The layer's index in the selected clip", true, 1);
-                m_hB = m_Parser.addOption("Bone",  "The bone (its name): added with its branch, or removed when it is in the mask", true, 1);
+                m_hB = m_Parser.addOption("Bone",  "The bone (its name): added with its branch, or removed when it is in the mask", false, 1);
                 m_hC = m_Parser.addOption("Only",  "1: this bone only (not its branch)", false, 1);
+                m_hD = m_Parser.addOption("Shared", "A skeleton mask group by name: the layer uses it instead of its own entries (\"\" = back to its own)", false, 1);
+                break;
+            case kind::layer_parent:
+                m_hA = m_Parser.addOption("Layer",  "The layer's index in the selected clip", true, 1);
+                m_hB = m_Parser.addOption("Parent", "The folder's or group's index; -1 = the top level", true, 1);
                 break;
             default: break;
             }
@@ -158,7 +163,7 @@ namespace xanim_package_editor
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
-        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit;
+        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
 
         // Layers (the layered edit mode): the compiler's layer-sources cache, the selected clip's live composition (same function as the compile)
         std::vector<xanim_package_layers::source_frames> m_LayerSources;
@@ -278,7 +283,8 @@ namespace xanim_package_editor
             , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved). Usage: KimodoDiscard")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
-            , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there. Usage: LayerMask -Layer n -Bone name [-Only 1]")
+            , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
+            , m_LayerParent   (m_Undo, *this, playback_cmd::kind::layer_parent,    "LayerParent",    "Puts a layer into a folder or group (or back to the top level with -1): one undo step. Usage: LayerParent -Layer n -Parent m|-1")
             , m_LayersInfo    (m_Undo, *this, playback_cmd::kind::layers_info,     "LayersInfo",     "The selected clip's layers, the live composition's isolation report and its parity with the compiled clip. Usage: LayersInfo")
             , m_PoseKey       (m_Undo, *this, playback_cmd::kind::pose_key,        "PoseKey",        "Sets a key on a Pose layer: the bone's pose at a time = the layers below turned by -Turn (absolute target), or the turn as an offset key. Usage: PoseKey -Layer n -Bone name -Time s [-Turn \"x y z\"] [-Offset 1] [-Move \"x y z\"]")
             , m_SuggestPose   (m_Undo, *this, playback_cmd::kind::suggest_pose,    "SuggestPose",    "Suggests a natural pose at a time with Kimodo for the handles moved and pinned: a CANDIDATE (nothing is written) and its report. Usage: SuggestPose -Time s [-Move \"LeftHand 0 0 15\"] [-Pin \"LeftFoot RightFoot\"] [-Seeds \"1 2\"] [-Prompt text]")
@@ -343,7 +349,13 @@ namespace xanim_package_editor
 
         void OnDescriptorReplaced() noexcept override { Reload(); }
         void OnCompileStarted()     noexcept override { LetGo(); }
-        void OnCompiled()           noexcept override { MergeDetails(); Reload(); }
+        void OnCompiled()           noexcept override
+        {
+            // the skeleton may have changed since the descriptor was read (its mask groups: shared masks, contract v3): the live preview
+            // must read what the compile read
+            if (auto* pDesc = Desc()) { xskeleton_desc::bone_manifest Keep = pDesc->m_ResolvedSkeletonBones; pDesc->m_ResolvedSkeletonBones = {}; if (pDesc->LoadSkeletonManifest(m_Document.m_DescriptorPath)) pDesc->m_ResolvedSkeletonBones = std::move(Keep); }
+            MergeDetails(); Reload();
+        }
 
         std::uint64_t m_FramedSkeleton = ~0ull;      // the skeleton the camera was last framed for
         void LetGo() noexcept
@@ -439,7 +451,7 @@ namespace xanim_package_editor
             std::string S;
             for (const auto& L : C.m_Layers)
             {
-                S += std::format("{}|{}|", int(L.m_Space), int(L.m_Kind));
+                S += std::format("{}|{}|{}|{}|{}|", int(L.m_Space), int(L.m_Kind), L.m_Id, L.m_Parent, L.m_SharedMask);
                 for (const auto& K : L.m_Keys) S += std::format("p{},{},{},{},{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Bone, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bOffset, K.m_bStep, K.m_bPosition, K.m_PX, K.m_PY, K.m_PZ);
                 S += std::format("s{},{}|", L.m_bSmooth, L.m_Falloff);
                 S += std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", L.m_bEnabled, int(L.m_Mode), int(L.m_Reference), L.m_ReferenceTick, xstrtool::To(L.m_SourceKey), L.m_SourceClip
@@ -457,7 +469,31 @@ namespace xanim_package_editor
         // folding, solo and selection never touch the descriptor.
         //----------------------------------------------------------------------------------------
         static constexpr std::uint64_t tl_base_row_v = 0xB000000000000001ull;
-        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4 };
+        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4, tl_folder = 5, tl_group = 6 };
+
+        // contract v3: a layer's effective parent (its folder or group in this clip; 0 = the top level). A parent that names nothing, or
+        // loops, is the top level - the same rule as the composition (xanim_package_layers::Compose)
+        static std::uint64_t TLParentOf(const xanim_package_desc::clip& C, int i) noexcept
+        {
+            using kind = xanim_package_desc::layer_kind;
+            auto Container = [&](std::uint64_t Id) -> const xanim_package_desc::clip_layer* { if (!Id) return nullptr; for (const auto& L : C.m_Layers) if (L.m_Id == Id && (L.m_Kind == kind::FOLDER || L.m_Kind == kind::GROUP)) return &L; return nullptr; };
+            const auto* pP = Container(C.m_Layers[i].m_Parent);
+            int Steps = 0;
+            for (const auto* pA = pP; pA; pA = Container(pA->m_Parent)) if (++Steps > int(C.m_Layers.size()) || pA == &C.m_Layers[i]) return 0;
+            return pP ? pP->m_Id : 0;
+        }
+        // Id is Of or inside it (any depth)
+        static bool TLIsWithin(const xanim_package_desc::clip& C, std::uint64_t Id, std::uint64_t Of) noexcept
+        {
+            for (int Steps = 0; Id && Steps <= int(C.m_Layers.size()); ++Steps)
+            {
+                if (Id == Of) return true;
+                int i = -1; for (int j = 0; j < int(C.m_Layers.size()); ++j) if (C.m_Layers[j].m_Id == Id) { i = j; break; }
+                if (i < 0) return false;
+                Id = TLParentOf(C, i);
+            }
+            return false;
+        }
         struct tl_row { int m_iLayer = -1; std::string m_Bone; };
         std::unordered_map<std::uint64_t, tl_row>       m_TLRows;               // rebuilt with the rows: row id -> layer (and bone)
         std::set<std::uint64_t>                         m_TLSeen;               // pose rows seen (a new one starts folded)
@@ -491,27 +527,39 @@ namespace xanim_package_editor
             m_TLRows.clear();
             auto* pOv = SelectedOv();
             if (!pOv) return;
-            for (int i = int(pOv->m_Layers.size()) - 1; i >= 0; --i)
+            // the tree (contract v3): top first in mix order; a folder's or group's children indented under it, top first too
+            using kind = xanim_package_desc::layer_kind;
+            std::function<void(std::uint64_t, int, bool, bool)> Emit = [&](std::uint64_t Parent, int Depth, bool bMuteUp, bool bLockUp)
             {
-                const auto& L = pOv->m_Layers[i];
-                const bool bPose = L.m_Kind == xanim_package_desc::layer_kind::POSE;
-                xeditor::timeline::row_desc R;
-                R.m_Id = TLLayerRow(L, i); R.m_Type = bPose ? tl_pose : tl_clip;
-                R.m_Name = L.m_Name.empty() ? "(unnamed)" : L.m_Name;         // weight, mode and mask are the row's header widgets
-                R.m_bMute = !L.m_bEnabled; R.m_bLock = L.m_bLock;
-                R.m_Color = bPose ? IM_COL32(210, 150, 70, 255) : IM_COL32(86, 132, 210, 255);
-                std::vector<std::string> Bones;
-                if (bPose) { for (const auto& K : L.m_Keys) if (std::find(Bones.begin(), Bones.end(), K.m_Bone) == Bones.end()) Bones.push_back(K.m_Bone); std::sort(Bones.begin(), Bones.end()); }
-                R.m_bHasChildren = !Bones.empty();
-                if (bPose && m_TLSeen.insert(R.m_Id).second) m_TLView.m_Folded.insert(R.m_Id);      // a pose layer starts folded: its summary row
-                Out.push_back(R); m_TLRows[R.m_Id] = { i, {} };
-                for (const auto& B : Bones)
+                for (int i = int(pOv->m_Layers.size()) - 1; i >= 0; --i)
                 {
-                    xeditor::timeline::row_desc C; C.m_Id = TLBoneRow(R.m_Id, B); C.m_Type = tl_bone; C.m_Depth = 1; C.m_Name = B;
-                    C.m_bMute = R.m_bMute; C.m_bLock = R.m_bLock; C.m_Color = IM_COL32(190, 140, 80, 255); C.m_bToggles = false;    // its layer's
-                    Out.push_back(C); m_TLRows[C.m_Id] = { i, B };
+                    const auto& L = pOv->m_Layers[i];
+                    if (TLParentOf(*pOv, i) != Parent) continue;
+                    const bool bPose = L.m_Kind == kind::POSE, bFolder = L.m_Kind == kind::FOLDER, bGroup = L.m_Kind == kind::GROUP;
+                    xeditor::timeline::row_desc R;
+                    R.m_Id = TLLayerRow(L, i); R.m_Type = bPose ? tl_pose : bFolder ? tl_folder : bGroup ? tl_group : tl_clip;
+                    R.m_Depth = Depth;
+                    R.m_Name = L.m_Name.empty() ? "(unnamed)" : L.m_Name;     // weight, mode and mask are the row's header widgets
+                    R.m_bMute = !L.m_bEnabled || bMuteUp; R.m_bLock = L.m_bLock || bLockUp;
+                    R.m_Color = bPose ? IM_COL32(210, 150, 70, 255) : bFolder ? IM_COL32(150, 150, 110, 255) : bGroup ? IM_COL32(140, 110, 190, 255) : IM_COL32(86, 132, 210, 255);
+                    std::vector<std::string> Bones;
+                    if (bPose) { for (const auto& K : L.m_Keys) if (std::find(Bones.begin(), Bones.end(), K.m_Bone) == Bones.end()) Bones.push_back(K.m_Bone); std::sort(Bones.begin(), Bones.end()); }
+                    const bool bContainer = bFolder || bGroup;
+                    bool bKids = !Bones.empty();
+                    if (bContainer) for (int j = 0; j < int(pOv->m_Layers.size()) && !bKids; ++j) bKids = j != i && TLParentOf(*pOv, j) == L.m_Id && L.m_Id;
+                    R.m_bHasChildren = bKids;
+                    if (bPose && m_TLSeen.insert(R.m_Id).second) m_TLView.m_Folded.insert(R.m_Id);      // a pose layer starts folded: its summary row
+                    Out.push_back(R); m_TLRows[R.m_Id] = { i, {} };
+                    if (bContainer) { if (L.m_Id) Emit(L.m_Id, Depth + 1, R.m_bMute, R.m_bLock); continue; }
+                    for (const auto& B : Bones)
+                    {
+                        xeditor::timeline::row_desc C; C.m_Id = TLBoneRow(R.m_Id, B); C.m_Type = tl_bone; C.m_Depth = Depth + 1; C.m_Name = B;
+                        C.m_bMute = R.m_bMute; C.m_bLock = R.m_bLock; C.m_Color = IM_COL32(190, 140, 80, 255); C.m_bToggles = false;    // its layer's
+                        Out.push_back(C); m_TLRows[C.m_Id] = { i, B };
+                    }
                 }
-            }
+            };
+            Emit(0, 0, false, false);
             xeditor::timeline::row_desc Base; Base.m_Id = tl_base_row_v; Base.m_Type = tl_base; Base.m_Name = std::format("Clip: {}", pOv->m_Name); Base.m_Color = IM_COL32(150, 150, 160, 255); Base.m_bToggles = false;
             Out.push_back(Base);
         }
@@ -605,8 +653,26 @@ namespace xanim_package_editor
                         const int a = pA->m_iLayer - (iL < pA->m_iLayer ? 1 : 0);
                         t = a + 1;
                     }
-                    if (t == iL) return "no change";
-                    Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Move -Index {} -ToIndex {}", xeditor::Quote(LayersPath()), iL, t)); });
+                    // contract v3: the row joins the folder or group of the row it lands above (the bottom / the clip row: the top level)
+                    const std::uint64_t NewParent = (X && X != tl_base_row_v) ? TLParentOf(*pOv, RowOf(X)->m_iLayer) : 0;
+                    if (NewParent && L.m_Id && TLIsWithin(*pOv, NewParent, L.m_Id)) return std::format("'{}' cannot go inside itself", L.m_Name);
+                    const std::uint64_t OldParent = L.m_Parent;
+                    if (t == iL && NewParent == TLParentOf(*pOv, iL)) return "no change";
+                    if (t != iL) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Move -Index {} -ToIndex {}", xeditor::Quote(LayersPath()), iL, t)); });
+                    if (NewParent != TLParentOf(*pOv, iL)) Steps.push_back([=, this] { return Set(t, "Parent", std::to_string(NewParent), std::to_string(OldParent)); });
+                }
+                else if (Op == "into" && n == 3)        // "into row container_row": the row goes inside a folder or group (on top of its children)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    const auto* pC = RowOf(X);
+                    if (!pC || !pC->m_Bone.empty()) return std::format("no folder or group row {}", X);
+                    const auto& CL = pOv->m_Layers[pC->m_iLayer];
+                    if (CL.m_Kind != xanim_package_desc::layer_kind::FOLDER && CL.m_Kind != xanim_package_desc::layer_kind::GROUP) return std::format("'{}' is not a folder or group", CL.m_Name);
+                    if (!CL.m_Id || (L.m_Id && TLIsWithin(*pOv, CL.m_Id, L.m_Id))) return std::format("'{}' cannot go inside itself", L.m_Name);
+                    if (TLParentOf(*pOv, iL) == CL.m_Id) return "no change";
+                    // the list index is kept: children compose at their container's place, in list order among themselves
+                    const std::uint64_t OldParent = L.m_Parent, NewParent = CL.m_Id;
+                    Steps.push_back([=, this] { return Set(iL, "Parent", std::to_string(NewParent), std::to_string(OldParent)); });
                 }
                 else return std::format("unknown op '{}'", Part);
             }
@@ -687,6 +753,14 @@ namespace xanim_package_editor
             std::string   SetRowFlag(std::uint64_t Row, xeditor::timeline::row_flag F, bool bOn) override { return m_S.m_TLRows.count(Row) ? Run(std::format("{} {} {}", F == xeditor::timeline::row_flag::mute ? "mute" : "lock", Row, int(bOn))) : std::string("the clip row has no flags"); }
             bool          CanMoveRow(std::uint64_t Row) override { return m_S.m_TLRows.count(Row) && m_S.m_TLRows[Row].m_Bone.empty(); }
             std::string   MoveRow(std::uint64_t Row, std::uint64_t Above) override { return Run(std::format("move {} {}", Row, Above)); }
+            bool          CanDropInto(std::uint64_t Row) override
+            {
+                const auto It = m_S.m_TLRows.find(Row); auto* pOv = m_S.SelectedOv();
+                if (!pOv || It == m_S.m_TLRows.end() || !It->second.m_Bone.empty()) return false;
+                const auto K = pOv->m_Layers[It->second.m_iLayer].m_Kind;
+                return K == xanim_package_desc::layer_kind::FOLDER || K == xanim_package_desc::layer_kind::GROUP;
+            }
+            std::string   DropInto(std::uint64_t Row, std::uint64_t Into) override { return Run(std::format("into {} {}", Row, Into)); }
             void          OnSelection(const std::set<xeditor::timeline::item_ref>& Sel) override { for (const auto& r : Sel) if (const auto It = m_S.m_TLRows.find(r.m_Row); It != m_S.m_TLRows.end()) { m_S.m_iLayer = It->second.m_iLayer; break; } }
             void          Seek(xeditor::timeline::tick T) override { m_S.m_TimeSeconds = float(double(T) / double(tl_tps_v)); m_S.m_LoopsElapsed = 0; }
         };
@@ -708,6 +782,7 @@ namespace xanim_package_editor
                 const auto It = m_S.m_TLRows.find(R.m_Id);
                 if (It == m_S.m_TLRows.end()) return;
                 const auto& L = pOv->m_Layers[It->second.m_iLayer];
+                if (R.m_Type == tl_folder || R.m_Type == tl_group) return;     // a container has no items of its own: its children are its rows
                 if (R.m_Type == tl_clip)
                 {
                     tl::item I; I.m_Ref = { R.m_Id, 1 }; I.m_Kind = tl::item_kind::segment;
@@ -765,7 +840,8 @@ namespace xanim_package_editor
 
             // a layer row's header widgets: its weight (a slider: dragging previews, the release is ONE command), its mode, its mask chip
             static constexpr float weight_w_v = 70, mode_w_v = 40, mask_w_v = 58;
-            float HeaderWidth(const xeditor::timeline::row_desc& R) override { return (R.m_Type == tl_clip || R.m_Type == tl_pose) ? weight_w_v + mode_w_v + mask_w_v + 8 : 0; }
+            // a group: weight and mask, no mode (over its own base override and additive are the same); a folder: only eye / solo / lock
+            float HeaderWidth(const xeditor::timeline::row_desc& R) override { return (R.m_Type == tl_clip || R.m_Type == tl_pose || R.m_Type == tl_group) ? weight_w_v + mode_w_v + mask_w_v + 8 : 0; }
             void  Header(const xeditor::timeline::row_desc& R, xeditor::timeline::document&, const ImRect& Box) override
             {
                 auto* pOv = m_S.SelectedOv(); auto* pDesc = m_S.Desc(); const auto It = m_S.m_TLRows.find(R.m_Id);
@@ -798,8 +874,15 @@ namespace xanim_package_editor
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip(bCurve ? "Weight: animated by a curve (edit its keys)" : L.m_bLock ? "Weight (the layer is locked)" : "Weight: how much of this layer is mixed in (drag: preview; release: one undo step)");
 
-                // the mode
+                // the mode (a group has none: it blends its children's result over its own base)
                 ImGui::SetCursorScreenPos({ Box.Min.x + weight_w_v + 4, Box.Min.y });
+                if (R.m_Type == tl_group)
+                {
+                    ImGui::BeginDisabled(true); ImGui::Button("Grp", { mode_w_v, h }); ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Group: its layers mix together first, then the result blends over the layers below with this weight and mask");
+                }
+                else
+                {
                 const bool bAdd = L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE;
                 ImGui::BeginDisabled(L.m_bLock);
                 ImGui::PushStyleColor(ImGuiCol_Button, bAdd ? IM_COL32(70, 120, 90, 255) : IM_COL32(60, 75, 110, 255));
@@ -808,12 +891,13 @@ namespace xanim_package_editor
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip(bAdd ? "Additive: adds its motion on top of the layers below (click: Override)" : "Override: replaces the layers below where its mask covers (click: Additive)");
+                }
 
                 // the mask chip: how many bones it covers; hover shows them in the viewport, a click edits the mask there
                 const auto M = xanim_package_layers::LayerMask(L, pDesc->m_ResolvedSkeletonBones);
                 int nOn = 0; for (float v : M) nOn += v > 0.0f;
-                const bool bAll = L.m_Mask.empty();
-                const std::string Chip = bAll ? (R.m_Type == tl_pose ? "keyed" : "all") : std::format("{} b", nOn);
+                const bool bAll = L.m_Mask.empty() && L.m_SharedMask.empty();
+                const std::string Chip = !L.m_SharedMask.empty() ? L.m_SharedMask : bAll ? (R.m_Type == tl_pose ? "keyed" : "all") : std::format("{} b", nOn);
                 ImGui::SetCursorScreenPos({ Box.Min.x + weight_w_v + mode_w_v + 8, Box.Min.y });
                 ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 62, 90, 255));
                 if (ImGui::Button(std::format("{}##mask", Chip).c_str(), { mask_w_v, h })) { m_S.m_iLayer = iL; m_S.m_bMaskEdit = true; }
@@ -841,7 +925,7 @@ namespace xanim_package_editor
         {
             namespace tl = xeditor::timeline;
             static_assert(tl_tps_v == tl::animation_ticks_per_second_v);
-            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType } };
+            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType }, { tl_folder, &m_TLRowType }, { tl_group, &m_TLRowType } };
             tl_document Doc(*this);
             m_iMaskHover = m_iMaskHoverNext; m_iMaskHoverNext = -1;          // last frame's hovered mask chip (the viewport draws before this panel)
             m_TLHeaderBoxes.clear();
@@ -907,13 +991,25 @@ namespace xanim_package_editor
             else if (!m_TLTransport.m_Solo.empty())     // the timeline's solo (a layer row, or a bone row of it): only those layers on, over the clip
             {
                 Audition = *pOv;
-                for (int i = 0; i < int(Audition.m_Layers.size()); ++i)
+                const int nL = int(Audition.m_Layers.size());
+                std::vector<char> Solo(nL, 0);
+                for (int i = 0; i < nL; ++i)
                 {
                     const auto Row = TLLayerRow(Audition.m_Layers[i], i);
                     bool bSolo = m_TLTransport.m_Solo.count(Row) != 0;
                     for (const auto& K : Audition.m_Layers[i].m_Keys) bSolo = bSolo || m_TLTransport.m_Solo.count(TLBoneRow(Row, K.m_Bone));
-                    Audition.m_Layers[i].m_bEnabled = Audition.m_Layers[i].m_bEnabled && bSolo;
+                    Solo[i] = bSolo;
                 }
+                // contract v3: a soloed layer keeps its folders/groups on (its context); a soloed folder/group keeps everything inside it
+                std::vector<char> Keep = Solo;
+                for (int i = 0; i < nL; ++i)
+                    for (int j = 0; j < nL; ++j)
+                        if (Solo[j] && Audition.m_Layers[i].m_Id && i != j)
+                        {
+                            if (TLIsWithin(Audition, Audition.m_Layers[j].m_Id, Audition.m_Layers[i].m_Id)) Keep[i] = 1;      // i contains a soloed j
+                            if (Audition.m_Layers[j].m_Id && TLIsWithin(Audition, Audition.m_Layers[i].m_Id, Audition.m_Layers[j].m_Id)) Keep[i] = 1;   // i is inside a soloed j
+                        }
+                for (int i = 0; i < nL; ++i) Audition.m_Layers[i].m_bEnabled = Audition.m_Layers[i].m_bEnabled && Keep[i];
                 pUse = &Audition;
             }
             std::vector<xmath::transform3> Out;
@@ -993,6 +1089,73 @@ namespace xanim_package_editor
             SetLayer(n, "SourceKey", xstrtool::To(Key), "");
             SetLayer(n, "SourceClip", Clip, "");
             return std::format("LayerAdd: layer {} '{}' (id {}); its mask is empty: add bones (LayerMask) for it to do anything", n, Name, Id);
+        }
+
+        // Contract v3: a folder (pass-through organization) or a group (isolated: its children mix over the stack below it, then the group blends
+        // that result with its weight and mask; its mask empty = the whole body)
+        std::string LayerAddContainer(std::string Name, bool bGroup) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv) return "LayerAdd: select a clip first (SelectClip)";
+            const int n = int(pOv->m_Layers.size());
+            std::uint64_t Id = 1;
+            for (const auto& S : pDesc->m_ImportSources) for (const auto& C : S.m_Clips) for (const auto& L : C.m_Layers) Id = std::max(Id, L.m_Id + 1);
+            if (Name.empty()) Name = std::format("{} {}", bGroup ? "Group" : "Folder", n);
+            if (auto E = AsOneStep(std::format("Add {} '{}'", bGroup ? "group" : "folder", Name), [&]() -> std::string
+            {
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(LayersPath() + "[]"), xeditor::Quote(std::to_string(n + 1)), xeditor::Quote(std::to_string(n))));
+                SetLayer(n, "Id", std::to_string(Id), "0");
+                SetLayer(n, "Name", Name, "");
+                SetLayer(n, "Kind", bGroup ? "Group" : "Folder", "Clip");
+                return {};
+            }); !E.empty()) return "LayerAdd: " + E;
+            m_iLayer = n;
+            return std::format("LayerAdd: {} {} '{}' (id {}); put layers in it with LayerParent", bGroup ? "group" : "folder", n, Name, Id);
+        }
+
+        // A layer into a folder or group (iParent its index) or back to the top level (-1): one undo step. Refuses a parent that is not a
+        // folder/group, the layer itself, or one of its own descendants (a loop).
+        std::string LayerParent(int iLayer, int iParent) noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "LayerParent: no such layer in the selected clip";
+            auto& Ls = pOv->m_Layers;
+            std::uint64_t NewId = 0;
+            if (iParent >= 0)
+            {
+                if (iParent >= int(Ls.size())) return "LayerParent: no such parent layer";
+                const auto& P = Ls[iParent];
+                if (P.m_Kind != xanim_package_desc::layer_kind::FOLDER && P.m_Kind != xanim_package_desc::layer_kind::GROUP) return "LayerParent: the parent must be a folder or a group";
+                if (iParent == iLayer) return "LayerParent: a layer cannot be its own parent";
+                for (std::uint64_t A = P.m_Id; A; )          // the parent's ancestors must not include the layer
+                {
+                    if (A == Ls[iLayer].m_Id) return "LayerParent: that would put a folder or group inside itself";
+                    const auto It = std::find_if(Ls.begin(), Ls.end(), [A](const auto& L) { return L.m_Id == A; });
+                    A = It == Ls.end() ? 0 : It->m_Parent;
+                }
+                if (!P.m_Id) return "LayerParent: the parent has no id yet";
+                NewId = P.m_Id;
+            }
+            const auto Old = Ls[iLayer].m_Parent;
+            if (Old == NewId) return "LayerParent: no change";
+            SetLayer(iLayer, "Parent", std::to_string(NewId), std::to_string(Old));
+            m_iLayer = iLayer;
+            return std::format("LayerParent: layer {} '{}' -> {}", iLayer, Ls[iLayer].m_Name, iParent < 0 ? std::string("top level") : std::format("{} '{}'", iParent, Ls[iParent].m_Name));
+        }
+
+        // A layer's mask from a skeleton mask group (by name), or back to its own entries ("")
+        std::string LayerMaskShared(int iLayer, const std::string& Name) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "LayerMask: no such layer in the selected clip";
+            const auto Old = pOv->m_Layers[iLayer].m_SharedMask;
+            if (Old == Name) return "LayerMask: no change";
+            SetLayer(iLayer, "SharedMask", Name, Old);
+            const auto& Ms = pDesc->m_ResolvedSkeletonBones.m_Masks;
+            const bool bKnown = Name.empty() || std::any_of(Ms.begin(), Ms.end(), [&](const auto& M) { return M.m_Name == Name; });
+            return Name.empty() ? std::format("LayerMask: layer {} uses its own mask entries again", iLayer)
+                 : bKnown ? std::format("LayerMask: layer {} uses the skeleton mask group '{}'", iLayer, Name)
+                 : std::format("LayerMask: layer {} names '{}', which the skeleton does not have: the layer contributes nothing until it is fixed", iLayer, Name);
         }
 
         // The bone's local rotation composed from the layers under iLayer, at a time (the base when iLayer is 0)
@@ -1098,7 +1261,12 @@ namespace xanim_package_editor
                 T += std::format("  layer {} id {} '{}' {} {} source {}:{} weight {} keys {} mask {} entries [", i, L.m_Id, L.m_Name, L.m_bEnabled ? "on" : "off"
                     , L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "additive" : "override", xstrtool::To(L.m_SourceKey), L.m_SourceClip, L.m_Weight, L.m_WeightKeys.size(), L.m_Mask.size());
                 for (const auto& E : L.m_Mask) T += std::format(" {}{}", E.m_Bone, E.m_bInherit ? "+" : "");
-                T += " ]\n";
+                T += " ]";
+                if (L.m_Kind == xanim_package_desc::layer_kind::FOLDER) T += " folder";
+                if (L.m_Kind == xanim_package_desc::layer_kind::GROUP)  T += " group";
+                if (const auto P = TLParentOf(*pOv, i)) T += std::format(" parent {}", P);
+                if (!L.m_SharedMask.empty()) T += std::format(" shared-mask '{}'", L.m_SharedMask);
+                T += "\n";
                 if (L.m_Kind == xanim_package_desc::layer_kind::POSE) T += std::format("    {} curve, falloff {:.2f} s\n", L.m_bSmooth ? "smooth" : "linear", L.m_Falloff);
                 if (L.m_Kind == xanim_package_desc::layer_kind::POSE)
                     for (const auto& K : L.m_Keys)
@@ -1124,6 +1292,7 @@ namespace xanim_package_editor
             if (!m_LayerComposed.empty())
                 T += std::format("  live isolation: bone-frames changed outside every mask {}{}; root travel change {:.6f} m\n  {}\n", m_LayerReport.m_ChangedOutside
                     , m_LayerReport.m_ChangedOutside ? " (first: " + m_LayerReport.m_FirstOutside + ")" : std::string{}, m_LayerReport.m_MaxRootMove, LayersParity());
+            for (const auto& W : m_LayerReport.m_Warnings) T += "  " + W + "\n";      // a missing shared mask, a parent that names nothing: shown, never silent
             return T;
         }
 
@@ -2869,7 +3038,9 @@ namespace xanim_package_editor
             xeditor::cmd_util::GetArg(m_Parser, m_hC, Name);
             xeditor::cmd_util::GetArg(m_Parser, m_hD, Kind);
             if (Kind == "Pose" || Kind == "pose") return S.LayerAdd({}, {}, Name, true);
-            if (!Kind.empty() && Kind != "Clip" && Kind != "clip") return "LayerAdd: -Kind is Clip or Pose";
+            if (Kind == "Folder" || Kind == "folder") return S.LayerAddContainer(Name, false);
+            if (Kind == "Group" || Kind == "group") return S.LayerAddContainer(Name, true);
+            if (!Kind.empty() && Kind != "Clip" && Kind != "clip") return "LayerAdd: -Kind is Clip, Pose, Folder or Group";
             if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Src) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Clip)) return "LayerAdd: -Source and -Clip are required";
             return S.LayerAdd(xstrtool::To(Src), Clip, Name);
         }
@@ -2892,11 +3063,20 @@ namespace xanim_package_editor
         }
         case kind::layer_mask:
         {
-            std::string L, Bone, Only; int iL = -1;
-            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Bone) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "LayerMask: bad arguments";
-            xeditor::cmd_util::GetArg(m_Parser, m_hC, Only);
+            std::string L, Bone, Only, Shared; int iL = -1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "LayerMask: bad arguments";
             S.m_iLayer = iL;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Shared)) return S.LayerMaskShared(iL, Shared);
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hB, Bone)) return "LayerMask: -Bone (or -Shared) is required";
+            xeditor::cmd_util::GetArg(m_Parser, m_hC, Only);
             return S.LayerMaskToggle(iL, Bone, Only == "1" || Only == "true");
+        }
+        case kind::layer_parent:
+        {
+            std::string L, Pa; int iL = -1, iP = -2;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Pa)
+                || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc() || std::from_chars(Pa.data(), Pa.data() + Pa.size(), iP).ec != std::errc()) return "LayerParent: bad arguments";
+            return S.LayerParent(iL, iP);
         }
         case kind::suggest_pose:
         {
