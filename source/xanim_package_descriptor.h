@@ -59,6 +59,36 @@ namespace xanim_package_desc
     , xproperty::settings::enum_item("From layer",    layer_root::FROM_LAYER)
     };
 
+    enum class layer_kind : std::uint8_t { CLIP, POSE };
+    static constexpr auto layer_kind_v = std::array
+    { xproperty::settings::enum_item("Clip", layer_kind::CLIP)
+    , xproperty::settings::enum_item("Pose", layer_kind::POSE)
+    };
+
+    // A Pose layer's key: one bone's local rotation at a time. Absolute target by default (the pose to reach: in an Additive layer its offset is
+    // derived against the layers below AT THE KEY'S TICK, so moving the key keeps the pose); Offset: the stored rotation offset itself.
+    struct layer_pose_key
+    {
+        std::int64_t    m_Tick    = 0;
+        std::string     m_Bone    = {};
+        float           m_X = 0, m_Y = 0, m_Z = 0, m_W = 1;     // quaternion
+        bool            m_bOffset = false;
+        bool            m_bStep   = false;
+
+        XPROPERTY_DEF
+        ( "PoseKey", layer_pose_key
+        , obj_member<"Tick",   &layer_pose_key::m_Tick >
+        , obj_member<"Bone",   &layer_pose_key::m_Bone >
+        , obj_member<"X",      &layer_pose_key::m_X >
+        , obj_member<"Y",      &layer_pose_key::m_Y >
+        , obj_member<"Z",      &layer_pose_key::m_Z >
+        , obj_member<"W",      &layer_pose_key::m_W >
+        , obj_member<"Offset", &layer_pose_key::m_bOffset >
+        , obj_member<"Step",   &layer_pose_key::m_bStep >
+        )
+    };
+    XPROPERTY_REG(layer_pose_key)
+
     enum class layer_space : std::uint8_t { LOCAL, SKELETON_MODEL };
     static constexpr auto layer_space_v = std::array
     { xproperty::settings::enum_item("Local",          layer_space::LOCAL)
@@ -122,6 +152,8 @@ namespace xanim_package_desc
         bool                m_bPosition   = false;
         layer_root          m_Root        = layer_root::INHERIT_BELOW;
         layer_space         m_Space       = layer_space::LOCAL;     // override rotations: per bone (Local) or relative to the skeleton (a masked arm keeps the layer's orientation)
+        layer_kind          m_Kind        = layer_kind::CLIP;       // Clip: motion from SourceKey/SourceClip; Pose: the Keys below
+        std::vector<layer_pose_key> m_Keys = {};                    // Pose layers: sparse keys (a track per bone); their mask, when empty, is the whole body
 
         XPROPERTY_DEF
         ( "Layer", clip_layer
@@ -146,6 +178,8 @@ namespace xanim_package_desc
         , obj_member<"Position",      &clip_layer::m_bPosition >
         , obj_member<"Root",          &clip_layer::m_Root, member_enum_span<layer_root_v> >
         , obj_member<"Space",         &clip_layer::m_Space, member_enum_span<layer_space_v> >
+        , obj_member<"Kind",          &clip_layer::m_Kind, member_enum_span<layer_kind_v> >
+        , obj_member<"Keys",          &clip_layer::m_Keys >
         )
     };
     XPROPERTY_REG(clip_layer)
@@ -264,8 +298,11 @@ namespace xanim_package_desc
                     for (const auto& L : C.m_Layers)
                     {
                         const auto Where = std::format("Clip '{}', layer '{}'", C.m_Name, L.m_Name);
-                        if (L.m_SourceKey.empty() || L.m_SourceClip.empty())   Errors.push_back(Where + ": no source clip (SourceKey and SourceClip)");
-                        else if (findImportSource(L.m_SourceKey) == -1)        Errors.push_back(Where + ": its source is not one of this package's import sources");
+                        if (L.m_Kind == layer_kind::CLIP)
+                        {
+                            if (L.m_SourceKey.empty() || L.m_SourceClip.empty())   Errors.push_back(Where + ": no source clip (SourceKey and SourceClip)");
+                            else if (findImportSource(L.m_SourceKey) == -1)        Errors.push_back(Where + ": its source is not one of this package's import sources");
+                        }
                         if (!(L.m_Rate >= 0.0))                                Errors.push_back(Where + ": a negative rate (use Reverse to play backwards)");
                         if (L.m_End >= 0 && L.m_End <= L.m_Start)              Errors.push_back(Where + ": it ends before it starts");
                         if (L.m_TrimOut >= 0 && L.m_TrimOut < L.m_TrimIn)      Errors.push_back(Where + ": trim out is before trim in");

@@ -49,7 +49,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info };
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key };
 
         session&    m_Session;
         kind        m_Kind;
@@ -73,9 +73,17 @@ namespace xanim_package_editor
                 break;
             case kind::kimodo_accept: m_hA = m_Parser.addOption("Name", "The clip's file name (default: from the prompt)", false, 1); break;
             case kind::layer_add:
-                m_hA = m_Parser.addOption("Source", "The import source's key (its path, as ListClips shows it)", true, 1);
-                m_hB = m_Parser.addOption("Clip",   "The clip there (its original name)", true, 1);
+                m_hA = m_Parser.addOption("Source", "The import source's key (its path, as ListClips shows it); not for -Kind Pose", false, 1);
+                m_hB = m_Parser.addOption("Clip",   "The clip there (its original name); not for -Kind Pose", false, 1);
                 m_hC = m_Parser.addOption("Name",   "The layer's name", false, 1);
+                m_hD = m_Parser.addOption("Kind",   "Clip (default) or Pose", false, 1);
+                break;
+            case kind::pose_key:
+                m_hA = m_Parser.addOption("Layer",  "The Pose layer's index in the selected clip", true, 1);
+                m_hB = m_Parser.addOption("Bone",   "The bone (its name)", true, 1);
+                m_hC = m_Parser.addOption("Time",   "Seconds", true, 1);
+                m_hD = m_Parser.addOption("Turn",   "\"x y z\" degrees: the key's pose = this turn (parent side) applied to the layers below at that time (default 0 0 0: the pose below)", false, 1);
+                m_hE = m_Parser.addOption("Offset", "1: store the turn itself as an offset key (additive layers) instead of the absolute pose", false, 1);
                 break;
             case kind::layer_mask:
                 m_hA = m_Parser.addOption("Layer", "The layer's index in the selected clip", true, 1);
@@ -87,7 +95,7 @@ namespace xanim_package_editor
         }
         std::string Query() noexcept override;
 
-        xcmdline::parser::handle m_hA, m_hB, m_hC;
+        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE;
     };
 
     //--------------------------------------------------------------------------------------------
@@ -121,7 +129,7 @@ namespace xanim_package_editor
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
-        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo;
+        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey;
 
         // Layers (the layered edit mode): the compiler's layer-sources cache, the selected clip's live composition (same function as the compile)
         std::vector<xanim_package_layers::source_frames> m_LayerSources;
@@ -221,6 +229,7 @@ namespace xanim_package_editor
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there. Usage: LayerMask -Layer n -Bone name [-Only 1]")
             , m_LayersInfo    (m_Undo, *this, playback_cmd::kind::layers_info,     "LayersInfo",     "The selected clip's layers, the live composition's isolation report and its parity with the compiled clip. Usage: LayersInfo")
+            , m_PoseKey       (m_Undo, *this, playback_cmd::kind::pose_key,        "PoseKey",        "Sets a key on a Pose layer: the bone's pose at a time = the layers below turned by -Turn (absolute target), or the turn as an offset key. Usage: PoseKey -Layer n -Bone name -Time s [-Turn \"x y z\"] [-Offset 1]")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
@@ -374,7 +383,8 @@ namespace xanim_package_editor
             std::string S;
             for (const auto& L : C.m_Layers)
             {
-                S += std::format("{}|", int(L.m_Space));
+                S += std::format("{}|{}|", int(L.m_Space), int(L.m_Kind));
+                for (const auto& K : L.m_Keys) S += std::format("p{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Bone, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bOffset, K.m_bStep);
                 S += std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", L.m_bEnabled, int(L.m_Mode), int(L.m_Reference), L.m_ReferenceTick, xstrtool::To(L.m_SourceKey), L.m_SourceClip
                     , L.m_Start, L.m_End, L.m_TrimIn, L.m_TrimOut, L.m_Rate, L.m_bReverse, L.m_Weight, L.m_bRotation, L.m_bPosition, int(L.m_Root), L.m_Name);
                 for (const auto& K : L.m_WeightKeys) S += std::format("k{},{},{};", K.m_Tick, K.m_Value, K.m_bStep);
@@ -450,22 +460,81 @@ namespace xanim_package_editor
             return std::format("parity: live vs compiled over {} frames: {} values differ, max difference {:.9g}", pClip->m_nFrames, nDiff, Max);
         }
 
-        std::string LayerAdd(const std::wstring& Key, const std::string& Clip, std::string Name) noexcept
+        std::string LayerAdd(const std::wstring& Key, const std::string& Clip, std::string Name, bool bPose = false) noexcept
         {
             auto* pOv = SelectedOv(); auto* pDesc = Desc();
             if (!pOv) return "LayerAdd: select a clip first (SelectClip)";
-            if (pDesc->findImportSource(Key) == -1) return "LayerAdd: that source is not one of this package's import sources";
+            if (!bPose && pDesc->findImportSource(Key) == -1) return "LayerAdd: that source is not one of this package's import sources";
             const int n = int(pOv->m_Layers.size());
             std::uint64_t Id = 1;
             for (const auto& S : pDesc->m_ImportSources) for (const auto& C : S.m_Clips) for (const auto& L : C.m_Layers) Id = std::max(Id, L.m_Id + 1);
-            if (Name.empty()) Name = std::format("{} ({})", Clip, std::filesystem::path(Key).stem().string());
+            if (Name.empty()) Name = bPose ? std::format("Pose {}", n) : std::format("{} ({})", Clip, std::filesystem::path(Key).stem().string());
             xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(LayersPath() + "[]"), xeditor::Quote(std::to_string(n + 1)), xeditor::Quote(std::to_string(n))));
             SetLayer(n, "Id", std::to_string(Id), "0");
             SetLayer(n, "Name", Name, "");
+            m_iLayer = n;
+            if (bPose)
+            {   // additive: a key is a turn on top of the layers below (its absolute target re-derived when they change)
+                SetLayer(n, "Kind", "Pose", "Clip");
+                SetLayer(n, "Mode", "Additive", "Override");
+                return std::format("LayerAdd: pose layer {} '{}' (id {}); it has no keys: add them (PoseKey)", n, Name, Id);
+            }
             SetLayer(n, "SourceKey", xstrtool::To(Key), "");
             SetLayer(n, "SourceClip", Clip, "");
-            m_iLayer = n;
             return std::format("LayerAdd: layer {} '{}' (id {}); its mask is empty: add bones (LayerMask) for it to do anything", n, Name, Id);
+        }
+
+        // The bone's local rotation composed from the layers under iLayer, at a time (the base when iLayer is 0)
+        bool RotationBelow(int iLayer, int Bone, double Seconds, xmath::fquat& Q, std::string& Error) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pS = SelectedSource(); auto* pDesc = Desc();
+            const auto* pBase = FindLayerSource(pS->key(), pOv->m_OriginalName);
+            if (!pBase) { Error = "this clip is not in the layer sources: compile the package"; return false; }
+            xanim_package_desc::clip Below = *pOv;
+            Below.m_Layers.resize(iLayer);
+            std::vector<xmath::transform3> Out; xanim_package_layers::report R;
+            if (!xanim_package_layers::Compose(*pBase, Below, pDesc->m_ResolvedSkeletonBones, [this](const std::wstring& K, const std::string& C) { return FindLayerSource(K, C); }, Out, R, Error)) return false;
+            const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size()), nF = pBase->m_nFrames;
+            const double FT = std::clamp(Seconds * std::max(1, pBase->m_FPS), 0.0, double(nF - 1));
+            const int A = int(FT), B = std::min(A + 1, nF - 1);
+            Q = xmath::fquat::Slerp(Out[std::size_t(A) * nB + Bone].m_Rotation, Out[std::size_t(B) * nB + Bone].m_Rotation, float(FT - A));
+            return true;
+        }
+
+        // A key on a Pose layer: absolute (the pose below at that time turned by Turn, parent side) or the turn itself as an offset.
+        // A key already on that bone at that tick is replaced.
+        std::string PoseKey(int iLayer, const std::string& Bone, double Seconds, const xmath::fquat& Turn, bool bOffset) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "PoseKey: no such layer in the selected clip";
+            const auto& L = pOv->m_Layers[iLayer];
+            if (L.m_Kind != xanim_package_desc::layer_kind::POSE) return "PoseKey: that layer is not a Pose layer";
+            const auto& Bones = pDesc->m_ResolvedSkeletonBones.m_Bones;
+            int b = -1;
+            for (int s = 0; s < int(Bones.size()); ++s) if (Bones[s].m_Name == Bone) { b = s; break; }
+            if (b < 0) return std::format("PoseKey: '{}' is not a bone of this skeleton", Bone);
+            xmath::fquat Q = Turn;
+            if (!bOffset)
+            {
+                xmath::fquat B; std::string Error;
+                if (!RotationBelow(iLayer, b, Seconds, B, Error)) return "PoseKey: " + Error;
+                Q = (Turn * B).NormalizeCopy();
+            }
+            const auto Tick = xanim_package_layers::ToTick(Seconds);
+            int k = -1;
+            for (int i = 0; i < int(L.m_Keys.size()); ++i) if (L.m_Keys[i].m_Bone == Bone && L.m_Keys[i].m_Tick == Tick) { k = i; break; }
+            const bool bNew = k < 0;
+            if (bNew) { k = int(L.m_Keys.size()); SetLayer(iLayer, "Keys[]", std::to_string(k + 1), std::to_string(k)); }
+            const auto& Old = bNew ? xanim_package_desc::layer_pose_key{} : L.m_Keys[k];
+            auto Field = [&](const char* p) { return std::format("Keys[G:{}]/{}", k, p); };
+            if (bNew) { SetLayer(iLayer, Field("Tick").c_str(), std::to_string(Tick), "0"); SetLayer(iLayer, Field("Bone").c_str(), Bone, ""); }
+            SetLayer(iLayer, Field("X").c_str(), F(Q.m_X), F(Old.m_X));
+            SetLayer(iLayer, Field("Y").c_str(), F(Q.m_Y), F(Old.m_Y));
+            SetLayer(iLayer, Field("Z").c_str(), F(Q.m_Z), F(Old.m_Z));
+            SetLayer(iLayer, Field("W").c_str(), F(Q.m_W), F(Old.m_W));
+            if (bOffset != Old.m_bOffset) SetLayer(iLayer, Field("Offset").c_str(), bOffset ? "true" : "false", Old.m_bOffset ? "true" : "false");
+            m_iLayer = iLayer;
+            return std::format("PoseKey: layer {} key {} {} '{}' at tick {} ({}): {:.6f} {:.6f} {:.6f} {:.6f}", iLayer, k, bNew ? "added" : "replaced", Bone, Tick, bOffset ? "offset" : "absolute", Q.m_X, Q.m_Y, Q.m_Z, Q.m_W);
         }
 
         // Adds the bone (with its branch, or alone) to the layer's mask, or removes its entry when it has one
@@ -500,6 +569,23 @@ namespace xanim_package_editor
                     , L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "additive" : "override", xstrtool::To(L.m_SourceKey), L.m_SourceClip, L.m_Weight, L.m_WeightKeys.size(), L.m_Mask.size());
                 for (const auto& E : L.m_Mask) T += std::format(" {}{}", E.m_Bone, E.m_bInherit ? "+" : "");
                 T += " ]\n";
+                if (L.m_Kind == xanim_package_desc::layer_kind::POSE)
+                    for (const auto& K : L.m_Keys)
+                    {
+                        T += std::format("    pose key '{}' tick {} {} ({:.6f} {:.6f} {:.6f} {:.6f})", K.m_Bone, K.m_Tick, K.m_bOffset ? "offset" : "absolute", K.m_X, K.m_Y, K.m_Z, K.m_W);
+                        // an absolute key's hit: the live pose there vs the key (exact when nothing above it turns that bone, weight 1)
+                        const auto& Bones = Desc()->m_ResolvedSkeletonBones.m_Bones; const int nB = int(Bones.size());
+                        int b = -1; for (int s = 0; s < nB; ++s) if (Bones[s].m_Name == K.m_Bone) { b = s; break; }
+                        if (!K.m_bOffset && L.m_bEnabled && b >= 0 && !m_LayerComposed.empty() && int(m_LayerComposed.size()) == m_LayerComposedFrames * nB)
+                        {
+                            const double FT = std::clamp(xanimation::TicksToSeconds(K.m_Tick) * m_LayerComposedFPS, 0.0, double(m_LayerComposedFrames - 1));
+                            const int A = int(FT), B = std::min(A + 1, m_LayerComposedFrames - 1);
+                            const auto Q = xmath::fquat::Slerp(m_LayerComposed[std::size_t(A) * nB + b].m_Rotation, m_LayerComposed[std::size_t(B) * nB + b].m_Rotation, float(FT - A));
+                            const double Dot = std::min(1.0, std::abs(double(Q.m_X) * K.m_X + double(Q.m_Y) * K.m_Y + double(Q.m_Z) * K.m_Z + double(Q.m_W) * K.m_W) / std::max(1e-12, std::sqrt(double(K.m_X) * K.m_X + double(K.m_Y) * K.m_Y + double(K.m_Z) * K.m_Z + double(K.m_W) * K.m_W)));
+                            T += std::format(" live hit {:.4f} deg", 2.0 * std::acos(Dot) * 57.29577951308232);
+                        }
+                        T += "\n";
+                    }
             }
             for (const auto& R : m_LayerReport.m_Layers) T += std::format("  live '{}': {} bones in its mask, bone-frames written {}, outside its mask {}\n", R.m_Name, R.m_nMaskBones, R.m_Written, R.m_WrittenOutside);
             T += std::format("  live recompose {:.3f} ms{}\n", m_LayerComposeMs, m_iSolo >= 0 ? std::format(" (solo layer {}: editor only)", m_iSolo) : std::string{});
@@ -562,6 +648,9 @@ namespace xanim_package_editor
                     }
                 ImGui::EndCombo();
             }
+            ImGui::SameLine();
+            if (ImGui::Button("+ Pose layer")) LayerAdd({}, {}, {}, true);
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("A layer of keyed poses (additive: each key turns the bone on top of the layers below).\nKeys: the PoseKey command (the gizmo comes next).");
 
             constexpr ImGuiTableFlags TF = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit;
             const int n = int(pOv->m_Layers.size());
@@ -1378,10 +1467,27 @@ namespace xanim_package_editor
         case kind::kimodo_discard: S.KimodoDiscard(); return "KimodoDiscard: discarded";
         case kind::layer_add:
         {
-            std::string Src, Clip, Name;
-            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Src) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Clip)) return "LayerAdd: -Source and -Clip are required";
+            std::string Src, Clip, Name, Kind;
             xeditor::cmd_util::GetArg(m_Parser, m_hC, Name);
+            xeditor::cmd_util::GetArg(m_Parser, m_hD, Kind);
+            if (Kind == "Pose" || Kind == "pose") return S.LayerAdd({}, {}, Name, true);
+            if (!Kind.empty() && Kind != "Clip" && Kind != "clip") return "LayerAdd: -Kind is Clip or Pose";
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Src) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Clip)) return "LayerAdd: -Source and -Clip are required";
             return S.LayerAdd(xstrtool::To(Src), Clip, Name);
+        }
+        case kind::pose_key:
+        {
+            std::string L, Bone, Time, Turn, Off; int iL = -1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Bone) || !xeditor::cmd_util::GetArg(m_Parser, m_hC, Time)
+                || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "PoseKey: bad arguments";
+            xeditor::cmd_util::GetArg(m_Parser, m_hD, Turn);
+            xeditor::cmd_util::GetArg(m_Parser, m_hE, Off);
+            double Secs = 0; float D[3] = {};
+            if (std::from_chars(Time.data(), Time.data() + Time.size(), Secs).ec != std::errc() || Secs < 0) return "PoseKey: -Time is seconds (>= 0)";
+            if (!Turn.empty() && std::sscanf(Turn.c_str(), "%f %f %f", &D[0], &D[1], &D[2]) != 3) return "PoseKey: -Turn is \"x y z\" degrees";
+            constexpr float R = 3.14159265358979f / 180.0f;
+            const xmath::fquat Q(xmath::radian3(xmath::radian{ D[0] * R }, xmath::radian{ D[1] * R }, xmath::radian{ D[2] * R }));
+            return S.PoseKey(iL, Bone, Secs, Q, Off == "1" || Off == "true");
         }
         case kind::layer_mask:
         {

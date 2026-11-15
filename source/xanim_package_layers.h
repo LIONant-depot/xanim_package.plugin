@@ -92,6 +92,7 @@ namespace xanim_package_layers
             std::vector<float>                      m_Mask;
             std::vector<xanimation::weight_key>     m_Keys;
             xanimation::layer_sample                m_Reference;
+            std::vector<xanimation::pose_track>     m_Tracks;               // Pose layers
             std::uint8_t                            m_Channels = 0;
             std::size_t                             m_Written = 0, m_WrittenOutside = 0;
         };
@@ -101,62 +102,104 @@ namespace xanim_package_layers
         for (const auto& L : Ov.m_Layers)
         {
             if (!L.m_bEnabled) continue;
-            const source_frames* pSrc = Find(L.m_SourceKey, L.m_SourceClip);
-            if (!pSrc || int(pSrc->m_Frames.size()) != pSrc->m_nFrames * nSkel) { Error = std::format("layer '{}': its source clip '{}' was not found", L.m_Name, L.m_SourceClip); return false; }
             auto& P = Layers.emplace_back();
-            P.m_pDesc = &L; P.m_pSrc = pSrc;
-            P.m_View  = xanimation::clip_view{ pSrc->m_Frames, nSkel, pSrc->m_nFrames, std::max(1, pSrc->m_FPS), false };
-            const xanimation::tick SourceEnd = ToTick(double(std::max(0, pSrc->m_nFrames - 1)) / P.m_View.m_FPS);
-            P.m_Time = { .m_Start = L.m_Start, .m_End = L.m_End >= 0 ? L.m_End : ToTick(double(nFrames) / FPS)
-                       , .m_TrimIn = L.m_TrimIn, .m_TrimOut = L.m_TrimOut >= 0 ? L.m_TrimOut : SourceEnd, .m_Rate = L.m_Rate, .m_bReverse = L.m_bReverse };
-            if (std::string Why; !xanimation::ValidateSection(P.m_Time, &Why)) { Error = std::format("layer '{}': {}", L.m_Name, Why); return false; }
-            P.m_Mask = LayerMask(L, Manifest, &Report.m_Warnings);
-            for (int s = 0; s < nSkel; ++s) Union[s] = std::max(Union[s], P.m_Mask[s]);
+            P.m_pDesc = &L;
+            const xanimation::tick ClipEnd = ToTick(double(nFrames) / FPS);
+            if (L.m_Kind == xanim_package_desc::layer_kind::POSE)
+            {
+                // a Pose layer: tracks from its keys (bones by name); its mask, when empty, is the whole body (the keys decide)
+                P.m_Time = { .m_Start = L.m_Start, .m_End = L.m_End >= 0 ? L.m_End : ClipEnd };
+                if (P.m_Time.m_End <= P.m_Time.m_Start) { Error = std::format("layer '{}': it ends before it starts", L.m_Name); return false; }
+                for (const auto& K : L.m_Keys)
+                {
+                    int b = -1;
+                    for (int s = 0; s < nSkel; ++s) if (Bones[s].m_Name == K.m_Bone) { b = s; break; }
+                    if (b < 0) { Report.m_Warnings.push_back(std::format("layer '{}': key bone '{}' is not in the skeleton (ignored)", L.m_Name, K.m_Bone)); continue; }
+                    auto It = std::find_if(P.m_Tracks.begin(), P.m_Tracks.end(), [b](const auto& T) { return T.m_Bone == b; });
+                    if (It == P.m_Tracks.end()) { P.m_Tracks.push_back({ .m_Bone = b }); It = std::prev(P.m_Tracks.end()); }
+                    It->m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Value = xmath::fquat(K.m_X, K.m_Y, K.m_Z, K.m_W).NormalizeCopy(), .m_bOffset = K.m_bOffset, .m_bStep = K.m_bStep });
+                }
+                for (auto& T : P.m_Tracks) xanimation::SortTrack(T);
+                P.m_Mask = L.m_Mask.empty() ? std::vector<float>(nSkel, 1.0f) : LayerMask(L, Manifest, &Report.m_Warnings);
+                if (L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE) P.m_Reference = xanimation::IdentityReference(nSkel);
+                P.m_Channels = xanimation::CHANNEL_ROTATION;
+                std::vector<float> Written(nSkel, 0.0f);         // the write set: keyed bones in the mask
+                for (const auto& T : P.m_Tracks) Written[T.m_Bone] = P.m_Mask[T.m_Bone];
+                for (int s = 0; s < nSkel; ++s) Union[s] = std::max(Union[s], Written[s]);
+            }
+            else
+            {
+                const source_frames* pSrc = Find(L.m_SourceKey, L.m_SourceClip);
+                if (!pSrc || int(pSrc->m_Frames.size()) != pSrc->m_nFrames * nSkel) { Error = std::format("layer '{}': its source clip '{}' was not found", L.m_Name, L.m_SourceClip); return false; }
+                P.m_pSrc = pSrc;
+                P.m_View = xanimation::clip_view{ pSrc->m_Frames, nSkel, pSrc->m_nFrames, std::max(1, pSrc->m_FPS), false };
+                const xanimation::tick SourceEnd = ToTick(double(std::max(0, pSrc->m_nFrames - 1)) / P.m_View.m_FPS);
+                P.m_Time = { .m_Start = L.m_Start, .m_End = L.m_End >= 0 ? L.m_End : ClipEnd
+                           , .m_TrimIn = L.m_TrimIn, .m_TrimOut = L.m_TrimOut >= 0 ? L.m_TrimOut : SourceEnd, .m_Rate = L.m_Rate, .m_bReverse = L.m_bReverse };
+                if (std::string Why; !xanimation::ValidateSection(P.m_Time, &Why)) { Error = std::format("layer '{}': {}", L.m_Name, Why); return false; }
+                P.m_Mask = LayerMask(L, Manifest, &Report.m_Warnings);
+                for (int s = 0; s < nSkel; ++s) Union[s] = std::max(Union[s], P.m_Mask[s]);
+                P.m_Channels = (L.m_bRotation ? xanimation::CHANNEL_ROTATION : 0) | (L.m_bPosition ? xanimation::CHANNEL_POSITION : 0);
+                if (L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE)
+                {
+                    P.m_Reference.resize(nSkel, P.m_Channels);
+                    if (L.m_Reference == xanim_package_desc::additive_reference::SOURCE_FRAME)
+                        xanimation::SampleLocal(P.m_View, float(xanimation::TicksToSeconds(L.m_ReferenceTick)), P.m_Reference.m_Pose);
+                    else
+                        for (int s = 0; s < nSkel; ++s) P.m_Reference.m_Pose.set(s, RestOf(Bones[s]));
+                }
+            }
             for (const auto& K : L.m_WeightKeys)
                 P.m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Value = K.m_Value, .m_Interp = K.m_bStep ? xanimation::weight_key::interp::STEP : xanimation::weight_key::interp::LINEAR });
             std::sort(P.m_Keys.begin(), P.m_Keys.end(), [](const auto& A, const auto& B) { return A.m_Tick < B.m_Tick; });
-            P.m_Channels = (L.m_bRotation ? xanimation::CHANNEL_ROTATION : 0) | (L.m_bPosition ? xanimation::CHANNEL_POSITION : 0);
-            if (L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE)
-            {
-                P.m_Reference.resize(nSkel, P.m_Channels);
-                if (L.m_Reference == xanim_package_desc::additive_reference::SOURCE_FRAME)
-                    xanimation::SampleLocal(P.m_View, float(xanimation::TicksToSeconds(L.m_ReferenceTick)), P.m_Reference.m_Pose);
-                else
-                    for (int s = 0; s < nSkel; ++s) P.m_Reference.m_Pose.set(s, RestOf(Bones[s]));
-            }
         }
 
+        // layer by layer over the whole clip (each layer sees the finished stack below it: an additive Pose layer's anchors read it)
         xanimation::pose Pose; Pose.resize(nSkel);
         xanimation::layer_sample Sample; Sample.resize(nSkel);
         std::vector<std::uint8_t> Written;
-        for (int f = 0; f < nFrames; ++f)
+        for (auto& P : Layers)
         {
-            for (int s = 0; s < nSkel; ++s) Pose.set(s, Out[static_cast<std::size_t>(f) * nSkel + s]);
-            const xanimation::tick T = ToTick(double(f) / FPS);
-            for (auto& P : Layers)
+            const bool bPose = P.m_pDesc->m_Kind == xanim_package_desc::layer_kind::POSE;
+            const bool bAdd  = P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE;
+            if (bPose && bAdd)
+                xanimation::DeriveAnchors(std::span<xanimation::pose_track>(P.m_Tracks), [&](int b, xanimation::tick T)
+                {   // the stack below at the key's tick: its frames blended like a clip sample
+                    const double FT = std::clamp(xanimation::TicksToSeconds(T) * FPS, 0.0, double(nFrames - 1));
+                    const int A = int(FT), B = std::min(A + 1, nFrames - 1);
+                    return xmath::fquat::Slerp(Out[std::size_t(A) * nSkel + b].m_Rotation, Out[std::size_t(B) * nSkel + b].m_Rotation, float(FT - A));
+                });
+            for (int f = 0; f < nFrames; ++f)
             {
-                if (!xanimation::SampleSection(P.m_View, P.m_Time, T, P.m_Channels, Sample)) continue;
+                const xanimation::tick T = ToTick(double(f) / FPS);
+                const bool bIn = bPose ? xanimation::SamplePoseTracks(P.m_Tracks, P.m_Time, T, bAdd ? xanimation::layer_mode::ADDITIVE : xanimation::layer_mode::OVERRIDE, Sample)
+                                       : xanimation::SampleSection(P.m_View, P.m_Time, T, P.m_Channels, Sample);
+                if (!bIn) continue;
+                for (int s = 0; s < nSkel; ++s) Pose.set(s, Out[static_cast<std::size_t>(f) * nSkel + s]);
                 xanimation::layer_apply A;
-                A.m_Mode       = P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? xanimation::layer_mode::ADDITIVE : xanimation::layer_mode::OVERRIDE;
+                A.m_Mode       = bAdd ? xanimation::layer_mode::ADDITIVE : xanimation::layer_mode::OVERRIDE;
                 A.m_Weight     = xanimation::EvaluateWeight(P.m_Keys, T, P.m_pDesc->m_Weight);
                 A.m_Mask       = P.m_Mask;
-                A.m_pReference = A.m_Mode == xanimation::layer_mode::ADDITIVE ? &P.m_Reference : nullptr;
+                A.m_pReference = bAdd ? &P.m_Reference : nullptr;
                 A.m_Root       = P.m_pDesc->m_Root == xanim_package_desc::layer_root::FROM_LAYER ? xanimation::root_policy::FROM_LAYER : xanimation::root_policy::INHERIT_BELOW;
                 A.m_RootBone   = iRoot;
                 A.m_Space      = P.m_pDesc->m_Space == xanim_package_desc::layer_space::SKELETON_MODEL ? xanimation::rotation_space::SKELETON_MODEL : xanimation::rotation_space::LOCAL;
                 A.m_Parents    = Parents;
                 xanimation::ApplyLayer(Pose, Sample, A, &Written);
-                for (int s = 0; s < nSkel; ++s) if (Written[s]) { ++P.m_Written; if (P.m_Mask[s] <= 0.0f) ++P.m_WrittenOutside; }
+                for (int s = 0; s < nSkel; ++s)
+                    if (Written[s]) { ++P.m_Written; if (P.m_Mask[s] <= 0.0f) ++P.m_WrittenOutside; Out[static_cast<std::size_t>(f) * nSkel + s] = Pose.get(s); }
             }
-            for (int s = 0; s < nSkel; ++s) Out[static_cast<std::size_t>(f) * nSkel + s] = Pose.get(s);
         }
 
         for (const auto& P : Layers)
         {
             auto& R = Report.m_Layers.emplace_back();
-            R.m_Name = P.m_pDesc->m_Name; R.m_Source = xstrtool::To(P.m_pDesc->m_SourceKey) + ":" + P.m_pDesc->m_SourceClip;
+            R.m_Name = P.m_pDesc->m_Name;
+            R.m_Source = P.m_pDesc->m_Kind == xanim_package_desc::layer_kind::POSE ? std::format("pose: {} keys on {} bones", P.m_pDesc->m_Keys.size(), P.m_Tracks.size())
+                                                                                  : xstrtool::To(P.m_pDesc->m_SourceKey) + ":" + P.m_pDesc->m_SourceClip;
             R.m_bAdditive = P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE;
-            for (float M : P.m_Mask) R.m_nMaskBones += M > 0.0f;
+            if (P.m_pDesc->m_Kind == xanim_package_desc::layer_kind::POSE) for (const auto& T : P.m_Tracks) R.m_nMaskBones += P.m_Mask[T.m_Bone] > 0.0f;   // its write set
+            else for (float M : P.m_Mask) R.m_nMaskBones += M > 0.0f;
             R.m_Written = P.m_Written; R.m_WrittenOutside = P.m_WrittenOutside;
         }
         for (int f = 0; f < nFrames; ++f)
