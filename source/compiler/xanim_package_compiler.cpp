@@ -717,6 +717,40 @@ namespace xanim_package_compiler
             return nullptr;
         }
 
+        // The demonstrated range of every joint over the package's clips, plus a 5 degree margin (posing v2 step R: contract 7.2's inferred
+        // limits): JointRanges.txt next to the log, for review. Editor posing measures the same from LayerSources.bin; the limits get a home in
+        // a resource once reviewed.
+        void WriteJointRanges(const xskeleton_desc::bone_manifest& Manifest)
+        {
+            const int N = static_cast<int>(Manifest.m_Bones.size());
+            if (!N) return;
+            std::vector<std::int32_t> Parents(N);
+            xanimation::pose Rest; Rest.resize(N);
+            for (int b = 0; b < N; ++b)
+            {
+                const auto& B = Manifest.m_Bones[b];
+                Parents[b] = B.m_iParent; Rest.m_Position[b] = B.m_RestPosition; Rest.m_Scale[b] = B.m_RestScale;
+                Rest.m_Rotation[b] = xmath::fquat(B.m_RestRotX, B.m_RestRotY, B.m_RestRotZ, B.m_RestRotW).NormalizeSafeCopy();
+            }
+            std::vector<xmath::transform3> All; int nFrames = 0;
+            for (const auto& S : m_SourceFrames)
+                if (static_cast<int>(S.m_Frames.size()) == S.m_nFrames * N) { All.insert(All.end(), S.m_Frames.begin(), S.m_Frames.end()); nFrames += S.m_nFrames; }
+            if (All.empty()) return;
+            std::vector<xanimation::joint_limit> L(N);
+            constexpr float D = 180.0f / 3.14159265f;
+            xanimation::MeasureJointRanges(Parents, Rest, All, 5.0f / D, L);
+            std::string Txt = std::format("# Demonstrated joint ranges over {} clips, {} frames (+5 deg margin). Degrees, measured from the rest pose.\n"
+                                          "# bone\ttwist min..max\tswing centre (1, 2)\tswing radii (1, 2)\n", m_SourceFrames.size(), nFrames);
+            for (int b = 0; b < N; ++b)
+            {
+                if (!L[b].m_bLimited) { Txt += std::format("{}\tfree (root)\n", Manifest.m_Bones[b].m_Name); continue; }
+                Txt += std::format("{}\t{:.1f}..{:.1f}\t{:.1f}, {:.1f}\t{:.1f}, {:.1f}\n", Manifest.m_Bones[b].m_Name, L[b].m_TwistMin * D, L[b].m_TwistMax * D
+                                  , L[b].m_C1 * D, L[b].m_C2 * D, L[b].m_R1 * D, L[b].m_R2 * D);
+            }
+            if (std::FILE* f = _wfopen(std::format(L"{}\\JointRanges.txt", m_ResourceLogPath).c_str(), L"wb")) { std::fwrite(Txt.data(), 1, Txt.size(), f); std::fclose(f); }
+            else LogMessage(xresource_pipeline::msg_type::WARNING, "JointRanges.txt could not be written");
+        }
+
         xerr BuildFinalPackage()
         {
             std::unordered_map<std::wstring, std::unordered_map<std::string, const xanim_package_desc::clip*>> Overrides;
@@ -746,6 +780,7 @@ namespace xanim_package_compiler
                 m_SourceFrames.push_back({ .m_Key = Raw.m_SourceFile, .m_Clip = Raw.m_Anim.m_Name, .m_FPS = std::max(1, Raw.m_Anim.m_FPS), .m_nFrames = Raw.m_Anim.m_nFrames, .m_Frames = SkeletonFrames(Raw, Manifest) });
             if (!xanim_package_layers::WriteSourcesCache(std::format(L"{}\\LayerSources.bin", m_ResourceLogPath), m_SourceFrames, static_cast<int>(ResolvedBones.size())))
                 LogMessage(xresource_pipeline::msg_type::WARNING, "The layer-sources cache (LayerSources.bin) could not be written: the editor cannot preview layers live");
+            WriteJointRanges(Manifest);
 
             for (auto& Raw : m_RawClips)
             {
