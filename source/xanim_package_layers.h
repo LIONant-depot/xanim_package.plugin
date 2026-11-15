@@ -117,7 +117,8 @@ namespace xanim_package_layers
                     if (b < 0) { Report.m_Warnings.push_back(std::format("layer '{}': key bone '{}' is not in the skeleton (ignored)", L.m_Name, K.m_Bone)); continue; }
                     auto It = std::find_if(P.m_Tracks.begin(), P.m_Tracks.end(), [b](const auto& T) { return T.m_Bone == b; });
                     if (It == P.m_Tracks.end()) { P.m_Tracks.push_back({ .m_Bone = b }); It = std::prev(P.m_Tracks.end()); }
-                    It->m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Value = xmath::fquat(K.m_X, K.m_Y, K.m_Z, K.m_W).NormalizeCopy(), .m_bOffset = K.m_bOffset, .m_bStep = K.m_bStep });
+                    It->m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Value = xmath::fquat(K.m_X, K.m_Y, K.m_Z, K.m_W).NormalizeCopy(), .m_bOffset = K.m_bOffset, .m_bStep = K.m_bStep
+                                         , .m_bPosition = K.m_bPosition, .m_Position = xmath::fvec3(K.m_PX, K.m_PY, K.m_PZ) });
                 }
                 for (auto& T : P.m_Tracks) xanimation::SortTrack(T);
                 P.m_Mask = L.m_Mask.empty() ? std::vector<float>(nSkel, 1.0f) : LayerMask(L, Manifest, &Report.m_Warnings);
@@ -163,16 +164,26 @@ namespace xanim_package_layers
             const bool bPose = P.m_pDesc->m_Kind == xanim_package_desc::layer_kind::POSE;
             const bool bAdd  = P.m_pDesc->m_Mode == xanim_package_desc::layer_mode::ADDITIVE;
             if (bPose && bAdd)
+            {
                 xanimation::DeriveAnchors(std::span<xanimation::pose_track>(P.m_Tracks), [&](int b, xanimation::tick T)
                 {   // the stack below at the key's tick: its frames blended like a clip sample
                     const double FT = std::clamp(xanimation::TicksToSeconds(T) * FPS, 0.0, double(nFrames - 1));
                     const int A = int(FT), B = std::min(A + 1, nFrames - 1);
                     return xmath::fquat::Slerp(Out[std::size_t(A) * nSkel + b].m_Rotation, Out[std::size_t(B) * nSkel + b].m_Rotation, float(FT - A));
                 });
+                xanimation::DerivePositionAnchors(std::span<xanimation::pose_track>(P.m_Tracks), [&](int b, xanimation::tick T)
+                {
+                    const double FT = std::clamp(xanimation::TicksToSeconds(T) * FPS, 0.0, double(nFrames - 1));
+                    const int A = int(FT), B = std::min(A + 1, nFrames - 1);
+                    const auto& PA = Out[std::size_t(A) * nSkel + b].m_Position; const auto& PB = Out[std::size_t(B) * nSkel + b].m_Position;
+                    return PA + (PB - PA) * float(FT - A);
+                });
+            }
+            const xanimation::pose_sampling Sampling{ .m_bSmooth = P.m_pDesc->m_bSmooth, .m_Falloff = ToTick(std::max(0.0, double(P.m_pDesc->m_Falloff))) };
             for (int f = 0; f < nFrames; ++f)
             {
                 const xanimation::tick T = ToTick(double(f) / FPS);
-                const bool bIn = bPose ? xanimation::SamplePoseTracks(P.m_Tracks, P.m_Time, T, bAdd ? xanimation::layer_mode::ADDITIVE : xanimation::layer_mode::OVERRIDE, Sample)
+                const bool bIn = bPose ? xanimation::SamplePoseTracks(P.m_Tracks, P.m_Time, T, bAdd ? xanimation::layer_mode::ADDITIVE : xanimation::layer_mode::OVERRIDE, Sample, Sampling)
                                        : xanimation::SampleSection(P.m_View, P.m_Time, T, P.m_Channels, Sample);
                 if (!bIn) continue;
                 for (int s = 0; s < nSkel; ++s) Pose.set(s, Out[static_cast<std::size_t>(f) * nSkel + s]);
@@ -181,7 +192,7 @@ namespace xanim_package_layers
                 A.m_Weight     = xanimation::EvaluateWeight(P.m_Keys, T, P.m_pDesc->m_Weight);
                 A.m_Mask       = P.m_Mask;
                 A.m_pReference = bAdd ? &P.m_Reference : nullptr;
-                A.m_Root       = P.m_pDesc->m_Root == xanim_package_desc::layer_root::FROM_LAYER ? xanimation::root_policy::FROM_LAYER : xanimation::root_policy::INHERIT_BELOW;
+                A.m_Root       = (bPose || P.m_pDesc->m_Root == xanim_package_desc::layer_root::FROM_LAYER) ? xanimation::root_policy::FROM_LAYER : xanimation::root_policy::INHERIT_BELOW;   // a pose layer's positioned key is the user's intent, the root's too
                 A.m_RootBone   = iRoot;
                 A.m_Space      = P.m_pDesc->m_Space == xanim_package_desc::layer_space::SKELETON_MODEL ? xanimation::rotation_space::SKELETON_MODEL : xanimation::rotation_space::LOCAL;
                 A.m_Parents    = Parents;

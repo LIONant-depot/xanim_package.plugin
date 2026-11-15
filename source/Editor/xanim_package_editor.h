@@ -85,6 +85,7 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Time",   "Seconds", true, 1);
                 m_hD = m_Parser.addOption("Turn",   "\"x y z\" degrees: the key's pose = this turn (parent side) applied to the layers below at that time (default 0 0 0: the pose below)", false, 1);
                 m_hE = m_Parser.addOption("Offset", "1: store the turn itself as an offset key (additive layers) instead of the absolute pose", false, 1);
+                m_hF = m_Parser.addOption("Move",   "\"x y z\" model units: also a position key - the position below moved by this (the hips' shift; any bone); with -Offset the move itself", false, 1);
                 break;
             case kind::suggest_pose:
                 m_hA = m_Parser.addOption("Time",   "Seconds: the key", true, 1);
@@ -107,7 +108,7 @@ namespace xanim_package_editor
         }
         std::string Query() noexcept override;
 
-        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE;
+        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE, m_hF;
     };
 
     //--------------------------------------------------------------------------------------------
@@ -215,6 +216,7 @@ namespace xanim_package_editor
             std::string                         m_Sig;          // the clip and its layers when asked: a candidate is stale once they change
             std::string                         m_MovedBone;
             xmath::fvec3                        m_Target{ 0, 0, 0 };
+            int                                 m_iHips = -1;   // the bone Kimodo's root drives: its translation is keyed too
         } m_Suggest;
 
         xskeleton_editor::skeleton_viewport             m_Viewport;             // the shared 3D skeleton panel (the scene is m_Viewport.m_Scene)
@@ -261,7 +263,7 @@ namespace xanim_package_editor
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there. Usage: LayerMask -Layer n -Bone name [-Only 1]")
             , m_LayersInfo    (m_Undo, *this, playback_cmd::kind::layers_info,     "LayersInfo",     "The selected clip's layers, the live composition's isolation report and its parity with the compiled clip. Usage: LayersInfo")
-            , m_PoseKey       (m_Undo, *this, playback_cmd::kind::pose_key,        "PoseKey",        "Sets a key on a Pose layer: the bone's pose at a time = the layers below turned by -Turn (absolute target), or the turn as an offset key. Usage: PoseKey -Layer n -Bone name -Time s [-Turn \"x y z\"] [-Offset 1]")
+            , m_PoseKey       (m_Undo, *this, playback_cmd::kind::pose_key,        "PoseKey",        "Sets a key on a Pose layer: the bone's pose at a time = the layers below turned by -Turn (absolute target), or the turn as an offset key. Usage: PoseKey -Layer n -Bone name -Time s [-Turn \"x y z\"] [-Offset 1] [-Move \"x y z\"]")
             , m_SuggestPose   (m_Undo, *this, playback_cmd::kind::suggest_pose,    "SuggestPose",    "Suggests a natural pose at a time with Kimodo for the handles moved and pinned: a CANDIDATE (nothing is written) and its report. Usage: SuggestPose -Time s [-Move \"LeftHand 0 0 15\"] [-Pin \"LeftFoot RightFoot\"] [-Seeds \"1 2\"] [-Prompt text]")
             , m_SuggestPoseAccept(m_Undo, *this, playback_cmd::kind::suggest_pose_accept, "SuggestPoseAccept", "Writes a Suggest Pose candidate as keys on a Pose layer (the bones it changes). Usage: SuggestPoseAccept -Layer n [-Candidate i]")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
@@ -418,7 +420,8 @@ namespace xanim_package_editor
             for (const auto& L : C.m_Layers)
             {
                 S += std::format("{}|{}|", int(L.m_Space), int(L.m_Kind));
-                for (const auto& K : L.m_Keys) S += std::format("p{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Bone, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bOffset, K.m_bStep);
+                for (const auto& K : L.m_Keys) S += std::format("p{},{},{},{},{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Bone, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bOffset, K.m_bStep, K.m_bPosition, K.m_PX, K.m_PY, K.m_PZ);
+                S += std::format("s{},{}|", L.m_bSmooth, L.m_Falloff);
                 S += std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", L.m_bEnabled, int(L.m_Mode), int(L.m_Reference), L.m_ReferenceTick, xstrtool::To(L.m_SourceKey), L.m_SourceClip
                     , L.m_Start, L.m_End, L.m_TrimIn, L.m_TrimOut, L.m_Rate, L.m_bReverse, L.m_Weight, L.m_bRotation, L.m_bPosition, int(L.m_Root), L.m_Name);
                 for (const auto& K : L.m_WeightKeys) S += std::format("k{},{},{};", K.m_Tick, K.m_Value, K.m_bStep);
@@ -511,6 +514,9 @@ namespace xanim_package_editor
             {   // additive: a key is a turn on top of the layers below (its absolute target re-derived when they change)
                 SetLayer(n, "Kind", "Pose", "Clip");
                 SetLayer(n, "Mode", "Additive", "Override");
+                // the software's job, not the user's: a smooth curve through the keys, eased in and out over half a second
+                SetLayer(n, "Smooth", "true", "false");
+                SetLayer(n, "Falloff", "0.5", "0");
                 return std::format("LayerAdd: pose layer {} '{}' (id {}); it has no keys: add them (PoseKey)", n, Name, Id);
             }
             SetLayer(n, "SourceKey", xstrtool::To(Key), "");
@@ -520,6 +526,12 @@ namespace xanim_package_editor
 
         // The bone's local rotation composed from the layers under iLayer, at a time (the base when iLayer is 0)
         bool RotationBelow(int iLayer, int Bone, double Seconds, xmath::fquat& Q, std::string& Error) noexcept
+        {
+            xmath::fvec3 P;
+            return TransformBelow(iLayer, Bone, Seconds, Q, P, Error);
+        }
+        // ... and its local position
+        bool TransformBelow(int iLayer, int Bone, double Seconds, xmath::fquat& Q, xmath::fvec3& Pos, std::string& Error) noexcept
         {
             auto* pOv = SelectedOv(); auto* pS = SelectedSource(); auto* pDesc = Desc();
             const auto* pBase = FindLayerSource(pS->key(), pOv->m_OriginalName);
@@ -532,12 +544,15 @@ namespace xanim_package_editor
             const double FT = std::clamp(Seconds * std::max(1, pBase->m_FPS), 0.0, double(nF - 1));
             const int A = int(FT), B = std::min(A + 1, nF - 1);
             Q = xmath::fquat::Slerp(Out[std::size_t(A) * nB + Bone].m_Rotation, Out[std::size_t(B) * nB + Bone].m_Rotation, float(FT - A));
+            const auto& PA = Out[std::size_t(A) * nB + Bone].m_Position; const auto& PB = Out[std::size_t(B) * nB + Bone].m_Position;
+            Pos = PA + (PB - PA) * float(FT - A);
             return true;
         }
 
         // A key on a Pose layer: absolute (the pose below at that time turned by Turn, parent side) or the turn itself as an offset.
         // A key already on that bone at that tick is replaced.
-        std::string PoseKey(int iLayer, const std::string& Bone, double Seconds, const xmath::fquat& Turn, bool bOffset) noexcept
+        // pMove: also a position key - absolute: the position below moved by it (model units, the bone's parent space); offset: the move itself
+        std::string PoseKey(int iLayer, const std::string& Bone, double Seconds, const xmath::fquat& Turn, bool bOffset, const xmath::fvec3* pMove = nullptr) noexcept
         {
             auto* pOv = SelectedOv(); auto* pDesc = Desc();
             if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "PoseKey: no such layer in the selected clip";
@@ -548,11 +563,13 @@ namespace xanim_package_editor
             for (int s = 0; s < int(Bones.size()); ++s) if (Bones[s].m_Name == Bone) { b = s; break; }
             if (b < 0) return std::format("PoseKey: '{}' is not a bone of this skeleton", Bone);
             xmath::fquat Q = Turn;
+            xmath::fvec3 Pos = pMove ? *pMove : xmath::fvec3(0, 0, 0);
             if (!bOffset)
             {
-                xmath::fquat B; std::string Error;
-                if (!RotationBelow(iLayer, b, Seconds, B, Error)) return "PoseKey: " + Error;
+                xmath::fquat B; xmath::fvec3 BP; std::string Error;
+                if (!TransformBelow(iLayer, b, Seconds, B, BP, Error)) return "PoseKey: " + Error;
                 Q = (Turn * B).NormalizeCopy();
+                Pos = BP + Pos;
             }
             const auto Tick = xanim_package_layers::ToTick(Seconds);
             int k = -1;
@@ -567,8 +584,16 @@ namespace xanim_package_editor
             SetLayer(iLayer, Field("Z").c_str(), F(Q.m_Z), F(Old.m_Z));
             SetLayer(iLayer, Field("W").c_str(), F(Q.m_W), F(Old.m_W));
             if (bOffset != Old.m_bOffset) SetLayer(iLayer, Field("Offset").c_str(), bOffset ? "true" : "false", Old.m_bOffset ? "true" : "false");
+            if (pMove)
+            {
+                if (!Old.m_bPosition) SetLayer(iLayer, Field("Positioned").c_str(), "true", "false");
+                SetLayer(iLayer, Field("PX").c_str(), F(Pos.m_X), F(Old.m_PX));
+                SetLayer(iLayer, Field("PY").c_str(), F(Pos.m_Y), F(Old.m_PY));
+                SetLayer(iLayer, Field("PZ").c_str(), F(Pos.m_Z), F(Old.m_PZ));
+            }
             m_iLayer = iLayer;
-            return std::format("PoseKey: layer {} key {} {} '{}' at tick {} ({}): {:.6f} {:.6f} {:.6f} {:.6f}", iLayer, k, bNew ? "added" : "replaced", Bone, Tick, bOffset ? "offset" : "absolute", Q.m_X, Q.m_Y, Q.m_Z, Q.m_W);
+            return std::format("PoseKey: layer {} key {} {} '{}' at tick {} ({}): {:.6f} {:.6f} {:.6f} {:.6f}{}", iLayer, k, bNew ? "added" : "replaced", Bone, Tick, bOffset ? "offset" : "absolute", Q.m_X, Q.m_Y, Q.m_Z, Q.m_W
+                , pMove ? std::format(" position {:.5f} {:.5f} {:.5f}", Pos.m_X, Pos.m_Y, Pos.m_Z) : "");
         }
 
         // Adds the bone (with its branch, or alone) to the layer's mask, or removes its entry when it has one
@@ -603,10 +628,12 @@ namespace xanim_package_editor
                     , L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "additive" : "override", xstrtool::To(L.m_SourceKey), L.m_SourceClip, L.m_Weight, L.m_WeightKeys.size(), L.m_Mask.size());
                 for (const auto& E : L.m_Mask) T += std::format(" {}{}", E.m_Bone, E.m_bInherit ? "+" : "");
                 T += " ]\n";
+                if (L.m_Kind == xanim_package_desc::layer_kind::POSE) T += std::format("    {} curve, falloff {:.2f} s\n", L.m_bSmooth ? "smooth" : "linear", L.m_Falloff);
                 if (L.m_Kind == xanim_package_desc::layer_kind::POSE)
                     for (const auto& K : L.m_Keys)
                     {
-                        T += std::format("    pose key '{}' tick {} {} ({:.6f} {:.6f} {:.6f} {:.6f})", K.m_Bone, K.m_Tick, K.m_bOffset ? "offset" : "absolute", K.m_X, K.m_Y, K.m_Z, K.m_W);
+                        T += std::format("    pose key '{}' tick {} {} ({:.6f} {:.6f} {:.6f} {:.6f}){}", K.m_Bone, K.m_Tick, K.m_bOffset ? "offset" : "absolute", K.m_X, K.m_Y, K.m_Z, K.m_W
+                            , K.m_bPosition ? std::format(" position ({:.5f} {:.5f} {:.5f})", K.m_PX, K.m_PY, K.m_PZ) : "");
                         // an absolute key's hit: the live pose there vs the key (exact when nothing above it turns that bone, weight 1)
                         const auto& Bones = Desc()->m_ResolvedSkeletonBones.m_Bones; const int nB = int(Bones.size());
                         int b = -1; for (int s = 0; s < nB; ++s) if (Bones[s].m_Name == K.m_Bone) { b = s; break; }
@@ -1187,6 +1214,8 @@ namespace xanim_package_editor
             m_Suggest = {};
             m_Suggest.m_Owned = Owned; m_Suggest.m_Original = P0; m_Suggest.m_Time = Seconds; m_Suggest.m_Sig = SuggestSignature();
             m_Suggest.m_MovedBone = iMoved >= 0 ? Names[iMoved] : ""; m_Suggest.m_Target = Target;
+            for (int t = 0; t < nB && m_Suggest.m_iHips < 0; ++t) if (t < int(Ctx.m_Mapping.m_Auto.m_Map.m_SourceOf.size()) && Ctx.m_Mapping.m_Auto.m_Map.m_SourceOf[t] == iRoot) m_Suggest.m_iHips = t;
+            xanimation::body_ik_settings CorrSet; CorrSet.m_TranslateBone = m_Suggest.m_iHips;     // the correction may shift the hips too (they are keyed)
             std::istringstream SeedIn(Seeds); int Seed = 0;
             while (SeedIn >> Seed)
             {
@@ -1223,14 +1252,15 @@ namespace xanim_package_editor
                 xanimation::ToSkeletonSpace(Gen, nSrc, iRoot, Post, Pre);
                 const auto Back = xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Gen, nSrc, B.m_nFrames, 30, false }, nB);
 
-                // Kimodo's rotations on the clip's translations (keys are rotation only), then corrected on this skeleton
+                // Kimodo's rotations and its hip shift (positioned keys carry it), then corrected on this skeleton
                 xanimation::pose Kim = Pose0;
                 for (int b = 0; b < nB; ++b) if (Owned[b]) Kim.m_Rotation[b] = Back[std::size_t(K) * nB + b].m_Rotation;
+                if (m_Suggest.m_iHips >= 0) Kim.m_Position[m_Suggest.m_iHips] = Back[std::size_t(K) * nB + m_Suggest.m_iHips].m_Position;
                 Solver.ComputeWorld(Kim);
                 std::vector<float> KimMiss(Tasks.size());
                 for (std::size_t t = 0; t < Tasks.size(); ++t) KimMiss[t] = (Solver.WorldPosition(Tasks[t].m_Bone) - Tasks[t].m_Position).Length();
                 xanimation::pose Fixed;
-                const auto ResC = Solver.Solve(Kim, Owned, Tasks, Rep, Fixed);
+                const auto ResC = Solver.Solve(Kim, Owned, Tasks, Rep, Fixed, CorrSet);
                 float CMax = 0, CSum = 0; int CN = 0; std::string CBone;
                 for (int b = 0; b < nB; ++b) if (Owned[b]) { const float a = AngleDeg(Kim.m_Rotation[b], Fixed.m_Rotation[b]); CSum += a; ++CN; if (a > CMax) { CMax = a; CBone = Names[b]; } }
 
@@ -1267,8 +1297,43 @@ namespace xanim_package_editor
             return Text;
         }
 
-        // A candidate as keys on a Pose layer: every keyable bone it turns by more than 0.05 degrees from the pose below that layer.
-        // ponytail: one PoseKey per bone, each a few undo steps (the count is returned); a single grouped step needs an xundo group
+        std::string m_AccAt;      // where the last MaxAcceleration found its largest value
+        // the bones' model positions (metres: the skeleton's scales applied) of one frame
+        std::vector<xmath::fvec3> ModelPositions(const xmath::transform3* pFrame) noexcept
+        {
+            const auto& Man = Desc()->m_ResolvedSkeletonBones.m_Bones; const int nB = int(Man.size());
+            std::vector<std::int32_t> Par(nB); for (int b = 0; b < nB; ++b) Par[b] = Man[b].m_iParent;
+            xanimation::body_ik FK; FK.Setup(Par);
+            xanimation::pose P; P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, pFrame[b]);
+            FK.ComputeWorld(P);
+            std::vector<xmath::fvec3> V(nB); for (int b = 0; b < nB; ++b) V[b] = FK.WorldPosition(b);
+            return V;
+        }
+        // max acceleration (m/s^2, model positions, owned bones) over the frames [f0, f1]: of the clip A, or (B given) of the motion A adds to B
+        float MaxAcceleration(const std::vector<xmath::transform3>& A, int FPS, int nF, int f0, int f1, const std::vector<xmath::transform3>* pB = nullptr, int OnlyBone = -1) noexcept
+        {
+            const int nB = int(Desc()->m_ResolvedSkeletonBones.m_Bones.size());
+            auto At = [&](int f)
+            {
+                auto V = ModelPositions(&A[std::size_t(f) * nB]);
+                if (pB) { const auto W = ModelPositions(&(*pB)[std::size_t(f) * nB]); for (int b = 0; b < nB; ++b) V[b] = V[b] - W[b]; }
+                return V;
+            };
+            f0 = std::max(1, f0); f1 = std::min(nF - 2, f1);
+            float Max = 0; const float dt = 1.0f / float(FPS);
+            if (f1 < f0) return 0;
+            auto Pm = At(f0 - 1), Po = At(f0);
+            for (int f = f0; f <= f1; ++f)
+            {
+                auto Pp = At(f + 1);
+                for (int b = 0; b < nB; ++b) if (OnlyBone >= 0 ? b == OnlyBone : (m_Suggest.m_Owned.empty() || m_Suggest.m_Owned[b])) { const float a = (Pp[b] - Po[b] * 2.0f + Pm[b]).Length() / (dt * dt); if (a > Max) { Max = a; m_AccAt = std::format("frame {} {}", f, Desc()->m_ResolvedSkeletonBones.m_Bones[b].m_Name); } }
+                Pm = std::move(Po); Po = std::move(Pp);
+            }
+            return Max;
+        }
+
+        // A candidate as keys on a Pose layer: every keyable bone it turns by more than 0.05 degrees from the pose below that layer, and the
+        // hips' translation (Kimodo's shift). One undo step. The layer's falloff and smooth curve blend the change in and out.
         std::string SuggestPoseAccept(int iLayer, int iCand) noexcept
         {
             auto* pOv = SelectedOv(); auto* pDesc = Desc();
@@ -1283,6 +1348,9 @@ namespace xanim_package_editor
             if (int(C.m_Pose.size()) != nB) return "SuggestPoseAccept: the skeleton changed since the candidate";
             // One undo step for the whole accept: the keys are written one by one (each reads the stack the previous ones made), then those
             // steps are rolled back and replayed as one snapshot edit (the snapshot keeps enums since C57)
+            // the motion around the key before the keys (for the continuity report)
+            std::vector<xmath::transform3> FramesBefore; int FPSb = 30, nFb = 0;
+            { const std::vector<xmath::transform3>* pF = nullptr; std::string E0; if (SuggestClipFrames(pF, FPSb, nFb, E0)) FramesBefore = *pF; }
             const int UndoAt = m_Undo.GetUndoIndex();
             xproperty::settings::context SnapCtx;
             const auto Before = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), SnapCtx);
@@ -1298,6 +1366,22 @@ namespace xanim_package_editor
                 if (!R.starts_with("PoseKey: layer")) return "SuggestPoseAccept: " + R;
                 ++nKeys; nSteps += R.find(" added ") != std::string::npos ? 7 : 4;      // PoseKey's SetProperty steps (a new key: size, tick, bone, x y z w)
             }
+            std::string HipsNote;
+            if (const int h = m_Suggest.m_iHips; h >= 0 && h < nB)
+            {
+                xmath::fquat BQ; xmath::fvec3 BP;
+                if (!TransformBelow(iLayer, h, m_Suggest.m_Time, BQ, BP, Err)) return "SuggestPoseAccept: " + Err;
+                const auto Move = C.m_Pose[h].m_Position - BP;                       // local units (the rig's: cm on a 0.01-scaled rig)
+                // the same shift in model space (metres): the candidate with its hips and with the position below
+                auto With = C.m_Pose; With[h].m_Position = BP;
+                const float Model = (ModelPositions(C.m_Pose.data())[h] - ModelPositions(With.data())[h]).Length();
+                if (Model > 1e-5f)
+                {
+                    const auto R = PoseKey(iLayer, Man[h].m_Name, m_Suggest.m_Time, (C.m_Pose[h].m_Rotation * BQ.ConjugateCopy()).NormalizeCopy(), false, &Move);
+                    if (!R.starts_with("PoseKey: layer")) return "SuggestPoseAccept: " + R;
+                    HipsNote = std::format("; hips moved {:.2f} cm", Model * 100.0f);
+                }
+            }
             if (m_Undo.GetUndoIndex() > UndoAt)
             {
                 const auto After = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), SnapCtx);
@@ -1312,8 +1396,33 @@ namespace xanim_package_editor
             const auto Now = SamplePose(*pFrames, FPS, nF, nB, m_Suggest.m_Time);
             float Max = 0; std::string MaxBone;
             for (int b = 0; b < nB; ++b) if (m_Suggest.m_Owned[b]) { const float a = AngleDeg(Now[b].m_Rotation, C.m_Pose[b].m_Rotation); if (a > Max) { Max = a; MaxBone = Man[b].m_Name; } }
+            float HipsMiss = 0;
+            if (const int h = m_Suggest.m_iHips; h >= 0 && h < nB) HipsMiss = (ModelPositions(Now.data())[h] - ModelPositions(C.m_Pose.data())[h]).Length();
+            // continuity: the largest acceleration within +-1 s of the key, before and after, and that of the motion the layer adds (its falloff
+            // and smooth curve ease the change in and out)
+            const int fk = int(std::lround(m_Suggest.m_Time * FPS));
+            const bool bSame = FramesBefore.size() == pFrames->size();
+            const float AccB = bSame ? MaxAcceleration(FramesBefore, FPSb, nFb, fk - FPSb, fk + FPSb) : -1.0f;
+            const float AccA = MaxAcceleration(*pFrames, FPS, nF, fk - FPS, fk + FPS);
+            const float AccD = bSame ? MaxAcceleration(*pFrames, FPS, nF, fk - FPS, fk + FPS, &FramesBefore) : -1.0f;
+            const std::string AccDAt = m_AccAt;
+            int iMovedBone = -1; for (int b = 0; b < nB; ++b) if (Man[b].m_Name == m_Suggest.m_MovedBone) iMovedBone = b;
+            // locality: the largest change of any bone more than 0.6 s from the key (the falloff keeps a pose local; the old ramp reached the clip's ends)
+            float Far = 0;
+            if (bSame)
+                for (int f = 0; f < nF; ++f)
+                {
+                    if (std::abs(f - fk) <= int(0.6 * FPS)) continue;
+                    const auto Pa = ModelPositions(&(*pFrames)[std::size_t(f) * nB]), Pb = ModelPositions(&FramesBefore[std::size_t(f) * nB]);
+                    for (int b = 0; b < nB; ++b) Far = std::max(Far, (Pa[b] - Pb[b]).Length());
+                }
+            std::string Moved = std::format("; change beyond 0.6 s of the key {:.3f} cm", Far * 100.0f);
+            if (bSame && iMovedBone >= 0)
+                Moved += std::format("; the moved {}: added motion max {:.2f} m/s^2 ({}), the clip's own {:.2f}", m_Suggest.m_MovedBone, MaxAcceleration(*pFrames, FPS, nF, fk - FPS, fk + FPS, &FramesBefore, iMovedBone), m_AccAt
+                                   , MaxAcceleration(FramesBefore, FPSb, nFb, fk - FPSb, fk + FPSb, nullptr, iMovedBone));
             m_Suggest.m_Sig = SuggestSignature();      // the keys just written are the candidate's own
-            return std::format("SuggestPoseAccept: {} keys on layer {} ({} undo steps); the stack at the key against the candidate: max {:.4f} deg ({})", nKeys, iLayer, nSteps, Max, MaxBone);
+            return std::format("SuggestPoseAccept: {} keys on layer {} ({} undo steps){}; the stack at the key against the candidate: max {:.4f} deg ({}), hips {:.3f} cm; acceleration within 1 s of the key: before {:.1f}, after {:.1f} m/s^2; of the added motion {:.1f} m/s^2 ({}; key frame {})"
+                , nKeys, iLayer, nSteps, HipsNote, Max, MaxBone, HipsMiss * 100.0f, AccB, AccA, AccD, AccDAt, fk) + Moved;
         }
 
         static std::string SafeFileName(std::string N) noexcept
@@ -1867,7 +1976,10 @@ namespace xanim_package_editor
             if (!Turn.empty() && std::sscanf(Turn.c_str(), "%f %f %f", &D[0], &D[1], &D[2]) != 3) return "PoseKey: -Turn is \"x y z\" degrees";
             constexpr float R = 3.14159265358979f / 180.0f;
             const xmath::fquat Q(xmath::radian3(xmath::radian{ D[0] * R }, xmath::radian{ D[1] * R }, xmath::radian{ D[2] * R }));
-            return S.PoseKey(iL, Bone, Secs, Q, Off == "1" || Off == "true");
+            std::string MoveArg; xeditor::cmd_util::GetArg(m_Parser, m_hF, MoveArg);
+            xmath::fvec3 Mv(0, 0, 0);
+            if (!MoveArg.empty() && std::sscanf(MoveArg.c_str(), "%f %f %f", &Mv.m_X, &Mv.m_Y, &Mv.m_Z) != 3) return "PoseKey: -Move is \"x y z\"";
+            return S.PoseKey(iL, Bone, Secs, Q, Off == "1" || Off == "true", MoveArg.empty() ? nullptr : &Mv);
         }
         case kind::layer_mask:
         {

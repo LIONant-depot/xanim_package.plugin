@@ -74,6 +74,8 @@ namespace xanim_package_desc
         float           m_X = 0, m_Y = 0, m_Z = 0, m_W = 1;     // quaternion
         bool            m_bOffset = false;
         bool            m_bStep   = false;
+        bool            m_bPosition = false;                    // a position key too (the hips' shift, or any bone): local, absolute or with Offset the offset
+        float           m_PX = 0, m_PY = 0, m_PZ = 0;
 
         XPROPERTY_DEF
         ( "PoseKey", layer_pose_key
@@ -85,6 +87,10 @@ namespace xanim_package_desc
         , obj_member<"W",      &layer_pose_key::m_W >
         , obj_member<"Offset", &layer_pose_key::m_bOffset >
         , obj_member<"Step",   &layer_pose_key::m_bStep >
+        , obj_member<"Positioned", &layer_pose_key::m_bPosition >
+        , obj_member<"PX",     &layer_pose_key::m_PX >
+        , obj_member<"PY",     &layer_pose_key::m_PY >
+        , obj_member<"PZ",     &layer_pose_key::m_PZ >
         )
     };
     XPROPERTY_REG(layer_pose_key)
@@ -154,6 +160,8 @@ namespace xanim_package_desc
         layer_space         m_Space       = layer_space::LOCAL;     // override rotations: per bone (Local) or relative to the skeleton (a masked arm keeps the layer's orientation)
         layer_kind          m_Kind        = layer_kind::CLIP;       // Clip: motion from SourceKey/SourceClip; Pose: the Keys below
         std::vector<layer_pose_key> m_Keys = {};                    // Pose layers: sparse keys (a track per bone); their mask, when empty, is the whole body
+        bool                m_bSmooth     = false;      // Pose layers: a smooth curve through the keys (new pose layers: on; off = linear, as layers made before)
+        float               m_Falloff     = 0.0f;       // Pose layers: seconds the layer eases in before its first key and out after its last (new pose layers: 0.5; 0 = ramp to the section ends)
 
         XPROPERTY_DEF
         ( "Layer", clip_layer
@@ -180,6 +188,8 @@ namespace xanim_package_desc
         , obj_member<"Space",         &clip_layer::m_Space, member_enum_span<layer_space_v> >
         , obj_member<"Kind",          &clip_layer::m_Kind, member_enum_span<layer_kind_v> >
         , obj_member<"Keys",          &clip_layer::m_Keys >
+        , obj_member<"Smooth",        &clip_layer::m_bSmooth >
+        , obj_member<"Falloff",       &clip_layer::m_Falloff >
         )
     };
     XPROPERTY_REG(clip_layer)
