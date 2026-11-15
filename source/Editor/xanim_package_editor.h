@@ -98,6 +98,7 @@ namespace xanim_package_editor
                 m_hA = m_Parser.addOption("Layer",     "The Pose layer the keys go on (the top layer of the clip)", true, 1);
                 m_hB = m_Parser.addOption("Candidate", "Which candidate (default 0)", false, 1);
                 m_hC = m_Parser.addOption("Refine",    "0: no Refine Motion (Kimodo regenerating +-0.5 s around the key so it moves naturally); default 1", false, 1);
+                m_hD = m_Parser.addOption("MaxWindow", "Seconds per Kimodo window (default 10, Kimodo's limit): a longer refine scope is generated as overlapping windows stitched together; a smaller value tests the stitching", false, 1);
                 break;
             case kind::layer_mask:
                 m_hA = m_Parser.addOption("Layer", "The layer's index in the selected clip", true, 1);
@@ -219,6 +220,7 @@ namespace xanim_package_editor
             xmath::fvec3                        m_Target{ 0, 0, 0 };
             int                                 m_iHips = -1;   // the bone Kimodo's root drives: its translation is keyed too
         } m_Suggest;
+        int m_RefineMaxFrames = 300;        // frames per Kimodo window (30 fps; Kimodo's 10 s limit): longer scopes are stitched windows
 
         xskeleton_editor::skeleton_viewport             m_Viewport;             // the shared 3D skeleton panel (the scene is m_Viewport.m_Scene)
         xeditor::camera_toolbar                         m_CameraToolbar;
@@ -1395,9 +1397,7 @@ namespace xanim_package_editor
             // the window at 30 fps: the scope [A, B] around the key K plus a 0.5 s margin each side; every frame keyed (the feet held)
             constexpr int Mg = 15, Step = 1;
             int Rl = std::max(2, int(std::lround(Lo * 30.0))), Rh = std::max(2, int(std::lround(Hi * 30.0)));
-            // ponytail: one Kimodo window, at most 10 s (300 frames); a longer scope is cut around the key - stitch overlapping windows when
-            // clips get longer than that
-            if (Rl + Rh + 2 * Mg + 1 > 300) { const double s = double(300 - 2 * Mg - 1) / double(Rl + Rh); Rl = int(Rl * s); Rh = int(Rh * s); }
+            // a window longer than Kimodo's limit is generated as overlapping windows, stitched (below)
             const int W = Rl + Rh + 2 * Mg + 1, K = Mg + Rl, A = K - Rl, B = K + Rh;
             const double Key = m_Suggest.m_Time;
             // the layer's other keys inside the scope: anchors (kept, constrained, met by the blend)
@@ -1448,67 +1448,111 @@ namespace xanim_package_editor
             };
             const float SkateBefore = 0.5f * (Skate(FootPos[0], &InContact[0]) + Skate(FootPos[1], &InContact[1]));
 
-            // the request
-            kimodo_space KS; std::vector<kimodo::soma_pose> SP;
-            if (!ToKimodo(*pCtx, Win, W, nB, KS, SP, Err)) return false;
-            auto Root2 = [&](int i) { return std::array<float, 2>{ SP[i].m_Root[0], SP[i].m_Root[2] }; };
-            std::vector<kimodo::constraint_set> Sets;
-            std::vector<int> Full = { A - 3 };
-            for (int f : Anchors) Full.push_back(f);                                       // the edges, the key, the user's other keys
-            Full.push_back(B + 3);
-            kimodo::constraint_set FB{ "fullbody", {}, {}, {} };
-            // the clip's own poses every 0.5 s away from the key: constraints AND blend anchors (Kimodo meets a constraint with a local jerk; anchored, the motion meets the clip there smoothly), so a wide scope
-            // keeps the clip's intent instead of drifting into another motion
-            for (int f = A + 15; f < B - 7; f += 15) if (std::abs(f - K) >= 15 && Full.size() < 20) { Full.push_back(f); Anchors.push_back(f); }
+            // the clip's own poses every 0.5 s away from the key: constraints AND blend anchors (Kimodo meets a constraint with a local jerk;
+            // anchored, the motion meets the clip there smoothly), so a wide scope keeps the clip's intent instead of drifting into another motion
+            const auto KeyAnchors = Anchors;                                               // the edges, the key, the user's other keys
+            for (int f = A + 15; f < B - 7; f += 15) if (std::abs(f - K) >= 15) Anchors.push_back(f);
             std::sort(Anchors.begin(), Anchors.end()); Anchors.erase(std::unique(Anchors.begin(), Anchors.end()), Anchors.end());
-            std::sort(Full.begin(), Full.end()); Full.erase(std::unique(Full.begin(), Full.end()), Full.end());
-            for (int f : Full) if (f >= 0 && f < W) { FB.m_Frames.push_back(f); FB.m_Poses.push_back(SP[f]); FB.m_Smooth.push_back(Root2(f)); }
-            Sets.push_back(std::move(FB));
-            int nFootFrames = 0;
-            const int FootStride = std::max(2, (B - A) / 16 + 1);                          // at most ~16 contact frames per foot (Kimodo's guidance)
-            for (int s = 0; s < 2; ++s)
-            {
-                kimodo::constraint_set Set{ s ? "right-foot" : "left-foot", {}, {}, {} };
-                for (int f = A; f <= B && Set.m_Frames.size() < 16; f += FootStride) if (InContact[s][f] && f != K) { Set.m_Frames.push_back(f); Set.m_Poses.push_back(SP[f]); Set.m_Smooth.push_back(Root2(f)); }
-                nFootFrames += int(Set.m_Frames.size());
-                if (!Set.m_Frames.empty()) Sets.push_back(std::move(Set));
-            }
-            kimodo::constraint_set Path{ "root2d", {}, {}, {} };
-            for (int i = 0; i < W; ++i) { Path.m_Frames.push_back(i); Path.m_Smooth.push_back(Root2(i)); }
-            Sets.push_back(std::move(Path));
-            static int s_Count = 0;
-            const auto Stem = std::format(L"{}\\refine_{}_{}", m_Document.m_TempDir, GetCurrentProcessId(), ++s_Count);
-            std::filesystem::create_directories(m_Document.m_TempDir);
-            if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return false;
-            const auto t1 = clock::now();
-            const auto Bvh = Stem + L".bvh";
-            const auto Args = std::format(L"gen --prompt \"A person.\" --frames {} --steps 25 --seed {} --no-postprocess --constraints \"{}.json\" --bvh \"{}\"", W, std::max(1, Seed), Stem, Bvh);
-            if (!kimodo::RunBlocking(Exe, Args, Stem + L".log", 180000, Err)) return false;
-            const auto t2 = clock::now();
-            kimodo::bvh Bv;
-            if (!Bv.Load(Bvh, Err)) return false;
-            if (Bv.m_nFrames < W) { Err = "the generated window is too short"; return false; }
-            const auto Back = FromKimodo(*pCtx, Bv, KS, nB);
 
-            // the window is a take: stored (never regenerated) and listed on the layer (provenance; the Kimodo layer kind shows it later)
+            // The windows: one when the scope fits Kimodo's limit, else overlapping windows (a quarter of a window of overlap, at most 2 s),
+            // each generated on its own (the constraints of the frames it covers, its own Kimodo space) and stored as a take; the overlaps
+            // crossfade with a zero-slope weight. Kimodo's 10 s is per take, never per result.
+            const int MaxW = std::max(30, m_RefineMaxFrames);
+            std::vector<std::pair<int, int>> Chunks;
+            if (W <= MaxW) Chunks.push_back({ 0, W });
+            else
             {
+                const int Ov = std::min(60, MaxW / 4), Stride = MaxW - Ov;
+                for (int c0 = 0;; c0 += Stride) { const int s = std::min(c0, W - MaxW); Chunks.push_back({ s, s + MaxW }); if (s + MaxW >= W) break; }
+            }
+            static int s_Count = 0;
+            std::filesystem::create_directories(m_Document.m_TempDir);
+            const auto t1 = clock::now();
+            std::vector<std::vector<xmath::transform3>> Gen(Chunks.size());
+            int nFootFrames = 0;
+            for (std::size_t ci = 0; ci < Chunks.size(); ++ci)
+            {
+                const int c0 = Chunks[ci].first, c1 = Chunks[ci].second, n = c1 - c0;
+                const std::vector<xmath::transform3> Wc(Win.begin() + std::size_t(c0) * nB, Win.begin() + std::size_t(c1) * nB);
+                kimodo_space KS; std::vector<kimodo::soma_pose> SP;
+                if (!ToKimodo(*pCtx, Wc, n, nB, KS, SP, Err)) return false;
+                auto Root2 = [&](int i) { return std::array<float, 2>{ SP[i].m_Root[0], SP[i].m_Root[2] }; };
+                std::vector<kimodo::constraint_set> Sets;
+                // full body inside this window, at most 20 (Kimodo's guidance): the edges just outside the scope, the key and the user's keys
+                // first, then the clip every 0.5 s
+                std::vector<int> Full;
+                for (int f : { A - 3, B + 3 }) if (f >= c0 && f < c1) Full.push_back(f);
+                for (int f : KeyAnchors) if (f >= c0 && f < c1) Full.push_back(f);
+                for (int f : Anchors) if (f >= c0 && f < c1 && Full.size() < 20) Full.push_back(f);
+                std::sort(Full.begin(), Full.end()); Full.erase(std::unique(Full.begin(), Full.end()), Full.end());
+                kimodo::constraint_set FB{ "fullbody", {}, {}, {} };
+                for (int f : Full) { FB.m_Frames.push_back(f - c0); FB.m_Poses.push_back(SP[f - c0]); FB.m_Smooth.push_back(Root2(f - c0)); }
+                if (!FB.m_Frames.empty()) Sets.push_back(std::move(FB));
+                const int a = std::max(A, c0), b = std::min(B, c1 - 1);
+                const int FootStride = std::max(2, (b - a) / 16 + 1);                      // at most ~16 contact frames per foot (Kimodo's guidance)
+                for (int s = 0; s < 2; ++s)
+                {
+                    kimodo::constraint_set Set{ s ? "right-foot" : "left-foot", {}, {}, {} };
+                    for (int f = a; f <= b && Set.m_Frames.size() < 16; f += FootStride) if (InContact[s][f] && f != K) { Set.m_Frames.push_back(f - c0); Set.m_Poses.push_back(SP[f - c0]); Set.m_Smooth.push_back(Root2(f - c0)); }
+                    nFootFrames += int(Set.m_Frames.size());
+                    if (!Set.m_Frames.empty()) Sets.push_back(std::move(Set));
+                }
+                kimodo::constraint_set Path{ "root2d", {}, {}, {} };
+                for (int i = 0; i < n; ++i) { Path.m_Frames.push_back(i); Path.m_Smooth.push_back(Root2(i)); }
+                Sets.push_back(std::move(Path));
+                const auto Stem = std::format(L"{}\\refine_{}_{}", m_Document.m_TempDir, GetCurrentProcessId(), ++s_Count);
+                if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return false;
+                const auto Bvh = Stem + L".bvh";
+                const int TakeSeed = std::max(1, Seed) + int(ci);
+                const auto Args = std::format(L"gen --prompt \"A person.\" --frames {} --steps 25 --seed {} --no-postprocess --constraints \"{}.json\" --bvh \"{}\"", n, TakeSeed, Stem, Bvh);
+                if (!kimodo::RunBlocking(Exe, Args, Stem + L".log", 180000, Err)) return false;
+                kimodo::bvh Bv;
+                if (!Bv.Load(Bvh, Err)) return false;
+                if (Bv.m_nFrames < n) { Err = "the generated window is too short"; return false; }
+                Gen[ci] = FromKimodo(*pCtx, Bv, KS, nB);
+
+                // the window is a take: stored (never regenerated) and listed on the layer (provenance; the Kimodo layer kind shows it later)
                 const auto Dir = ProjectPath() / L"Cache" / L"KimodoTakes" / std::format(L"{:016X}", m_Document.m_Guid.m_Instance.m_Value);
                 std::error_code Ec; std::filesystem::create_directories(Dir, Ec);
                 const auto Name = std::format("refine_{:%Y%m%d_%H%M%S}_{}", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()), s_Count);
                 std::filesystem::copy_file(Bvh, Dir / (xstrtool::To(Name) + L".bvh"), std::filesystem::copy_options::overwrite_existing, Ec);
                 std::filesystem::copy_file(Stem + L".json", Dir / (xstrtool::To(Name) + L".json"), std::filesystem::copy_options::overwrite_existing, Ec);
+                const double T0 = Key + double(c0 - K) / 30.0, Ta = Key + double(a - K) / 30.0, Tb = Key + double(b - K) / 30.0;
                 xanim_package_desc::layer_take Tk;
-                Tk.m_File = Name; Tk.m_Prompt = "A person."; Tk.m_Seed = std::max(1, Seed); Tk.m_Steps = 25;
-                Tk.m_Start = xanim_package_layers::ToTick(std::max(0.0, Key - double(K - A) / 30.0)); Tk.m_End = xanim_package_layers::ToTick(Key + double(B - K) / 30.0);
-                Tk.m_Offset = xanim_package_layers::ToTick(Key - double(K) / 30.0); Tk.m_Why = Why;
+                Tk.m_File = Name; Tk.m_Prompt = "A person."; Tk.m_Seed = TakeSeed; Tk.m_Steps = 25;
+                Tk.m_Start = xanim_package_layers::ToTick(std::max(0.0, Ta)); Tk.m_End = xanim_package_layers::ToTick(Tb);
+                Tk.m_Offset = xanim_package_layers::ToTick(T0);
+                Tk.m_Why = Chunks.size() > 1 ? std::format("{} (window {} of {}, stitched)", Why, ci + 1, Chunks.size()) : Why;
                 if (std::FILE* fp = _wfopen((Dir / (xstrtool::To(Name) + L".take.txt")).c_str(), L"wb"))
                 {
                     const auto T = std::format("prompt: {}\nseed: {}\nsteps: {}\nframes: {} at 30 fps (frame 0 = clip {:.3f} s)\nkeys made: clip {:.3f} .. {:.3f} s\nclip: {}\nwhy: {}\n"
-                        , Tk.m_Prompt, Tk.m_Seed, Tk.m_Steps, W, Key - double(K) / 30.0, Key - double(K - A) / 30.0, Key + double(B - K) / 30.0, pOv->m_OriginalName, Why);
+                        , Tk.m_Prompt, Tk.m_Seed, Tk.m_Steps, n, T0, Ta, Tb, pOv->m_OriginalName, Tk.m_Why);
                     std::fwrite(T.data(), 1, T.size(), fp); std::fclose(fp);
                 }
                 if (Ec) { Err = std::format("the take could not be stored in {}: {}", xstrtool::To(Dir.wstring()), Ec.message()); return false; }
                 pOv->m_Layers[iLayer].m_Takes.push_back(Tk);
+            }
+            const auto t2 = clock::now();
+            // stitched: a frame covered by two windows crossfades from the earlier to the later with a zero-slope (smootherstep) weight
+            std::vector<xmath::transform3> Back(std::size_t(W) * nB);
+            for (int f = 0; f < W; ++f)
+            {
+                int j = 0; while (j + 1 < int(Chunks.size()) && Chunks[j + 1].first <= f) ++j;
+                const auto* pB = &Gen[j][std::size_t(f - Chunks[j].first) * nB];
+                auto* pOut = &Back[std::size_t(f) * nB];
+                if (j > 0 && f < Chunks[j - 1].second)
+                {
+                    const int s = Chunks[j].first, e = Chunks[j - 1].second;
+                    float u = float(f - s + 1) / float(e - s + 1); u = u * u * u * (u * (u * 6.0f - 15.0f) + 10.0f);
+                    const auto* pA = &Gen[j - 1][std::size_t(f - Chunks[j - 1].first) * nB];
+                    for (int b = 0; b < nB; ++b)
+                    {
+                        pOut[b] = pB[b];
+                        pOut[b].m_Rotation = xmath::fquat::Slerp(pA[b].m_Rotation, pB[b].m_Rotation, u).NormalizeCopy();
+                        pOut[b].m_Position = pA[b].m_Position + (pB[b].m_Position - pA[b].m_Position) * u;
+                    }
+                }
+                else std::copy(pB, pB + nB, pOut);
             }
 
             // per refined frame: Kimodo's rotations (keyable bones) and hips, the feet pinned where in contact
@@ -1619,9 +1663,9 @@ namespace xanim_package_editor
                 if (i == K) for (int b = 0; b < nB; ++b) if (Owned[b]) KeyMiss = std::max(KeyMiss, AngleDeg(Pp[b].m_Rotation, Win[std::size_t(K) * nB + b].m_Rotation));
             }
             const float SkateAfter = 0.5f * (Skate(AfterFeet[0], nullptr) + Skate(AfterFeet[1], nullptr));
-            Report = std::format("refine scope -{:.2f} .. +{:.2f} s (Kimodo window {} frames, 25 steps, {} anchors): {} frames keyed ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm); "
+            Report = std::format("refine scope -{:.2f} .. +{:.2f} s ({} frames as {} Kimodo window(s) of up to {} frames{}, 25 steps, {} anchors): {} frames keyed ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm); "
                                  "skate in contact {:.4f} -> {:.4f} hip heights/s; the key kept within {:.4f} deg; time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms"
-                , double(K - A) / 30.0, double(B - K) / 30.0, W, Anchors.size(), nFrames, nKeys, nFootFrames, PinMax * 100.0f, SkateBefore, SkateAfter, KeyMiss, ms(t0, t1), ms(t1, t2), ms(t2, t3));
+                , double(K - A) / 30.0, double(B - K) / 30.0, W, Chunks.size(), MaxW, Chunks.size() > 1 ? ", stitched" : "", Anchors.size(), nFrames, nKeys, nFootFrames, PinMax * 100.0f, SkateBefore, SkateAfter, KeyMiss, ms(t0, t1), ms(t1, t2), ms(t2, t3));
             return true;
         }
 
@@ -1689,26 +1733,45 @@ namespace xanim_package_editor
                 }
                 for (int b = 0; b < nB; ++b) Vw[b] = Nm[b];
                 const xanimation::skeleton_view SV{ Par };
-                // ponytail: the Humanoid v1 preset resolved for the package skeleton; the skeleton's own compiled limits when the package reads them
-                const auto Rig = xanimation::MakeHumanoidRealismRig(SV, Vw, RestP, xanimation::HumanoidJointPresetV1(SV, Vw, RestP));
+                // the joint limits: the skeleton's own compiled limits when it has them (JointLimits On), else the Humanoid v1 preset
+                std::vector<xanimation::joint_limit> Lim;
+                std::string LimitsFrom = xanimation::humanoid_v1_name_v;
+                if (auto* pSk = m_SkeletonRef.empty() ? nullptr : xresource::g_Mgr.getResource(m_SkeletonRef); pSk && pSk->m_nJoints == nB && pSk->m_nBones == nB)
+                {
+                    Lim.resize(nB);
+                    for (int b = 0; b < nB; ++b) Lim[b] = xskeleton_joints::FromRuntime(pSk->m_pJoints[b], pSk->m_pBoneRests[b].m_RestPose.m_Rotation.NormalizeSafeCopy());
+                    LimitsFrom = "the skeleton's own";
+                }
+                else Lim = xanimation::HumanoidJointPresetV1(SV, Vw, RestP);
+                const auto Rig = xanimation::MakeHumanoidRealismRig(SV, Vw, RestP, std::move(Lim));
                 const double Key = m_Suggest.m_Time, Dur = double(std::max(1, nFb - 1)) / double(std::max(1, FPSb));
                 const int fk = int(std::lround(Key * FPSb));
+                const auto OwnFrames = FramesBefore.empty() ? xanimation::realism_frames{} : xanimation::MeasureRealismFrames(Rig, FramesBefore, nB, nFb, float(FPSb));
+                // judged frame by frame against the clip at the same moment (+-3 frames): a wider scope cannot hide the edit's own fault
+                // behind a worse moment elsewhere in the clip. Margins: 25 % + a floor (noise, not realism).
+                const bool bOwnLimits = LimitsFrom != xanimation::humanoid_v1_name_v;     // reviewed limits decide; the unreviewed preset only informs
+                float LastScore = 0;                                                     // how far the last judged scope is from passing (0: passes)
                 auto Judge = [&](double Lo, double Hi, std::string& Line) -> std::vector<std::string>
                 {
                     const std::vector<xmath::transform3>* pA = nullptr; int FPSa = 30, nFa = 0; std::string E1;
                     std::vector<std::string> Fails;
                     if (FramesBefore.empty() || !SuggestClipFrames(pA, FPSa, nFa, E1) || nFa != nFb) { Line = "not measured"; return Fails; }
                     const int f0 = fk - int(std::lround(Lo * FPSb)) - 3, f1 = fk + int(std::lround(Hi * FPSb)) + 3;
-                    const auto Own = xanimation::MeasureRealism(Rig, FramesBefore, nB, nFb, float(FPSb), f0, f1);
-                    const auto Now = xanimation::MeasureRealism(Rig, *pA, nB, nFa, float(FPSa), f0, f1);
-                    Line = std::format("skate {:.3f} (clip {:.3f}) hip h/s, acceleration {:.1f} ({:.1f}) m/s^2, hips {:.1f} ({:.1f}) m/s^2, limits {:.1f} ({:.1f}) deg over {} ({}) frames, balance [advisory] {:.3f} ({:.3f}) hip h on {} static frames"
-                        , Now.m_Skate, Own.m_Skate, Now.m_Acc, Own.m_Acc, Now.m_Hips, Own.m_Hips, Now.m_LimitExcess, Own.m_LimitExcess, Now.m_nLimitFrames, Own.m_nLimitFrames, Now.m_Balance, Own.m_Balance, Now.m_nStatic);
-                    // no worse than the clip's own, with a margin (25 % + a floor: noise, not realism)
-                    if (Now.m_Skate > Own.m_Skate * 1.25f + 0.02f)    Fails.push_back("foot skate");
-                    if (Now.m_Acc   > Own.m_Acc   * 1.25f + 2.0f)     Fails.push_back("acceleration");
-                    if (Now.m_Hips  > Own.m_Hips  * 1.25f + 1.0f)     Fails.push_back("hips momentum");
-                    if (Now.m_LimitExcess > Own.m_LimitExcess + 2.0f) Fails.push_back("joint limits");
-                    if (Now.m_Balance > Own.m_Balance + 0.1f)         Fails.push_back("balance");
+                    // the user's key is intent: what its pose itself asks for (a joint excess, a lean) is allowed within the layer's 0.5 s
+                    // falloff of it; the refine must not add to it
+                    const auto Cmp = xanimation::CompareRealism(xanimation::MeasureRealismFrames(Rig, *pA, nB, nFa, float(FPSa)), OwnFrames, f0, f1, {}, fk, int(std::lround(0.5 * FPSb)));
+                    auto M = [&](const xanimation::realism_margin& m) { return m.m_Frame < 0 ? std::string("-") : std::format("{:.3f} vs {:.3f} at {:.2f} s", m.m_Edit, m.m_Clip, double(m.m_Frame) / FPSb); };
+                    Line = std::format("worst against the clip at the same moment - skate {} hip h/s, acceleration {} m/s^2, hips {} m/s^2, limits ({}) {} deg, balance [advisory] {} hip h"
+                        , M(Cmp.m_Skate), M(Cmp.m_Acc), M(Cmp.m_Hips), LimitsFrom, M(Cmp.m_Limit), M(Cmp.m_Balance));
+                    if (!bOwnLimits) Line += " (limits from the preset, not reviewed for this skeleton: advisory)";
+                    LastScore = 0;
+                    auto Fail = [&](const xanimation::realism_margin& m, float Floor, const char* pName) { if (m.m_Value > 0) { Fails.push_back(pName); LastScore += m.m_Value / Floor; } };
+                    const xanimation::realism_floors Fl;
+                    Fail(Cmp.m_Skate, Fl.m_Skate, "foot skate");
+                    Fail(Cmp.m_Acc, Fl.m_Acc, "acceleration");
+                    Fail(Cmp.m_Hips, Fl.m_Hips, "hips momentum");
+                    if (bOwnLimits) Fail(Cmp.m_Limit, Fl.m_Limit, "joint limits");
+                    Fail(Cmp.m_Balance, Fl.m_Balance, "balance");
                     return Fails;
                 };
                 auto Join = [](const std::vector<std::string>& V) { std::string S; for (const auto& s : V) S += (S.empty() ? "" : ", ") + s; return S; };
@@ -1725,6 +1788,7 @@ namespace xanim_package_editor
                     for (double r : { 0.5, 1.0, 2.0 }) if (r < Key || r < Dur - Key) Scopes.push_back({ std::min(r, Key), std::min(r, Dur - Key), std::format("+-{} s", r) });
                     Scopes.push_back({ Key, Dur - Key, "the whole clip" });
                     std::string Why;
+                    std::size_t Best = 0; float BestScore = 1e30f; std::string BestFails;
                     for (std::size_t i = 0; i < Scopes.size(); ++i)
                     {
                         const auto& S = Scopes[i];
@@ -1739,8 +1803,19 @@ namespace xanim_package_editor
                         const auto F = Judge(S.Lo, S.Hi, Line);
                         RefineNote += std::format("; scope {}: {} - {} [{}]", S.Name, F.empty() ? "passes" : "worse than the clip: " + Join(F), Line, Rep);
                         if (F.empty()) { RefineNote += std::format("; chosen scope: {}", S.Name); break; }
+                        if (LastScore < BestScore) { BestScore = LastScore; Best = i; BestFails = Join(F); }
                         Why = " (a smaller scope failed: " + Join(F) + ")";
-                        if (i + 1 == Scopes.size()) RefineNote += std::format("; chosen scope: {} (still worse than the clip: {})", S.Name, Join(F));
+                        if (i + 1 == Scopes.size())
+                        {   // no scope passes: the least worse one (wider is not better when the refine itself adds the fault)
+                            if (Best != i)
+                            {
+                                pOv->m_Layers[iLayer].m_Keys = KeysBefore; pOv->m_Layers[iLayer].m_Takes = TakesBefore;
+                                std::string Rep2, RErr2;
+                                if (!SuggestRefine(iLayer, C.m_Seed, Scopes[Best].Lo, Scopes[Best].Hi, std::format("refine after Suggest Pose at {:.2f} s, scope {} (no scope passed: the least worse)", Key, Scopes[Best].Name), FramesBefore, Rep2, RErr2))
+                                { pOv->m_Layers[iLayer].m_Keys = KeysBefore; pOv->m_Layers[iLayer].m_Takes = TakesBefore; RefineNote += "; refine skipped: " + RErr2; bRefined = false; break; }
+                            }
+                            RefineNote += std::format("; chosen scope: {} (no scope passes; the least worse: {})", Scopes[Best].Name, BestFails);
+                        }
                     }
                 }
             }
@@ -2365,6 +2440,9 @@ namespace xanim_package_editor
             if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "SuggestPoseAccept: bad arguments";
             if (xeditor::cmd_util::GetArg(m_Parser, m_hB, C) && std::from_chars(C.data(), C.data() + C.size(), iC).ec != std::errc()) return "SuggestPoseAccept: -Candidate is an index";
             std::string Rf; const bool bRefine = !(xeditor::cmd_util::GetArg(m_Parser, m_hC, Rf) && (Rf == "0" || Rf == "false"));
+            std::string Mw; double MaxW = 10.0;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Mw) && (std::from_chars(Mw.data(), Mw.data() + Mw.size(), MaxW).ec != std::errc() || MaxW < 1.0)) return "SuggestPoseAccept: -MaxWindow is seconds (at least 1)";
+            S.m_RefineMaxFrames = int(std::lround(std::min(MaxW, 10.0) * 30.0));
             return S.SuggestPoseAccept(iL, iC, bRefine);
         }
         case kind::layers_info: return S.LayersInfo();
