@@ -21,6 +21,7 @@
 #include "plugins/xretarget.plugin/source/xretarget_mapping.h"
 #include "dependencies/xAnimation/source/xanimation.h"
 #include "plugins/xanim_package.plugin/source/Editor/xanim_package_kimodo.h"
+#include "plugins/xanim_package.plugin/source/xanim_package_layers.h"
 
 #include <charconv>
 
@@ -48,7 +49,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info };
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info };
 
         session&    m_Session;
         kind        m_Kind;
@@ -71,6 +72,16 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Seed",    "Seed (default 1): another seed, another take", false, 1);
                 break;
             case kind::kimodo_accept: m_hA = m_Parser.addOption("Name", "The clip's file name (default: from the prompt)", false, 1); break;
+            case kind::layer_add:
+                m_hA = m_Parser.addOption("Source", "The import source's key (its path, as ListClips shows it)", true, 1);
+                m_hB = m_Parser.addOption("Clip",   "The clip there (its original name)", true, 1);
+                m_hC = m_Parser.addOption("Name",   "The layer's name", false, 1);
+                break;
+            case kind::layer_mask:
+                m_hA = m_Parser.addOption("Layer", "The layer's index in the selected clip", true, 1);
+                m_hB = m_Parser.addOption("Bone",  "The bone (its name): added with its branch, or removed when it is in the mask", true, 1);
+                m_hC = m_Parser.addOption("Only",  "1: this bone only (not its branch)", false, 1);
+                break;
             default: break;
             }
         }
@@ -110,6 +121,22 @@ namespace xanim_package_editor
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
+        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo;
+
+        // Layers (the layered edit mode): the compiler's layer-sources cache, the selected clip's live composition (same function as the compile)
+        std::vector<xanim_package_layers::source_frames> m_LayerSources;
+        std::vector<xmath::transform3>                  m_LayerComposed;        // the selected clip's layers composed now (source frames, before trim/downsample/root motion)
+        int                                             m_LayerComposedFPS = 30;
+        int                                             m_LayerComposedFrames = 0;
+        std::string                                     m_LayerSig;             // what m_LayerComposed was made from
+        xanim_package_layers::report                    m_LayerReport;
+        std::string                                     m_LayerError;
+        int                                             m_iLayer = -1;          // the layer the panel edits
+        int                                             m_iSolo = -1;           // a layer auditioned alone (with the clip below it): editor state only, never in the build
+        double                                          m_LayerComposeMs = 0;   // the last live recompose (the preview budget is < 100 ms)
+        bool                                            m_bLayerLive = true;    // the viewport shows the live composition (not the compiled clip)
+        bool                                            m_bMaskEdit = false;    // a click on a bone adds/removes it from the selected layer's mask
+        std::set<int>                                   m_MaskShown;            // the selected layer's masked bones (drawn selected)
 
         // Kimodo (text to motion): one generation at a time; its result previews until accepted or discarded
         struct kimodo_state
@@ -191,6 +218,9 @@ namespace xanim_package_editor
             , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName]")
             , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved). Usage: KimodoDiscard")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
+            , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
+            , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there. Usage: LayerMask -Layer n -Bone name [-Only 1]")
+            , m_LayersInfo    (m_Undo, *this, playback_cmd::kind::layers_info,     "LayersInfo",     "The selected clip's layers, the live composition's isolation report and its parity with the compiled clip. Usage: LayersInfo")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
@@ -202,6 +232,7 @@ namespace xanim_package_editor
 
             AddPanel("Clips",                dock::right,  [this] { RenderClips(); });
             AddPanel("Kimodo",               dock::right,  [this] { RenderKimodo(); });
+            AddPanel("Layers",               dock::right,  [this] { RenderLayers(); });
             if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value);
             AddPanel("AnimPackage Viewport", dock::center, [this] { RenderViewport(); }, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             AddPanel("Playback",             dock::bottom, [this] { RenderPlayback(); });
@@ -266,6 +297,11 @@ namespace xanim_package_editor
         {
             LetGo();
             m_ErrorMessage.clear();
+            {   // the layers' sources, as the last compile saw them (the live composition reads them)
+                int nBones = 0;
+                if (!xanim_package_layers::ReadSourcesCache(m_Document.m_LogPath + L"\\LayerSources.bin", m_LayerSources, nBones)) m_LayerSources.clear();
+                m_LayerSig.clear();
+            }
             auto* pDesc = Desc();
             if (!pDesc) { m_ErrorMessage = "The descriptor could not be read."; return; }
 
@@ -301,6 +337,346 @@ namespace xanim_package_editor
 
             m_bShowable = true;
             if (m_iSelectedSource >= 0) SelectDescriptorClip(m_iSelectedSource, m_iSelectedDescriptorClip);
+        }
+
+        //----------------------------------------------------------------------------------------
+        // Layers (the layered edit mode, L1c): the selected clip's layer stack, edited through SetProperty / ListOp (undoable, console
+        // parity), previewed live with the compiler's own composition (xanim_package_layers.h) on the compiler's source frames.
+        //----------------------------------------------------------------------------------------
+
+        xanim_package_desc::import_source* SelectedSource() noexcept
+        {
+            auto* pDesc = Desc();
+            return (pDesc && m_iSelectedSource >= 0 && m_iSelectedSource < int(pDesc->m_ImportSources.size())) ? &pDesc->m_ImportSources[m_iSelectedSource] : nullptr;
+        }
+        xanim_package_desc::clip* SelectedOv() noexcept
+        {
+            auto* pS = SelectedSource();
+            return (pS && m_iSelectedDescriptorClip >= 0 && m_iSelectedDescriptorClip < int(pS->m_Clips.size())) ? &pS->m_Clips[m_iSelectedDescriptorClip] : nullptr;
+        }
+        std::string LayersPath() const { return std::format("AnimPackage/ImportSources[G:{}]/Clips[G:{}]/Layers", m_iSelectedSource, m_iSelectedDescriptorClip); }
+        std::string LayerPath(int iLayer, const char* pField) const { return std::format("{}[G:{}]/{}", LayersPath(), iLayer, pField); }
+        void SetLayer(int iLayer, const char* pField, const std::string& Value, const std::string& Before) noexcept
+        {
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(LayerPath(iLayer, pField)), xeditor::Quote(Value), xeditor::Quote(Before)));
+        }
+        static std::string F(double v) { return std::format("{}", v); }
+
+        const xanim_package_layers::source_frames* FindLayerSource(const std::wstring& Key, const std::string& Clip) const
+        {
+            for (const auto& S : m_LayerSources) if (S.m_Key == Key && S.m_Clip == Clip) return &S;
+            return nullptr;
+        }
+
+        // Everything the composition depends on, as text: a change recomposes (cheap: a few layers)
+        static std::string LayerSignature(const xanim_package_desc::clip& C)
+        {
+            std::string S;
+            for (const auto& L : C.m_Layers)
+            {
+                S += std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", L.m_bEnabled, int(L.m_Mode), int(L.m_Reference), L.m_ReferenceTick, xstrtool::To(L.m_SourceKey), L.m_SourceClip
+                    , L.m_Start, L.m_End, L.m_TrimIn, L.m_TrimOut, L.m_Rate, L.m_bReverse, L.m_Weight, L.m_bRotation, L.m_bPosition, int(L.m_Root), L.m_Name);
+                for (const auto& K : L.m_WeightKeys) S += std::format("k{},{},{};", K.m_Tick, K.m_Value, K.m_bStep);
+                for (const auto& E : L.m_Mask) S += std::format("m{},{},{},{};", E.m_Bone, E.m_Value, E.m_bInherit, E.m_BlendDepth);
+            }
+            return S;
+        }
+
+        // The selected clip's live composition, remade when its layers changed (or the sources were reloaded)
+        void UpdateLiveLayers() noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pS = SelectedSource(); auto* pDesc = Desc();
+            const bool bAny = pOv && std::any_of(pOv->m_Layers.begin(), pOv->m_Layers.end(), [](const auto& L) { return L.m_bEnabled; });
+            if (!bAny || !pDesc) { m_LayerComposed.clear(); m_LayerSig.clear(); m_LayerError.clear(); m_LayerReport = {}; return; }
+            if (m_iSolo >= int(pOv->m_Layers.size())) m_iSolo = -1;
+            const std::string Sig = std::format("{}:{}:{}:{}:{}", m_iSelectedSource, m_iSelectedDescriptorClip, m_LayerSources.size(), m_iSolo, LayerSignature(*pOv));
+            if (Sig == m_LayerSig) return;
+            m_LayerSig = Sig; m_LayerComposed.clear(); m_LayerError.clear();
+            const auto* pBase = FindLayerSource(pS->key(), pOv->m_OriginalName);
+            if (!pBase) { m_LayerError = m_LayerSources.empty() ? "no layer sources yet: compile the package once" : "this clip is not in the layer sources: compile the package"; return; }
+            xanim_package_desc::clip Audition;                              // solo: a copy with only that layer on (the descriptor is untouched)
+            const xanim_package_desc::clip* pUse = pOv;
+            if (m_iSolo >= 0) { Audition = *pOv; for (int i = 0; i < int(Audition.m_Layers.size()); ++i) Audition.m_Layers[i].m_bEnabled = i == m_iSolo; pUse = &Audition; }
+            std::vector<xmath::transform3> Out;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool bOk = xanim_package_layers::Compose(*pBase, *pUse, pDesc->m_ResolvedSkeletonBones, [this](const std::wstring& K, const std::string& C) { return FindLayerSource(K, C); }, Out, m_LayerReport, m_LayerError);
+            m_LayerComposeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (!bOk) return;
+            m_LayerComposed = std::move(Out); m_LayerComposedFPS = pBase->m_FPS; m_LayerComposedFrames = pBase->m_nFrames;
+        }
+        bool LiveLayers() const noexcept { return m_bLayerLive && !m_LayerComposed.empty(); }
+
+        // The live pose at the playhead: the composed source frames (blended between the two nearest), parent * local like a compiled clip
+        void EvaluateLiveLayers(const xskeleton::skeleton& Skeleton) noexcept
+        {
+            const auto Bones = Skeleton.getBones();
+            const int nB = int(Bones.size());
+            if (int(m_LayerComposed.size()) != m_LayerComposedFrames * nB || m_LayerComposedFrames <= 0) { m_PoseWorlds = m_RestWorlds; return; }
+            const float FT = std::max(0.0f, m_TimeSeconds) * float(m_LayerComposedFPS);
+            const int A = std::clamp(int(FT), 0, m_LayerComposedFrames - 1), B = std::min(A + 1, m_LayerComposedFrames - 1);
+            const float T = FT - std::floor(FT);
+            m_PoseWorlds.resize(nB);
+            for (int i = 0; i < nB; ++i)
+            {
+                const auto Local = xmath::transform3::fromBlend(m_LayerComposed[std::size_t(A) * nB + i], m_LayerComposed[std::size_t(B) * nB + i], T).toMatrix();
+                m_PoseWorlds[i] = Bones[i].m_iParent < 0 ? Local : m_PoseWorlds[Bones[i].m_iParent] * Local;
+            }
+        }
+
+        // The compiled clip against the live composition, frame by frame (only when the clip has no trim / downsample / root motion: then the
+        // two are the same frames). Returns a sentence.
+        std::string LayersParity() noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pPackage = Package(); auto* pClip = SelectedClip();
+            if (!pOv || m_LayerComposed.empty()) return "parity: no live composition";
+            if (!pPackage || !pClip) return "parity: the clip is not compiled";
+            if (pOv->m_DownsampleFPS > 0 || pOv->m_TrimStartFrame >= 0 || pOv->m_TrimEndFrame >= 0 || pOv->m_RootMotion != xanim_package::root_motion_mode::NONE)
+                return "parity: skipped (the clip trims, downsamples or extracts root motion after the layers)";
+            const int nB = int(pPackage->m_nBones);
+            if (pClip->m_nFrames != m_LayerComposedFrames) return std::format("parity: frame counts differ (compiled {}, live {}): compile the package", pClip->m_nFrames, m_LayerComposedFrames);
+            float Max = 0.0f; int nDiff = 0;
+            for (int f = 0; f < pClip->m_nFrames; ++f)
+            {
+                const auto Frame = pPackage->getClipFrame(m_iSelectedClip, f);
+                for (int b = 0; b < nB; ++b)
+                {
+                    const auto& C = Frame[b]; const auto& L = m_LayerComposed[std::size_t(f) * nB + b];
+                    const float D = std::max({ std::abs(C.m_Position.m_X - L.m_Position.m_X), std::abs(C.m_Position.m_Y - L.m_Position.m_Y), std::abs(C.m_Position.m_Z - L.m_Position.m_Z)
+                                             , std::abs(C.m_Rotation.m_X - L.m_Rotation.m_X), std::abs(C.m_Rotation.m_Y - L.m_Rotation.m_Y), std::abs(C.m_Rotation.m_Z - L.m_Rotation.m_Z), std::abs(C.m_Rotation.m_W - L.m_Rotation.m_W) });
+                    Max = std::max(Max, D); nDiff += D > 0.0f;
+                }
+            }
+            return std::format("parity: live vs compiled over {} frames: {} values differ, max difference {:.9g}", pClip->m_nFrames, nDiff, Max);
+        }
+
+        std::string LayerAdd(const std::wstring& Key, const std::string& Clip, std::string Name) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv) return "LayerAdd: select a clip first (SelectClip)";
+            if (pDesc->findImportSource(Key) == -1) return "LayerAdd: that source is not one of this package's import sources";
+            const int n = int(pOv->m_Layers.size());
+            std::uint64_t Id = 1;
+            for (const auto& S : pDesc->m_ImportSources) for (const auto& C : S.m_Clips) for (const auto& L : C.m_Layers) Id = std::max(Id, L.m_Id + 1);
+            if (Name.empty()) Name = std::format("{} ({})", Clip, std::filesystem::path(Key).stem().string());
+            xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(LayersPath() + "[]"), xeditor::Quote(std::to_string(n + 1)), xeditor::Quote(std::to_string(n))));
+            SetLayer(n, "Id", std::to_string(Id), "0");
+            SetLayer(n, "Name", Name, "");
+            SetLayer(n, "SourceKey", xstrtool::To(Key), "");
+            SetLayer(n, "SourceClip", Clip, "");
+            m_iLayer = n;
+            return std::format("LayerAdd: layer {} '{}' (id {}); its mask is empty: add bones (LayerMask) for it to do anything", n, Name, Id);
+        }
+
+        // Adds the bone (with its branch, or alone) to the layer's mask, or removes its entry when it has one
+        std::string LayerMaskToggle(int iLayer, const std::string& Bone, bool bOnly) noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "LayerMask: no such layer in the selected clip";
+            const auto& Mask = pOv->m_Layers[iLayer].m_Mask;
+            for (int e = 0; e < int(Mask.size()); ++e)
+                if (Mask[e].m_Bone == Bone)
+                {
+                    xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iLayer, "Mask")), e));
+                    return std::format("LayerMask: '{}' removed from layer {}'s mask", Bone, iLayer);
+                }
+            const int n = int(Mask.size());
+            SetLayer(iLayer, "Mask[]", std::to_string(n + 1), std::to_string(n));
+            SetLayer(iLayer, std::format("Mask[G:{}]/Bone", n).c_str(), Bone, "");
+            if (bOnly) SetLayer(iLayer, std::format("Mask[G:{}]/Inherit", n).c_str(), "false", "true");
+            return std::format("LayerMask: '{}' added to layer {}'s mask{}", Bone, iLayer, bOnly ? " (this bone only)" : " (with its branch)");
+        }
+
+        std::string LayersInfo() noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) return "LayersInfo: select a clip first";
+            UpdateLiveLayers();
+            std::string T = std::format("clip '{}': {} layer(s); layer sources {} clip(s){}\n", pOv->m_Name, pOv->m_Layers.size(), m_LayerSources.size(), m_LayerError.empty() ? "" : "; " + m_LayerError);
+            for (int i = 0; i < int(pOv->m_Layers.size()); ++i)
+            {
+                const auto& L = pOv->m_Layers[i];
+                T += std::format("  layer {} id {} '{}' {} {} source {}:{} weight {} keys {} mask {} entries [", i, L.m_Id, L.m_Name, L.m_bEnabled ? "on" : "off"
+                    , L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "additive" : "override", xstrtool::To(L.m_SourceKey), L.m_SourceClip, L.m_Weight, L.m_WeightKeys.size(), L.m_Mask.size());
+                for (const auto& E : L.m_Mask) T += std::format(" {}{}", E.m_Bone, E.m_bInherit ? "+" : "");
+                T += " ]\n";
+            }
+            for (const auto& R : m_LayerReport.m_Layers) T += std::format("  live '{}': {} bones in its mask, bone-frames written {}, outside its mask {}\n", R.m_Name, R.m_nMaskBones, R.m_Written, R.m_WrittenOutside);
+            T += std::format("  live recompose {:.3f} ms{}\n", m_LayerComposeMs, m_iSolo >= 0 ? std::format(" (solo layer {}: editor only)", m_iSolo) : std::string{});
+            if (!m_LayerComposed.empty())
+                T += std::format("  live isolation: bone-frames changed outside every mask {}{}; root travel change {:.6f} m\n  {}\n", m_LayerReport.m_ChangedOutside
+                    , m_LayerReport.m_ChangedOutside ? " (first: " + m_LayerReport.m_FirstOutside + ")" : std::string{}, m_LayerReport.m_MaxRootMove, LayersParity());
+            return T;
+        }
+
+        // The selected layer's mask, as the bones it touches (drawn selected in the viewport)
+        void UpdateMaskShown() noexcept
+        {
+            m_MaskShown.clear();
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || !pDesc || m_iLayer < 0 || m_iLayer >= int(pOv->m_Layers.size())) return;
+            const auto M = xanim_package_layers::LayerMask(pOv->m_Layers[m_iLayer], pDesc->m_ResolvedSkeletonBones);
+            for (int b = 0; b < int(M.size()); ++b) if (M[b] > 0.0f) m_MaskShown.insert(b);
+        }
+
+        // A field edited in place: the widget edits a buffer while active (the descriptor value is re-read every frame) and the change is ONE
+        // SetProperty when the edit ends. Returns true with the new value then.
+        ImGuiID m_ActiveEdit = 0; double m_ActiveValue = 0;
+        bool EditNumber(const char* pLabel, double Shown, double& Out, int Kind /*0 int, 1 float, 2 slider 0..1*/) noexcept
+        {
+            const ImGuiID Id = ImGui::GetID(pLabel);
+            const bool bMine = m_ActiveEdit == Id;
+            bool bDone = false;
+            if (Kind == 0) { int V = int(bMine ? m_ActiveValue : Shown); ImGui::InputInt(pLabel, &V, 0); m_ActiveValue = ImGui::IsItemActive() ? V : m_ActiveValue; if (ImGui::IsItemDeactivatedAfterEdit()) { Out = V; bDone = true; } }
+            else { float V = float(bMine ? m_ActiveValue : Shown); if (Kind == 1) ImGui::InputFloat(pLabel, &V, 0, 0, "%.3f"); else ImGui::SliderFloat(pLabel, &V, 0.0f, 1.0f, "%.2f");
+                   m_ActiveValue = ImGui::IsItemActive() ? V : m_ActiveValue; if (ImGui::IsItemDeactivatedAfterEdit()) { Out = V; bDone = true; } }
+            if (ImGui::IsItemActive()) m_ActiveEdit = Id; else if (bMine) m_ActiveEdit = 0;
+            return bDone;
+        }
+
+        // a frame number of the clip's source <-> ticks (the panel shows frames)
+        int    TicksToFrame(std::int64_t T) const { return int(std::llround(double(T) * m_LayerComposedFPS / double(xanimation::ticks_per_second_v))); }
+        std::int64_t FrameToTicks(int F) const { return std::llround(double(F) * double(xanimation::ticks_per_second_v) / std::max(1, m_LayerComposedFPS)); }
+
+        void RenderLayers() noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || !pDesc) { ImGui::TextDisabled("Select a clip (in Clips) to edit its layers."); return; }
+            UpdateLiveLayers();
+            ImGui::Text("Clip '%s'", pOv->m_Name.c_str());
+            ImGui::SameLine(); ImGui::Checkbox("Live", &m_bLayerLive);
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("On: the viewport shows the layers composed now (the compile's own function, on the source frames before\nthe clip's trim / downsample / root motion). Off: the compiled clip.");
+            ImGui::SameLine(); ImGui::Checkbox("Edit mask", &m_bMaskEdit);
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("A click on a bone adds it (with its branch) to the selected layer's mask, or removes it.\nShift-click: this bone only.");
+            if (!m_LayerError.empty()) ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "%s", m_LayerError.c_str());
+            ImGui::Separator();
+
+            // + Layer: any clip of this package's import sources (its source frames, not a compiled output: no cycles)
+            if (ImGui::BeginCombo("##addlayer", "+ Layer from a clip...", ImGuiComboFlags_HeightLarge))
+            {
+                for (const auto& S : pDesc->m_ImportSources)
+                    for (const auto& C : S.m_Clips)
+                    {
+                        const auto Label = std::format("{}  ({})", C.m_OriginalName, xstrtool::To(S.key()));
+                        if (ImGui::Selectable(Label.c_str())) LayerAdd(S.key(), C.m_OriginalName, {});
+                    }
+                ImGui::EndCombo();
+            }
+
+            constexpr ImGuiTableFlags TF = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit;
+            const int n = int(pOv->m_Layers.size());
+            if (n && ImGui::BeginTable("###Layers", 5, TF))
+            {
+                ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+                ImGui::TableSetupColumn("Layer (top first)", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Mode", ImGuiTableColumnFlags_WidthFixed, 74.0f);
+                ImGui::TableSetupColumn("Weight", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                ImGui::TableSetupColumn("##ops", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+                ImGui::TableHeadersRow();
+                for (int i = n - 1; i >= 0; --i)          // top layer first, like every layer list
+                {
+                    const auto& L = pOv->m_Layers[i];
+                    ImGui::PushID(i); ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    { bool V = L.m_bEnabled; if (ImGui::Checkbox("##on", &V)) SetLayer(i, "Enabled", V ? "true" : "false", L.m_bEnabled ? "true" : "false"); }
+                    ImGui::TableSetColumnIndex(1);
+                    if (ImGui::Selectable(L.m_Name.empty() ? "(unnamed)" : L.m_Name.c_str(), m_iLayer == i)) m_iLayer = i;
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    { int M = int(L.m_Mode); if (ImGui::Combo("##mode", &M, "Override\0Additive\0")) SetLayer(i, "Mode", M ? "Additive" : "Override", L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "Additive" : "Override"); }
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (double W; EditNumber("##w", L.m_Weight, W, 2)) SetLayer(i, "Weight", F(W), F(L.m_Weight));
+                    ImGui::TableSetColumnIndex(4);
+                    {
+                        const bool bSolo = m_iSolo == i;
+                        if (bSolo) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.6f, 0.1f, 1.0f));
+                        if (ImGui::SmallButton("S")) m_iSolo = bSolo ? -1 : i;
+                        if (bSolo) ImGui::PopStyleColor();
+                        if (ImGui::IsItemHovered()) xeditor::hint::Text("Solo: see this layer alone on the clip (the preview only: never saved, never in the build)");
+                        ImGui::SameLine();
+                    }
+                    ImGui::BeginDisabled(i == n - 1); if (ImGui::SmallButton("Up")) { xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Move -Index {} -ToIndex {}", xeditor::Quote(LayersPath()), i, i + 1)); m_iLayer = i + 1; } ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("X")) { xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayersPath()), i)); if (m_iLayer >= i) --m_iLayer; }
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text("Delete this layer (undoable)");
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            if (!n) { ImGui::TextDisabled("No layers: this clip compiles exactly as imported."); return; }
+            if (m_iLayer < 0 || m_iLayer >= n) m_iLayer = n - 1;
+
+            // the selected layer's details
+            const auto& L = pOv->m_Layers[m_iLayer];
+            ImGui::Separator();
+            ImGui::Text("Layer %d: %s:%s", m_iLayer, xstrtool::To(std::filesystem::path(L.m_SourceKey).filename().wstring()).c_str(), L.m_SourceClip.c_str());
+            { bool R = L.m_bRotation; if (ImGui::Checkbox("Rotations", &R)) SetLayer(m_iLayer, "Rotation", R ? "true" : "false", L.m_bRotation ? "true" : "false"); }
+            ImGui::SameLine(); { bool P = L.m_bPosition; if (ImGui::Checkbox("Positions", &P)) SetLayer(m_iLayer, "Position", P ? "true" : "false", L.m_bPosition ? "true" : "false"); }
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("The channels the layer brings. The root's position (its travel) is never taken from a layer.");
+            auto FrameField = [&](const char* pLabel, const char* pField, std::int64_t Value)        // shown in frames, stored in ticks (-1 stays -1)
+            {
+                ImGui::SetNextItemWidth(90.0f);
+                if (double V; EditNumber(pLabel, Value < 0 ? -1.0 : double(TicksToFrame(Value)), V, 0))
+                    SetLayer(m_iLayer, pField, std::to_string(V < 0 ? -1 : FrameToTicks(int(V))), std::to_string(Value));
+            };
+            FrameField("Start", "Start", L.m_Start); ImGui::SameLine(); FrameField("End (-1: clip end)", "End", L.m_End);
+            FrameField("Trim in", "TrimIn", L.m_TrimIn); ImGui::SameLine(); FrameField("Trim out (-1: source end)", "TrimOut", L.m_TrimOut);
+            ImGui::TextDisabled("(frames at %d fps)", m_LayerComposedFPS);
+            ImGui::SetNextItemWidth(90.0f);
+            if (double R; EditNumber("Rate", L.m_Rate, R, 1)) SetLayer(m_iLayer, "Rate", F(std::max(0.0, R)), F(L.m_Rate));
+            ImGui::SameLine(); { bool V = L.m_bReverse; if (ImGui::Checkbox("Reverse", &V)) SetLayer(m_iLayer, "Reverse", V ? "true" : "false", L.m_bReverse ? "true" : "false"); }
+
+            // weight keys
+            ImGui::Separator();
+            ImGui::Text("Weight keys (%d)", int(L.m_WeightKeys.size()));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Key at playhead"))
+            {
+                const int k = int(L.m_WeightKeys.size());
+                SetLayer(m_iLayer, "WeightKeys[]", std::to_string(k + 1), std::to_string(k));
+                SetLayer(m_iLayer, std::format("WeightKeys[G:{}]/Tick", k).c_str(), std::to_string(xanim_package_layers::ToTick(m_TimeSeconds)), "0");
+                SetLayer(m_iLayer, std::format("WeightKeys[G:{}]/Value", k).c_str(), F(L.m_Weight), "1");
+            }
+            for (int k = 0; k < int(L.m_WeightKeys.size()); ++k)
+            {
+                const auto& K = L.m_WeightKeys[k];
+                ImGui::PushID(1000 + k);
+                ImGui::Text("%.2fs", xanimation::TicksToSeconds(K.m_Tick)); ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.0f);
+                if (double V; EditNumber("##kv", K.m_Value, V, 2)) SetLayer(m_iLayer, std::format("WeightKeys[G:{}]/Value", k).c_str(), F(V), F(K.m_Value));
+                ImGui::SameLine(); if (ImGui::SmallButton("X")) xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(m_iLayer, "WeightKeys")), k));
+                ImGui::PopID();
+            }
+
+            // mask entries
+            ImGui::Separator();
+            ImGui::Text("Mask (%d entries)", int(L.m_Mask.size()));
+            if (L.m_Mask.empty()) ImGui::TextDisabled("Empty: the layer touches nothing. Tick 'Edit mask' and click bones.");
+            for (int e = 0; e < int(L.m_Mask.size()); ++e)
+            {
+                const auto& E = L.m_Mask[e];
+                ImGui::PushID(2000 + e);
+                ImGui::Text("%s%s", E.m_Bone.c_str(), E.m_bInherit ? " (+branch)" : ""); ImGui::SameLine();
+                ImGui::SetNextItemWidth(90.0f);
+                if (double V; EditNumber("##mv", E.m_Value, V, 2)) SetLayer(m_iLayer, std::format("Mask[G:{}]/Value", e).c_str(), F(V), F(E.m_Value));
+                ImGui::SameLine(); ImGui::SetNextItemWidth(60.0f);
+                if (double D; EditNumber("depth", E.m_BlendDepth, D, 0)) SetLayer(m_iLayer, std::format("Mask[G:{}]/BlendDepth", e).c_str(), std::to_string(std::max(0, int(D))), std::to_string(E.m_BlendDepth));
+                if (ImGui::IsItemHovered()) xeditor::hint::Text("Blend depth: 0 = the whole branch at the value; N = it ramps in over N bones down the branch");
+                ImGui::SameLine(); if (ImGui::SmallButton("X")) xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(m_iLayer, "Mask")), e));
+                ImGui::PopID();
+            }
+
+            // the live isolation report
+            if (!m_LayerComposed.empty())
+            {
+                ImGui::Separator();
+                ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+                for (const auto& R : m_LayerReport.m_Layers) ImGui::TextDisabled("'%s': %d bones in its mask, %zu bone-frames written (outside its mask: %zu)", R.m_Name.c_str(), R.m_nMaskBones, R.m_Written, R.m_WrittenOutside);
+                const bool bLeak = m_LayerReport.m_ChangedOutside > 0;
+                ImGui::TextColored(bLeak ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f) : ImVec4(0.5f, 0.85f, 0.5f, 1.0f), "Outside every mask: %zu bone-frames changed; root travel change %.4f m", m_LayerReport.m_ChangedOutside, m_LayerReport.m_MaxRootMove);
+                ImGui::TextDisabled("Composed in %.2f ms%s", m_LayerComposeMs, m_iSolo >= 0 ? "  (SOLO: one layer auditioned; the build uses every enabled layer)" : "");
+                ImGui::PopTextWrapPos();
+            }
         }
 
         //----------------------------------------------------------------------------------------
@@ -795,7 +1171,9 @@ namespace xanim_package_editor
         void EvaluatePose(const xskeleton::skeleton& Skeleton) noexcept
         {
             auto* pPackage = Package();
-            if (auto* pClip = SelectedClip())
+            UpdateLiveLayers();
+            if (LiveLayers()) EvaluateLiveLayers(Skeleton);        // the selected clip's layers composed now (what the compile will store)
+            else if (auto* pClip = SelectedClip())
             {
                 xgpu::tools::editors::ComputeAnimatedBoneWorlds(Skeleton, *pPackage, m_iSelectedClip, m_TimeSeconds, m_PoseWorlds);
                 if (pClip->m_RootMotionMode != xanim_package::root_motion_mode::NONE)
@@ -847,8 +1225,18 @@ namespace xanim_package_editor
 
             // Play / pause is the AnimPackage/Preview/PlayPause action (P; Space belongs to the drawer).
             EvaluatePose(*pSkeleton);
-            const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSkeleton, .m_Bones = m_PoseBones };
+            UpdateMaskShown();
+            const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSkeleton, .m_Bones = m_PoseBones, .m_pSelected = m_MaskShown.empty() ? nullptr : &m_MaskShown };
             m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
+
+            // mask editing: a click on a bone adds it (with its branch; Shift: alone) to the selected layer's mask, or removes it
+            if (m_bMaskEdit && m_Viewport.Over() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
+            {
+                int iBone = -1; float T = 0;
+                auto* pDesc = Desc();
+                if (pDesc && m_Viewport.PickBone(Item, ImGui::GetMousePos(), iBone, T) && iBone >= 0 && iBone < int(pDesc->m_ResolvedSkeletonBones.m_Bones.size()))
+                    LayerMaskToggle(m_iLayer, pDesc->m_ResolvedSkeletonBones.m_Bones[iBone].m_Name, ImGui::GetIO().KeyShift);
+            }
         }
 
         void RenderPlayback() noexcept
@@ -982,6 +1370,22 @@ namespace xanim_package_editor
             return S.KimodoAccept(Name);
         }
         case kind::kimodo_discard: S.KimodoDiscard(); return "KimodoDiscard: discarded";
+        case kind::layer_add:
+        {
+            std::string Src, Clip, Name;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Src) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Clip)) return "LayerAdd: -Source and -Clip are required";
+            xeditor::cmd_util::GetArg(m_Parser, m_hC, Name);
+            return S.LayerAdd(xstrtool::To(Src), Clip, Name);
+        }
+        case kind::layer_mask:
+        {
+            std::string L, Bone, Only; int iL = -1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Bone) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "LayerMask: bad arguments";
+            xeditor::cmd_util::GetArg(m_Parser, m_hC, Only);
+            S.m_iLayer = iL;
+            return S.LayerMaskToggle(iL, Bone, Only == "1" || Only == "true");
+        }
+        case kind::layers_info: return S.LayersInfo();
         case kind::kimodo_info:
         {
             auto* pDesc = S.Desc();
