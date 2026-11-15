@@ -8,6 +8,7 @@
 #include "../xanim_package_descriptor.h"
 #include "plugins/xretarget.plugin/source/xretarget_mapping.h"
 #include "dependencies/xAnimation/source/xanimation.h"
+#include "plugins/xskeleton.plugin/source/xskeleton_joint_evidence.h"
 #include "../xanim_package_layers.h"
 #include "../xanim_package.h"
 #include "../xanim_package_details.h"
@@ -736,6 +737,22 @@ namespace xanim_package_compiler
             for (const auto& S : m_SourceFrames)
                 if (static_cast<int>(S.m_Frames.size()) == S.m_nFrames * N) { All.insert(All.end(), S.m_Frames.begin(), S.m_Frames.end()); nFrames += S.m_nFrames; }
             if (All.empty()) return;
+            // the evidence the skeleton's "Analyze clips" reads (every clip's local rotations, keyed by the skeleton and its bone names)
+            {
+                xskeleton_joint_evidence::evidence E;
+                E.m_Skeleton = m_Descriptor.m_SkeletonRef.m_Instance.m_Value;
+                for (const auto& B : Manifest.m_Bones) E.m_Bones.push_back(B.m_Name);
+                for (const auto& S : m_SourceFrames)
+                {
+                    if (static_cast<int>(S.m_Frames.size()) != S.m_nFrames * N) continue;
+                    auto& C = E.m_Clips.emplace_back();
+                    C.m_Name = S.m_Clip; C.m_nFrames = S.m_nFrames;
+                    C.m_Rotations.reserve(S.m_Frames.size());
+                    for (const auto& T : S.m_Frames) C.m_Rotations.push_back(T.m_Rotation);
+                }
+                if (!xskeleton_joint_evidence::Write(std::format(L"{}\\JointEvidence.bin", m_ResourceLogPath), E))
+                    LogMessage(xresource_pipeline::msg_type::WARNING, "JointEvidence.bin could not be written: the skeleton's Analyze clips will not see this package");
+            }
             std::vector<xanimation::joint_limit> L(N);
             std::vector<xanimation::frame_confidence> Conf(N);
             constexpr float D = 180.0f / 3.14159265f;
