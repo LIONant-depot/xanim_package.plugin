@@ -59,6 +59,12 @@ namespace xanim_package_desc
     , xproperty::settings::enum_item("From layer",    layer_root::FROM_LAYER)
     };
 
+    enum class layer_space : std::uint8_t { LOCAL, SKELETON_MODEL };
+    static constexpr auto layer_space_v = std::array
+    { xproperty::settings::enum_item("Local",          layer_space::LOCAL)
+    , xproperty::settings::enum_item("Skeleton model", layer_space::SKELETON_MODEL)
+    };
+
     // A bone entry of a layer's mask: this bone (and, inheriting, its descendants until a nearer entry) at Value; BlendDepth > 0 ramps the
     // value in down the branch: Value * min(1, (depth + 1) / BlendDepth). Nothing listed = the layer touches nothing.
     struct layer_mask_entry
@@ -115,6 +121,7 @@ namespace xanim_package_desc
         bool                m_bRotation   = true;       // the channels the layer brings
         bool                m_bPosition   = false;
         layer_root          m_Root        = layer_root::INHERIT_BELOW;
+        layer_space         m_Space       = layer_space::LOCAL;     // override rotations: per bone (Local) or relative to the skeleton (a masked arm keeps the layer's orientation)
 
         XPROPERTY_DEF
         ( "Layer", clip_layer
@@ -138,6 +145,7 @@ namespace xanim_package_desc
         , obj_member<"Rotation",      &clip_layer::m_bRotation >
         , obj_member<"Position",      &clip_layer::m_bPosition >
         , obj_member<"Root",          &clip_layer::m_Root, member_enum_span<layer_root_v> >
+        , obj_member<"Space",         &clip_layer::m_Space, member_enum_span<layer_space_v> >
         )
     };
     XPROPERTY_REG(clip_layer)

@@ -80,6 +80,8 @@ namespace xanim_package_layers
         if (int(Base.m_Frames.size()) != nFrames * nSkel) { Error = "the source frames do not match the skeleton"; return false; }
         int iRoot = 0;
         for (int s = 0; s < nSkel; ++s) if (Bones[s].m_iParent < 0) { iRoot = s; break; }
+        std::vector<std::int32_t> Parents(nSkel);
+        for (int s = 0; s < nSkel; ++s) Parents[s] = Bones[s].m_iParent;
 
         struct prepared
         {
@@ -141,6 +143,8 @@ namespace xanim_package_layers
                 A.m_pReference = A.m_Mode == xanimation::layer_mode::ADDITIVE ? &P.m_Reference : nullptr;
                 A.m_Root       = P.m_pDesc->m_Root == xanim_package_desc::layer_root::FROM_LAYER ? xanimation::root_policy::FROM_LAYER : xanimation::root_policy::INHERIT_BELOW;
                 A.m_RootBone   = iRoot;
+                A.m_Space      = P.m_pDesc->m_Space == xanim_package_desc::layer_space::SKELETON_MODEL ? xanimation::rotation_space::SKELETON_MODEL : xanimation::rotation_space::LOCAL;
+                A.m_Parents    = Parents;
                 xanimation::ApplyLayer(Pose, Sample, A, &Written);
                 for (int s = 0; s < nSkel; ++s) if (Written[s]) { ++P.m_Written; if (P.m_Mask[s] <= 0.0f) ++P.m_WrittenOutside; }
             }

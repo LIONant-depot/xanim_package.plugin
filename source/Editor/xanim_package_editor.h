@@ -374,6 +374,7 @@ namespace xanim_package_editor
             std::string S;
             for (const auto& L : C.m_Layers)
             {
+                S += std::format("{}|", int(L.m_Space));
                 S += std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", L.m_bEnabled, int(L.m_Mode), int(L.m_Reference), L.m_ReferenceTick, xstrtool::To(L.m_SourceKey), L.m_SourceClip
                     , L.m_Start, L.m_End, L.m_TrimIn, L.m_TrimOut, L.m_Rate, L.m_bReverse, L.m_Weight, L.m_bRotation, L.m_bPosition, int(L.m_Root), L.m_Name);
                 for (const auto& K : L.m_WeightKeys) S += std::format("k{},{},{};", K.m_Tick, K.m_Value, K.m_bStep);
@@ -613,6 +614,11 @@ namespace xanim_package_editor
             { bool R = L.m_bRotation; if (ImGui::Checkbox("Rotations", &R)) SetLayer(m_iLayer, "Rotation", R ? "true" : "false", L.m_bRotation ? "true" : "false"); }
             ImGui::SameLine(); { bool P = L.m_bPosition; if (ImGui::Checkbox("Positions", &P)) SetLayer(m_iLayer, "Position", P ? "true" : "false", L.m_bPosition ? "true" : "false"); }
             if (ImGui::IsItemHovered()) xeditor::hint::Text("The channels the layer brings. The root's position (its travel) is never taken from a layer.");
+            {
+                int Sp = int(L.m_Space); ImGui::SetNextItemWidth(150.0f);
+                if (ImGui::Combo("Rotation space", &Sp, "Local\0Skeleton model\0")) SetLayer(m_iLayer, "Space", Sp ? "Skeleton model" : "Local", L.m_Space == xanim_package_desc::layer_space::SKELETON_MODEL ? "Skeleton model" : "Local");
+                if (ImGui::IsItemHovered()) xeditor::hint::Text("Override rotations. Local: each bone keeps its pose relative to its parent (a masked arm follows the body below).\nSkeleton model: relative to the character, so a masked arm keeps the layer's orientation whatever the spine below does\n(not a world lock; additive layers are always local).");
+            }
             auto FrameField = [&](const char* pLabel, const char* pField, std::int64_t Value)        // shown in frames, stored in ticks (-1 stays -1)
             {
                 ImGui::SetNextItemWidth(90.0f);
