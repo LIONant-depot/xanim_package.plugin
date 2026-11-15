@@ -1359,7 +1359,10 @@ namespace xanim_package_editor
         // absolute keys every 3 frames on the same layer (rotations of the keyable bones + the hips' position) with the window's edges keyed
         // at the pose below (neutral), so the layer joins the clip exactly there. Writes into the layer directly: the caller makes it part of
         // its one undo step. Report: skate in contact and acceleration in the window, before and after; residuals; time.
-        bool SuggestRefine(int iLayer, int Seed, std::string& Report, std::string& Err) noexcept
+        // Scope: [Key - Lo, Key + Hi] seconds (the adaptive caller grows it). Every other key of this layer inside the scope is an anchor:
+        // a full-body constraint, kept exactly (never rewritten), and the blend meets it. The Kimodo window is stored as a take
+        // (Cache\KimodoTakes\<package>\) and listed on the layer (provenance).
+        bool SuggestRefine(int iLayer, int Seed, double Lo, double Hi, const std::string& Why, const std::vector<xmath::transform3>& Own, std::string& Report, std::string& Err) noexcept
         {
             using clock = std::chrono::steady_clock;
             const auto t0 = clock::now();
@@ -1389,9 +1392,24 @@ namespace xanim_package_editor
             if (Feet[0] < 0 || Feet[1] < 0) { Err = "the feet were not recognized from the bone names"; return false; }
             const int iHips = m_Suggest.m_iHips;
 
-            // the window: 2 s at 30 fps around the key; refined: +-R frames
-            constexpr int W = 60, K = 30, R = 15, Step = 1;      // every frame keyed (the feet held between keys too)
+            // the window at 30 fps: the scope [A, B] around the key K plus a 0.5 s margin each side; every frame keyed (the feet held)
+            constexpr int Mg = 15, Step = 1;
+            int Rl = std::max(2, int(std::lround(Lo * 30.0))), Rh = std::max(2, int(std::lround(Hi * 30.0)));
+            // ponytail: one Kimodo window, at most 10 s (300 frames); a longer scope is cut around the key - stitch overlapping windows when
+            // clips get longer than that
+            if (Rl + Rh + 2 * Mg + 1 > 300) { const double s = double(300 - 2 * Mg - 1) / double(Rl + Rh); Rl = int(Rl * s); Rh = int(Rh * s); }
+            const int W = Rl + Rh + 2 * Mg + 1, K = Mg + Rl, A = K - Rl, B = K + Rh;
             const double Key = m_Suggest.m_Time;
+            // the layer's other keys inside the scope: anchors (kept, constrained, met by the blend)
+            std::set<std::int64_t> UserTicks; std::vector<int> Anchors = { A, K, B };
+            for (const auto& k : pOv->m_Layers[iLayer].m_Keys)
+            {
+                const int f = K + int(std::lround((double(k.m_Tick) / double(xanim_package_layers::ToTick(1.0)) - Key) * 30.0));
+                if (std::abs(double(k.m_Tick) / double(xanim_package_layers::ToTick(1.0)) - Key) < 1e-6) continue;   // the accepted key
+                if (f <= A || f >= B) continue;
+                UserTicks.insert(k.m_Tick); Anchors.push_back(f);
+            }
+            std::sort(Anchors.begin(), Anchors.end()); Anchors.erase(std::unique(Anchors.begin(), Anchors.end()), Anchors.end());
             std::vector<xmath::transform3> Win(std::size_t(W) * nB);
             for (int i = 0; i < W; ++i)
             {
@@ -1411,7 +1429,11 @@ namespace xanim_package_editor
             std::vector<std::vector<std::uint8_t>> InContact(2, std::vector<std::uint8_t>(W, 0));
             std::vector<xmath::fvec3> FootPos[2]; std::vector<xmath::fquat> FootRot[2];
             for (int s = 0; s < 2; ++s) { FootPos[s].resize(W); FootRot[s].resize(W); }
-            for (int i = 0; i < W; ++i) { std::vector<xmath::fquat> Rw; World(&Win[std::size_t(i) * nB], P, &Rw); for (int s = 0; s < 2; ++s) { FootPos[s][i] = P[Feet[s]]; FootRot[s][i] = Rw[Feet[s]]; } }
+            for (int i = 0; i < W; ++i)
+            {   // the feet where the clip itself had them (before the accept: its falloff slides them), the pins and the contacts
+                const auto Po = Own.size() == Accepted.size() ? SamplePose(Own, FPS, nF, nB, Key + double(i - K) / 30.0) : std::vector<xmath::transform3>(Win.begin() + std::size_t(i) * nB, Win.begin() + std::size_t(i + 1) * nB);
+                std::vector<xmath::fquat> Rw; World(Po.data(), P, &Rw); for (int s = 0; s < 2; ++s) { FootPos[s][i] = P[Feet[s]]; FootRot[s][i] = Rw[Feet[s]]; }
+            }
             auto Skate = [&](const std::vector<xmath::fvec3>& Pos, std::vector<std::uint8_t>* pMark) -> float     // mean skate (hip heights/s) of the contacts inside the refined frames
             {
                 std::vector<xmath::fvec3> N(Pos.size()); for (std::size_t i = 0; i < Pos.size(); ++i) N[i] = Pos[i] * (1.0f / HipH);
@@ -1419,7 +1441,7 @@ namespace xanim_package_editor
                 for (const auto& C : xanimation::FindContacts(N, 30.0f))
                 {
                     if (pMark) for (int f = C.m_First; f <= C.m_Last; ++f) (*pMark)[f] = 1;
-                    if (C.m_Last < K - R || C.m_First > K + R) continue;
+                    if (C.m_Last < A || C.m_First > B) continue;
                     Sum += C.m_Skate; ++n;
                 }
                 return n ? Sum / n : 0.0f;
@@ -1431,15 +1453,23 @@ namespace xanim_package_editor
             if (!ToKimodo(*pCtx, Win, W, nB, KS, SP, Err)) return false;
             auto Root2 = [&](int i) { return std::array<float, 2>{ SP[i].m_Root[0], SP[i].m_Root[2] }; };
             std::vector<kimodo::constraint_set> Sets;
-            const int Full[5] = { K - R - 3, K - R, K, K + R, K + R + 3 };
+            std::vector<int> Full = { A - 3 };
+            for (int f : Anchors) Full.push_back(f);                                       // the edges, the key, the user's other keys
+            Full.push_back(B + 3);
             kimodo::constraint_set FB{ "fullbody", {}, {}, {} };
-            for (int f : Full) { FB.m_Frames.push_back(f); FB.m_Poses.push_back(SP[f]); FB.m_Smooth.push_back(Root2(f)); }
+            // the clip's own poses every 0.5 s away from the key: constraints AND blend anchors (Kimodo meets a constraint with a local jerk; anchored, the motion meets the clip there smoothly), so a wide scope
+            // keeps the clip's intent instead of drifting into another motion
+            for (int f = A + 15; f < B - 7; f += 15) if (std::abs(f - K) >= 15 && Full.size() < 20) { Full.push_back(f); Anchors.push_back(f); }
+            std::sort(Anchors.begin(), Anchors.end()); Anchors.erase(std::unique(Anchors.begin(), Anchors.end()), Anchors.end());
+            std::sort(Full.begin(), Full.end()); Full.erase(std::unique(Full.begin(), Full.end()), Full.end());
+            for (int f : Full) if (f >= 0 && f < W) { FB.m_Frames.push_back(f); FB.m_Poses.push_back(SP[f]); FB.m_Smooth.push_back(Root2(f)); }
             Sets.push_back(std::move(FB));
             int nFootFrames = 0;
+            const int FootStride = std::max(2, (B - A) / 16 + 1);                          // at most ~16 contact frames per foot (Kimodo's guidance)
             for (int s = 0; s < 2; ++s)
             {
                 kimodo::constraint_set Set{ s ? "right-foot" : "left-foot", {}, {}, {} };
-                for (int f = K - R; f <= K + R && Set.m_Frames.size() < 16; f += 2) if (InContact[s][f] && f != K) { Set.m_Frames.push_back(f); Set.m_Poses.push_back(SP[f]); Set.m_Smooth.push_back(Root2(f)); }
+                for (int f = A; f <= B && Set.m_Frames.size() < 16; f += FootStride) if (InContact[s][f] && f != K) { Set.m_Frames.push_back(f); Set.m_Poses.push_back(SP[f]); Set.m_Smooth.push_back(Root2(f)); }
                 nFootFrames += int(Set.m_Frames.size());
                 if (!Set.m_Frames.empty()) Sets.push_back(std::move(Set));
             }
@@ -1455,25 +1485,38 @@ namespace xanim_package_editor
             const auto Args = std::format(L"gen --prompt \"A person.\" --frames {} --steps 25 --seed {} --no-postprocess --constraints \"{}.json\" --bvh \"{}\"", W, std::max(1, Seed), Stem, Bvh);
             if (!kimodo::RunBlocking(Exe, Args, Stem + L".log", 180000, Err)) return false;
             const auto t2 = clock::now();
-            kimodo::bvh B;
-            if (!B.Load(Bvh, Err)) return false;
-            if (B.m_nFrames < W) { Err = "the generated window is too short"; return false; }
-            const auto Back = FromKimodo(*pCtx, B, KS, nB);
+            kimodo::bvh Bv;
+            if (!Bv.Load(Bvh, Err)) return false;
+            if (Bv.m_nFrames < W) { Err = "the generated window is too short"; return false; }
+            const auto Back = FromKimodo(*pCtx, Bv, KS, nB);
 
-            // the pose below this layer (the edges are keyed at it: neutral), composed once
-            xanim_package_desc::clip BelowClip = *pOv; BelowClip.m_Layers.resize(iLayer);
-            const auto* pBase = FindLayerSource(pS->key(), pOv->m_OriginalName);
-            if (!pBase) { Err = "this clip is not in the layer sources"; return false; }
-            std::vector<xmath::transform3> Below; xanim_package_layers::report Rp;
-            if (!xanim_package_layers::Compose(*pBase, BelowClip, pDesc->m_ResolvedSkeletonBones, [this](const std::wstring& Kk, const std::string& C) { return FindLayerSource(Kk, C); }, Below, Rp, Err)) return false;
-            const int BFPS = std::max(1, pBase->m_FPS), BnF = pBase->m_nFrames;
+            // the window is a take: stored (never regenerated) and listed on the layer (provenance; the Kimodo layer kind shows it later)
+            {
+                const auto Dir = ProjectPath() / L"Cache" / L"KimodoTakes" / std::format(L"{:016X}", m_Document.m_Guid.m_Instance.m_Value);
+                std::error_code Ec; std::filesystem::create_directories(Dir, Ec);
+                const auto Name = std::format("refine_{:%Y%m%d_%H%M%S}_{}", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()), s_Count);
+                std::filesystem::copy_file(Bvh, Dir / (xstrtool::To(Name) + L".bvh"), std::filesystem::copy_options::overwrite_existing, Ec);
+                std::filesystem::copy_file(Stem + L".json", Dir / (xstrtool::To(Name) + L".json"), std::filesystem::copy_options::overwrite_existing, Ec);
+                xanim_package_desc::layer_take Tk;
+                Tk.m_File = Name; Tk.m_Prompt = "A person."; Tk.m_Seed = std::max(1, Seed); Tk.m_Steps = 25;
+                Tk.m_Start = xanim_package_layers::ToTick(std::max(0.0, Key - double(K - A) / 30.0)); Tk.m_End = xanim_package_layers::ToTick(Key + double(B - K) / 30.0);
+                Tk.m_Offset = xanim_package_layers::ToTick(Key - double(K) / 30.0); Tk.m_Why = Why;
+                if (std::FILE* fp = _wfopen((Dir / (xstrtool::To(Name) + L".take.txt")).c_str(), L"wb"))
+                {
+                    const auto T = std::format("prompt: {}\nseed: {}\nsteps: {}\nframes: {} at 30 fps (frame 0 = clip {:.3f} s)\nkeys made: clip {:.3f} .. {:.3f} s\nclip: {}\nwhy: {}\n"
+                        , Tk.m_Prompt, Tk.m_Seed, Tk.m_Steps, W, Key - double(K) / 30.0, Key - double(K - A) / 30.0, Key + double(B - K) / 30.0, pOv->m_OriginalName, Why);
+                    std::fwrite(T.data(), 1, T.size(), fp); std::fclose(fp);
+                }
+                if (Ec) { Err = std::format("the take could not be stored in {}: {}", xstrtool::To(Dir.wstring()), Ec.message()); return false; }
+                pOv->m_Layers[iLayer].m_Takes.push_back(Tk);
+            }
 
             // per refined frame: Kimodo's rotations (keyable bones) and hips, the feet pinned where in contact
             xanimation::body_ik Solver;
             std::vector<xanimation::two_bone_chain> Limbs;
             for (int E : Feet) if (const int p = Parents[E]; p >= 0 && Parents[p] >= 0) Limbs.push_back({ Parents[p], p, E });
             Solver.Setup(Parents, {}, {}, Limbs);
-            xanimation::body_ik_settings Set; Set.m_TranslateBone = iHips;
+            xanimation::body_ik_settings Set;     // the hips stay: a per-frame hips solve jitters (each pinned frame alone); the legs reach
             const auto& Owned = m_Suggest.m_Owned;
             auto& Keys = pOv->m_Layers[iLayer].m_Keys;
             auto PutKey = [&](const std::string& Bone, std::int64_t Tick, const xmath::fquat& Q, const xmath::fvec3* pPos)
@@ -1485,46 +1528,49 @@ namespace xanim_package_editor
                 pK->m_X = N.m_X; pK->m_Y = N.m_Y; pK->m_Z = N.m_Z; pK->m_W = N.m_W; pK->m_bOffset = false; pK->m_bStep = false;
                 if (pPos) { pK->m_bPosition = true; pK->m_PX = pPos->m_X; pK->m_PY = pPos->m_Y; pK->m_PZ = pPos->m_Z; }
             };
-            // The refined motion before the pins, frames [K-R, K+R] (the rest of Ref is the clip):
-            // 1. offset blending: Kimodo's constraints are soft (cm off the key and the edges); its error at the key and at each half's edge
-            //    is spread over that half with a smootherstep, so the motion keeps Kimodo's shape and meets the key and the edges exactly;
-            // 2. its difference from the clip smoothed in time ([1 2 1]/4, 3 passes, the key and the edges held): raw diffusion frames
-            //    jitter, and a second difference (acceleration) amplifies that
+            // The refined motion before the pins, frames [A, B] (the rest of Ref is the clip):
+            // 1. offset blending: Kimodo's constraints are soft (cm off the anchors); its error at the anchors (the edges, the key, the user's
+            //    other keys) is spread between them linearly, then the difference is faded in from each anchor with a zero-slope envelope, so
+            //    the motion keeps Kimodo's shape and meets every anchor exactly;
+            // 2. the difference smoothed in time ([1 2 1]/4, 3 passes, the anchors held): raw diffusion frames jitter, and a second
+            //    difference (acceleration) amplifies that
             std::vector<xmath::transform3> Ref = Win;
             {
                 auto Smooth5 = [](float u) { u = std::clamp(u, 0.0f, 1.0f); return u * u * u * (u * (u * 6.0f - 15.0f) + 10.0f); };
+                std::vector<std::uint8_t> IsAnchor(W, 0); for (int f : Anchors) IsAnchor[f] = 1;
                 for (int b = 0; b < nB; ++b)
                 {
                     if (!Owned[b] && b != iHips) continue;
-                    // Kimodo's difference from the clip per frame (a rotation vector, parent side, and a position), made zero at the key and at
-                    // each half's edge (its error there removed, linearly across the half), then faded in from both with a zero-slope envelope
                     std::vector<xmath::fvec3> E(W), EP(W), D(W), DP(W);
-                    for (int f = K - R; f <= K + R; ++f)
+                    for (int f = A; f <= B; ++f)
                     {
                         const auto& Bb = Back[std::size_t(f) * nB + b]; const auto& Wb = Win[std::size_t(f) * nB + b];
                         E[f] = xanimation::details::LogQ(Bb.m_Rotation * Wb.m_Rotation.ConjugateCopy()); EP[f] = Bb.m_Position - Wb.m_Position;
                     }
-                    for (int f = K - R; f <= K + R; ++f)
+                    for (std::size_t s = 0; s + 1 < Anchors.size(); ++s)
                     {
-                        const int Edge = f < K ? K - R : K + R;
-                        const float u = float(std::abs(f - Edge)) / float(R);                                     // 0 at the edge, 1 at the key
-                        const float Env = Smooth5(u / 0.4f) * Smooth5((1.0f - u) / 0.4f);
-                        D[f]  = (E[f]  - E[Edge]  * (1.0f - u) - E[K]  * u) * (Owned[b] ? Env : 0.0f);
-                        DP[f] = (EP[f] - EP[Edge] * (1.0f - u) - EP[K] * u) * (b == iHips ? Env : 0.0f);
+                        const int a = Anchors[s], c = Anchors[s + 1];
+                        for (int f = a; f <= c; ++f)
+                        {
+                            const float u = float(f - a) / float(std::max(1, c - a));
+                            const float Env = Smooth5(u / 0.4f) * Smooth5((1.0f - u) / 0.4f);
+                            D[f]  = (E[f]  - E[a]  * (1.0f - u) - E[c]  * u) * (Owned[b] ? Env : 0.0f);
+                            DP[f] = (EP[f] - EP[a] * (1.0f - u) - EP[c] * u) * (b == iHips ? Env : 0.0f);
+                        }
                     }
                     for (int pass = 0; pass < 3; ++pass)
                     {
                         auto D2 = D, DP2 = DP;
-                        for (int f = K - R + 1; f < K + R; ++f)
+                        for (int f = A + 1; f < B; ++f)
                         {
-                            if (f == K) continue;
+                            if (IsAnchor[f]) continue;
                             D2[f] = (D[f - 1] + D[f] * 2.0f + D[f + 1]) * 0.25f; DP2[f] = (DP[f - 1] + DP[f] * 2.0f + DP[f + 1]) * 0.25f;
                         }
                         D = D2; DP = DP2;
                     }
-                    for (int f = K - R + 1; f < K + R; ++f)
+                    for (int f = A + 1; f < B; ++f)
                     {
-                        if (f == K) continue;
+                        if (IsAnchor[f]) continue;
                         auto& O = Ref[std::size_t(f) * nB + b]; const auto& Wb = Win[std::size_t(f) * nB + b];
                         if (Owned[b]) O.m_Rotation = (xanimation::details::ExpV(D[f]) * Wb.m_Rotation).NormalizeCopy();
                         if (b == iHips) O.m_Position = Wb.m_Position + DP[f];
@@ -1532,15 +1578,15 @@ namespace xanim_package_editor
                 }
             }
             float PinMax = 0; int nKeys = 0, nFrames = 0;
-            for (int f = K - R; f <= K + R; f += Step)
+            for (int f = A; f <= B; f += Step)
             {
                 const double t = Key + double(f - K) / 30.0;
+                if (t < 0.0) continue;                                           // before the clip's start
                 const auto Tick = xanim_package_layers::ToTick(t);
-                if (f == K) continue;                                            // the accepted key stays as it is
-                if (f == K - R || f == K + R)
-                {   // the edges: the pose below (a neutral key: the layer joins the clip exactly here)
-                    const auto Bp = SamplePose(Below, BFPS, BnF, nB, t);
-                    for (int b = 0; b < nB; ++b) if (Owned[b] || b == iHips) { PutKey(Names[b], Tick, Bp[b].m_Rotation, b == iHips ? &Bp[b].m_Position : nullptr); ++nKeys; }
+                if (f == K || UserTicks.count(Tick)) continue;                  // the accepted key and the user's keys stay as they are
+                if (f == A || f == B)
+                {   // the edges: the motion as it plays there now (the layer joins it exactly)
+                    for (int b = 0; b < nB; ++b) if (Owned[b] || b == iHips) { const auto& Wb = Win[std::size_t(f) * nB + b]; PutKey(Names[b], Tick, Wb.m_Rotation, b == iHips ? &Wb.m_Position : nullptr); ++nKeys; }
                     continue;
                 }
                 xanimation::pose Kim; Kim.resize(nB); for (int b = 0; b < nB; ++b) Kim.set(b, Ref[std::size_t(f) * nB + b]);
@@ -1573,13 +1619,9 @@ namespace xanim_package_editor
                 if (i == K) for (int b = 0; b < nB; ++b) if (Owned[b]) KeyMiss = std::max(KeyMiss, AngleDeg(Pp[b].m_Rotation, Win[std::size_t(K) * nB + b].m_Rotation));
             }
             const float SkateAfter = 0.5f * (Skate(AfterFeet[0], nullptr) + Skate(AfterFeet[1], nullptr));
-            const int fk = int(std::lround(Key * FPS));
-            const float AccBefore = MaxAcceleration(Accepted, FPS, nF, fk - R, fk + R);
-            const float AccAfter  = MaxAcceleration(*pAfter, FPSa, nFa, fk - R, fk + R);
-            Report = std::format("; refine (Kimodo, +-0.5 s, 25 steps): {} frames keyed every {} ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm); "
-                                 "skate in contact {:.4f} -> {:.4f} hip heights/s; acceleration in the window {:.1f} -> {:.1f} m/s^2; the key kept within {:.4f} deg; "
-                                 "refine time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms"
-                , nFrames, Step, nKeys, nFootFrames, PinMax * 100.0f, SkateBefore, SkateAfter, AccBefore, AccAfter, KeyMiss, ms(t0, t1), ms(t1, t2), ms(t2, t3));
+            Report = std::format("refine scope -{:.2f} .. +{:.2f} s (Kimodo window {} frames, 25 steps, {} anchors): {} frames keyed ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm); "
+                                 "skate in contact {:.4f} -> {:.4f} hip heights/s; the key kept within {:.4f} deg; time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms"
+                , double(K - A) / 30.0, double(B - K) / 30.0, W, Anchors.size(), nFrames, nKeys, nFootFrames, PinMax * 100.0f, SkateBefore, SkateAfter, KeyMiss, ms(t0, t1), ms(t1, t2), ms(t2, t3));
             return true;
         }
 
@@ -1634,13 +1676,73 @@ namespace xanim_package_editor
                 }
             }
             // the motion around the key made natural (Kimodo), in the same undo step
+            // the motion around the key made natural (Kimodo), as far as realism needs: the smallest scope (+-0.5 s, +-1, +-2, the whole
+            // clip) whose motion is no worse than the clip's own (skate, acceleration, the hips' momentum, joint limits; balance advisory)
             std::string RefineNote;
             bool bRefined = false;
-            if (bRefine)
             {
-                std::string RErr;
-                bRefined = SuggestRefine(iLayer, C.m_Seed, RefineNote, RErr);
-                if (!bRefined) RefineNote = "; refine skipped: " + RErr;
+                std::vector<std::int32_t> Par(nB); std::vector<std::string> Nm(nB); std::vector<std::string_view> Vw(nB); xanimation::pose RestP; RestP.resize(nB);
+                for (int b = 0; b < nB; ++b)
+                {
+                    Par[b] = Man[b].m_iParent; Nm[b] = Man[b].m_Name; RestP.m_Position[b] = Man[b].m_RestPosition; RestP.m_Scale[b] = Man[b].m_RestScale;
+                    RestP.m_Rotation[b] = xmath::fquat(Man[b].m_RestRotX, Man[b].m_RestRotY, Man[b].m_RestRotZ, Man[b].m_RestRotW).NormalizeSafeCopy();
+                }
+                for (int b = 0; b < nB; ++b) Vw[b] = Nm[b];
+                const xanimation::skeleton_view SV{ Par };
+                // ponytail: the Humanoid v1 preset resolved for the package skeleton; the skeleton's own compiled limits when the package reads them
+                const auto Rig = xanimation::MakeHumanoidRealismRig(SV, Vw, RestP, xanimation::HumanoidJointPresetV1(SV, Vw, RestP));
+                const double Key = m_Suggest.m_Time, Dur = double(std::max(1, nFb - 1)) / double(std::max(1, FPSb));
+                const int fk = int(std::lround(Key * FPSb));
+                auto Judge = [&](double Lo, double Hi, std::string& Line) -> std::vector<std::string>
+                {
+                    const std::vector<xmath::transform3>* pA = nullptr; int FPSa = 30, nFa = 0; std::string E1;
+                    std::vector<std::string> Fails;
+                    if (FramesBefore.empty() || !SuggestClipFrames(pA, FPSa, nFa, E1) || nFa != nFb) { Line = "not measured"; return Fails; }
+                    const int f0 = fk - int(std::lround(Lo * FPSb)) - 3, f1 = fk + int(std::lround(Hi * FPSb)) + 3;
+                    const auto Own = xanimation::MeasureRealism(Rig, FramesBefore, nB, nFb, float(FPSb), f0, f1);
+                    const auto Now = xanimation::MeasureRealism(Rig, *pA, nB, nFa, float(FPSa), f0, f1);
+                    Line = std::format("skate {:.3f} (clip {:.3f}) hip h/s, acceleration {:.1f} ({:.1f}) m/s^2, hips {:.1f} ({:.1f}) m/s^2, limits {:.1f} ({:.1f}) deg over {} ({}) frames, balance [advisory] {:.3f} ({:.3f}) hip h on {} static frames"
+                        , Now.m_Skate, Own.m_Skate, Now.m_Acc, Own.m_Acc, Now.m_Hips, Own.m_Hips, Now.m_LimitExcess, Own.m_LimitExcess, Now.m_nLimitFrames, Own.m_nLimitFrames, Now.m_Balance, Own.m_Balance, Now.m_nStatic);
+                    // no worse than the clip's own, with a margin (25 % + a floor: noise, not realism)
+                    if (Now.m_Skate > Own.m_Skate * 1.25f + 0.02f)    Fails.push_back("foot skate");
+                    if (Now.m_Acc   > Own.m_Acc   * 1.25f + 2.0f)     Fails.push_back("acceleration");
+                    if (Now.m_Hips  > Own.m_Hips  * 1.25f + 1.0f)     Fails.push_back("hips momentum");
+                    if (Now.m_LimitExcess > Own.m_LimitExcess + 2.0f) Fails.push_back("joint limits");
+                    if (Now.m_Balance > Own.m_Balance + 0.1f)         Fails.push_back("balance");
+                    return Fails;
+                };
+                auto Join = [](const std::vector<std::string>& V) { std::string S; for (const auto& s : V) S += (S.empty() ? "" : ", ") + s; return S; };
+                if (!bRefine)
+                {
+                    std::string Line; const auto F = Judge(0.5, 0.5, Line);
+                    RefineNote = std::format("; no refine; +-0.5 s: {}{}", Line, F.empty() ? "" : " - worse than the clip: " + Join(F));
+                }
+                else
+                {
+                    const auto KeysBefore = pOv->m_Layers[iLayer].m_Keys; const auto TakesBefore = pOv->m_Layers[iLayer].m_Takes;
+                    struct scope { double Lo, Hi; std::string Name; };
+                    std::vector<scope> Scopes;
+                    for (double r : { 0.5, 1.0, 2.0 }) if (r < Key || r < Dur - Key) Scopes.push_back({ std::min(r, Key), std::min(r, Dur - Key), std::format("+-{} s", r) });
+                    Scopes.push_back({ Key, Dur - Key, "the whole clip" });
+                    std::string Why;
+                    for (std::size_t i = 0; i < Scopes.size(); ++i)
+                    {
+                        const auto& S = Scopes[i];
+                        pOv->m_Layers[iLayer].m_Keys = KeysBefore; pOv->m_Layers[iLayer].m_Takes = TakesBefore;      // each scope from the accepted state
+                        std::string Rep, RErr, Line;
+                        if (!SuggestRefine(iLayer, C.m_Seed, S.Lo, S.Hi, std::format("refine after Suggest Pose at {:.2f} s, scope {}{}", Key, S.Name, Why), FramesBefore, Rep, RErr))
+                        {
+                            pOv->m_Layers[iLayer].m_Keys = KeysBefore; pOv->m_Layers[iLayer].m_Takes = TakesBefore;
+                            RefineNote += "; refine skipped: " + RErr; bRefined = false; break;
+                        }
+                        bRefined = true;
+                        const auto F = Judge(S.Lo, S.Hi, Line);
+                        RefineNote += std::format("; scope {}: {} - {} [{}]", S.Name, F.empty() ? "passes" : "worse than the clip: " + Join(F), Line, Rep);
+                        if (F.empty()) { RefineNote += std::format("; chosen scope: {}", S.Name); break; }
+                        Why = " (a smaller scope failed: " + Join(F) + ")";
+                        if (i + 1 == Scopes.size()) RefineNote += std::format("; chosen scope: {} (still worse than the clip: {})", S.Name, Join(F));
+                    }
+                }
             }
             if (m_Undo.GetUndoIndex() > UndoAt || bRefined)
             {

@@ -135,6 +135,34 @@ namespace xanim_package_desc
     };
     XPROPERTY_REG(layer_weight_key)
 
+    // A generated take behind some of a layer's keys (Tomas 2026-11-15: any part of a Kimodo animation can be an ingredient of the final
+    // clip): stored in the project's Cache\KimodoTakes\<package guid>\ (its BVH, the constraints JSON, a .take.txt), never regenerated;
+    // the keys of [Start, End] came from it. The coming Kimodo layer kind shows these as segments.
+    struct layer_take
+    {
+        std::string     m_File    = {};         // the take's stem in the package's takes folder (File.bvh, File.json, File.take.txt)
+        std::string     m_Prompt  = {};
+        int             m_Seed    = 1;
+        int             m_Steps   = 25;
+        std::int64_t    m_Start   = 0;          // the clip span [Start, End] (ticks) whose keys it produced
+        std::int64_t    m_End     = 0;
+        std::int64_t    m_Offset  = 0;          // the clip tick of the take's frame 0
+        std::string     m_Why     = {};         // why it was made (e.g. "refine after Suggest Pose at 1.00 s, scope +-1 s: acceleration")
+
+        XPROPERTY_DEF
+        ( "Take", layer_take
+        , obj_member<"File",   &layer_take::m_File >
+        , obj_member<"Prompt", &layer_take::m_Prompt >
+        , obj_member<"Seed",   &layer_take::m_Seed >
+        , obj_member<"Steps",  &layer_take::m_Steps >
+        , obj_member<"Start",  &layer_take::m_Start >
+        , obj_member<"End",    &layer_take::m_End >
+        , obj_member<"Offset", &layer_take::m_Offset >
+        , obj_member<"Why",    &layer_take::m_Why >
+        )
+    };
+    XPROPERTY_REG(layer_take)
+
     struct clip_layer
     {
         std::uint64_t       m_Id          = 0;          // stable identity (commands, undo, reports); 0 = not given yet (the editor gives one)
@@ -162,6 +190,7 @@ namespace xanim_package_desc
         std::vector<layer_pose_key> m_Keys = {};                    // Pose layers: sparse keys (a track per bone); their mask, when empty, is the whole body
         bool                m_bSmooth     = false;      // Pose layers: a smooth curve through the keys (new pose layers: on; off = linear, as layers made before)
         float               m_Falloff     = 0.0f;       // Pose layers: seconds the layer eases in before its first key and out after its last (new pose layers: 0.5; 0 = ramp to the section ends)
+        std::vector<layer_take> m_Takes   = {};         // Pose layers: the generated takes (Kimodo) some of the keys came from (provenance; nothing composes from it)
 
         XPROPERTY_DEF
         ( "Layer", clip_layer
@@ -190,6 +219,7 @@ namespace xanim_package_desc
         , obj_member<"Keys",          &clip_layer::m_Keys >
         , obj_member<"Smooth",        &clip_layer::m_bSmooth >
         , obj_member<"Falloff",       &clip_layer::m_Falloff >
+        , obj_member<"Takes",         &clip_layer::m_Takes >
         )
     };
     XPROPERTY_REG(clip_layer)
