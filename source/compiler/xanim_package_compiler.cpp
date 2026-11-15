@@ -737,15 +737,18 @@ namespace xanim_package_compiler
                 if (static_cast<int>(S.m_Frames.size()) == S.m_nFrames * N) { All.insert(All.end(), S.m_Frames.begin(), S.m_Frames.end()); nFrames += S.m_nFrames; }
             if (All.empty()) return;
             std::vector<xanimation::joint_limit> L(N);
+            std::vector<xanimation::frame_confidence> Conf(N);
             constexpr float D = 180.0f / 3.14159265f;
-            xanimation::MeasureJointRanges(Parents, Rest, All, 5.0f / D, L);
-            std::string Txt = std::format("# Demonstrated joint ranges over {} clips, {} frames (+5 deg margin). Degrees, measured from the rest pose.\n"
-                                          "# bone\ttwist min..max\tswing centre (1, 2)\tswing radii (1, 2)\n", m_SourceFrames.size(), nFrames);
+            xanimation::MeasureJointRanges(Parents, Rest, All, 5.0f / D, L, Conf);
+            std::string Txt = std::format("# Demonstrated joint ranges over {} clips, {} frames (+5 deg margin): evidence, not accepted limits. Degrees, in each\n"
+                                          "# joint's suggested frame (x along the bone, z the bend axis), from the rest pose.\n"
+                                          "# bone\tframe\ttwist centre +- half\tswing centre (y, z)\tswing radii (y, z)\n", m_SourceFrames.size(), nFrames);
             for (int b = 0; b < N; ++b)
             {
-                if (!L[b].m_bLimited) { Txt += std::format("{}\tfree (root)\n", Manifest.m_Bones[b].m_Name); continue; }
-                Txt += std::format("{}\t{:.1f}..{:.1f}\t{:.1f}, {:.1f}\t{:.1f}, {:.1f}\n", Manifest.m_Bones[b].m_Name, L[b].m_TwistMin * D, L[b].m_TwistMax * D
-                                  , L[b].m_C1 * D, L[b].m_C2 * D, L[b].m_R1 * D, L[b].m_R2 * D);
+                if (L[b].m_Type == xanimation::joint_type::FREE) { Txt += std::format("{}\tfree (root)\n", Manifest.m_Bones[b].m_Name); continue; }
+                Txt += std::format("{}\t{}\t{:.1f} +- {:.1f}\t{:.1f}, {:.1f}\t{:.1f}, {:.1f}\n", Manifest.m_Bones[b].m_Name
+                                  , Conf[b] == xanimation::frame_confidence::SUGGESTED ? "suggested" : "needs confirmation"
+                                  , L[b].m_TwistCentre * D, L[b].m_TwistHalf * D, L[b].m_SwingCy * D, L[b].m_SwingCz * D, L[b].m_SwingRy * D, L[b].m_SwingRz * D);
             }
             if (std::FILE* f = _wfopen(std::format(L"{}\\JointRanges.txt", m_ResourceLogPath).c_str(), L"wb")) { std::fwrite(Txt.data(), 1, Txt.size(), f); std::fclose(f); }
             else LogMessage(xresource_pipeline::msg_type::WARNING, "JointRanges.txt could not be written");
