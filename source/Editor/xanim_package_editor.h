@@ -23,8 +23,12 @@
 #include "plugins/xanim_package.plugin/source/Editor/xanim_package_kimodo.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_layers.h"
 #include "plugins/xskeleton.plugin/source/xskeleton_joints.h"
+#include "source/Tools/Editor/xeditor_timeline.h"
 
 #include <charconv>
+#include <functional>
+#include <map>
+#include <unordered_map>
 
 namespace xanim_package_editor
 {
@@ -50,7 +54,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept };
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit };
 
         session&    m_Session;
         kind        m_Kind;
@@ -100,6 +104,16 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Refine",    "0: no Refine Motion (Kimodo regenerating +-0.5 s around the key so it moves naturally); default 1", false, 1);
                 m_hD = m_Parser.addOption("MaxWindow", "Seconds per Kimodo window (default 10, Kimodo's limit): a longer refine scope is generated as overlapping windows stitched together; a smaller value tests the stitching", false, 1);
                 break;
+            case kind::layer_timeline:
+                m_hA = m_Parser.addOption("Time",   "Seconds: the playhead (a seek: the descriptor is not touched)", false, 1);
+                m_hB = m_Parser.addOption("Solo",   "\"row 0|1\": audition a layer row (editor only, never in the build)", false, 1);
+                m_hC = m_Parser.addOption("Fold",   "A row to fold (view state)", false, 1);
+                m_hD = m_Parser.addOption("Unfold", "A row to unfold (view state)", false, 1);
+                m_hE = m_Parser.addOption("Frame",  "\"a b\" seconds: the view shows that span", false, 1);
+                break;
+            case kind::layer_timeline_edit:
+                m_hA = m_Parser.addOption("Ops", "A timeline plan (\"rev N; seg row item start end offset ein eout; key row item tick\", ticks: 6000 a second) or row ops \"mute row 0|1; lock row 0|1; move row above_row; delete row item\"", true, 1);
+                break;
             case kind::layer_mask:
                 m_hA = m_Parser.addOption("Layer", "The layer's index in the selected clip", true, 1);
                 m_hB = m_Parser.addOption("Bone",  "The bone (its name): added with its branch, or removed when it is in the mask", true, 1);
@@ -144,7 +158,7 @@ namespace xanim_package_editor
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
-        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept;
+        playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit;
 
         // Layers (the layered edit mode): the compiler's layer-sources cache, the selected clip's live composition (same function as the compile)
         std::vector<xanim_package_layers::source_frames> m_LayerSources;
@@ -269,6 +283,8 @@ namespace xanim_package_editor
             , m_PoseKey       (m_Undo, *this, playback_cmd::kind::pose_key,        "PoseKey",        "Sets a key on a Pose layer: the bone's pose at a time = the layers below turned by -Turn (absolute target), or the turn as an offset key. Usage: PoseKey -Layer n -Bone name -Time s [-Turn \"x y z\"] [-Offset 1] [-Move \"x y z\"]")
             , m_SuggestPose   (m_Undo, *this, playback_cmd::kind::suggest_pose,    "SuggestPose",    "Suggests a natural pose at a time with Kimodo for the handles moved and pinned: a CANDIDATE (nothing is written) and its report. Usage: SuggestPose -Time s [-Move \"LeftHand 0 0 15\"] [-Pin \"LeftFoot RightFoot\"] [-Seeds \"1 2\"] [-Prompt text]")
             , m_SuggestPoseAccept(m_Undo, *this, playback_cmd::kind::suggest_pose_accept, "SuggestPoseAccept", "Writes a Suggest Pose candidate as keys on a Pose layer (the bones it changes). Usage: SuggestPoseAccept -Layer n [-Candidate i]")
+            , m_LayerTimeline    (m_Undo, *this, playback_cmd::kind::layer_timeline,      "LayerTimeline",     "The layer timeline: its rows (top layer first, the clip at the bottom), their items, the revision, the playhead, solo, the selection and the layout. Usage: LayerTimeline [-Time s] [-Solo \"row 0|1\"] [-Fold row] [-Unfold row] [-Frame \"a b\"]")
+            , m_LayerTimelineEdit(m_Undo, *this, playback_cmd::kind::layer_timeline_edit, "LayerTimelineEdit", "Edits the selected clip's layers as the timeline does (ONE undo step): a plan's text or row ops. Usage: LayerTimelineEdit -Ops \"rev N; seg ...; key ...\" | \"mute r 1; lock r 0; move r above; delete r i\"")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
@@ -433,6 +449,353 @@ namespace xanim_package_editor
             return S;
         }
 
+        //----------------------------------------------------------------------------------------
+        // The layer timeline (T2, xLION_Docs editor_timeline_framework_design): the selected clip's layer stack as rows of the editor timeline
+        // (source/Tools/Editor/xeditor_timeline.h): the top layer on top, the base clip at the bottom - the mix order, as Photoshop shows it.
+        // A view over the descriptor: every edit is a command (LayerTimelineEdit: a plan's text or row ops) and ONE undo step; scrubbing,
+        // folding, solo and selection never touch the descriptor.
+        //----------------------------------------------------------------------------------------
+        static constexpr std::uint64_t tl_base_row_v = 0xB000000000000001ull;
+        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4 };
+        struct tl_row { int m_iLayer = -1; std::string m_Bone; };
+        std::unordered_map<std::uint64_t, tl_row>       m_TLRows;               // rebuilt with the rows: row id -> layer (and bone)
+        std::set<std::uint64_t>                         m_TLSeen;               // pose rows seen (a new one starts folded)
+        xeditor::timeline::state                        m_TLView;
+        xeditor::timeline::transport                    m_TLTransport;          // m_Solo: layer row ids auditioned (editor only, never in the build)
+        static constexpr xeditor::timeline::tick tl_tps_v = 6000;               // the layers' ticks
+
+        static std::uint64_t TLLayerRow(const xanim_package_desc::clip_layer& L, int i) noexcept { return L.m_Id ? L.m_Id : 0xA000000000000000ull + std::uint64_t(i); }
+        static std::uint64_t TLBoneRow(std::uint64_t Layer, const std::string& Bone) noexcept { return ((std::hash<std::string>{}(Bone) ^ (Layer * 0x9E3779B97F4A7C15ull)) & 0x3FFFFFFFFFFFFFFFull) | 0x4000000000000000ull; }
+
+        // the selected clip's source length in ticks (its composition span), else the compiled clip's
+        xeditor::timeline::tick TLClipTicks() noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pS = SelectedSource();
+            if (pOv && pS) if (const auto* pB = FindLayerSource(pS->key(), pOv->m_OriginalName); pB && pB->m_FPS > 0) return xeditor::timeline::tick(std::llround(double(std::max(1, pB->m_nFrames - 1)) / pB->m_FPS * tl_tps_v));
+            if (auto* pC = SelectedClip()) return xeditor::timeline::tick(std::llround(double(ClipLength(*pC)) * tl_tps_v));
+            return 4 * tl_tps_v;
+        }
+        // names the content the plans are made against (an undo restores the old number)
+        std::uint64_t TLRevision() noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) return 0;
+            std::string S = std::format("{}:{}:{}", m_iSelectedSource, m_iSelectedDescriptorClip, LayerSignature(*pOv));
+            for (const auto& L : pOv->m_Layers) S += L.m_bLock ? 'L' : 'u';
+            return std::hash<std::string>{}(S) | 1;
+        }
+
+        void TLRowsOf(std::vector<xeditor::timeline::row_desc>& Out) noexcept
+        {
+            m_TLRows.clear();
+            auto* pOv = SelectedOv();
+            if (!pOv) return;
+            for (int i = int(pOv->m_Layers.size()) - 1; i >= 0; --i)
+            {
+                const auto& L = pOv->m_Layers[i];
+                const bool bPose = L.m_Kind == xanim_package_desc::layer_kind::POSE;
+                xeditor::timeline::row_desc R;
+                R.m_Id = TLLayerRow(L, i); R.m_Type = bPose ? tl_pose : tl_clip;
+                R.m_Name = std::format("{}  {} {}{}", L.m_Name.empty() ? "(unnamed)" : L.m_Name, L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "Add" : "Ovr"
+                    , L.m_WeightKeys.empty() ? std::format("{:.2f}", L.m_Weight) : std::string("~w"), L.m_Mask.empty() ? (bPose ? "" : "  no mask") : std::format("  mask {}", L.m_Mask.size()));
+                R.m_bMute = !L.m_bEnabled; R.m_bLock = L.m_bLock;
+                R.m_Color = bPose ? IM_COL32(210, 150, 70, 255) : IM_COL32(86, 132, 210, 255);
+                std::vector<std::string> Bones;
+                if (bPose) { for (const auto& K : L.m_Keys) if (std::find(Bones.begin(), Bones.end(), K.m_Bone) == Bones.end()) Bones.push_back(K.m_Bone); std::sort(Bones.begin(), Bones.end()); }
+                R.m_bHasChildren = !Bones.empty();
+                if (bPose && m_TLSeen.insert(R.m_Id).second) m_TLView.m_Folded.insert(R.m_Id);      // a pose layer starts folded: its summary row
+                Out.push_back(R); m_TLRows[R.m_Id] = { i, {} };
+                for (const auto& B : Bones)
+                {
+                    xeditor::timeline::row_desc C; C.m_Id = TLBoneRow(R.m_Id, B); C.m_Type = tl_bone; C.m_Depth = 1; C.m_Name = B;
+                    C.m_bMute = R.m_bMute; C.m_bLock = R.m_bLock; C.m_Color = IM_COL32(190, 140, 80, 255);
+                    Out.push_back(C); m_TLRows[C.m_Id] = { i, B };
+                }
+            }
+            xeditor::timeline::row_desc Base; Base.m_Id = tl_base_row_v; Base.m_Type = tl_base; Base.m_Name = std::format("Clip: {}", pOv->m_Name); Base.m_Color = IM_COL32(150, 150, 160, 255);
+            Out.push_back(Base);
+        }
+
+        // ops: a timeline plan ("rev N; seg row item start end offset ease_in ease_out; key row item tick") or row ops separated by ';':
+        // "mute row 0|1", "lock row 0|1", "move row above_row" (0: the bottom), "delete row item" (pose keys)
+        std::string TLApply(const std::string& Ops) noexcept
+        {
+            namespace tl = xeditor::timeline;
+            auto* pOv = SelectedOv();
+            if (!pOv) return "select a clip first";
+            std::vector<tl::row_desc> Rows; TLRowsOf(Rows);
+            auto RowOf = [&](std::uint64_t Id) -> const tl_row* { const auto It = m_TLRows.find(Id); return It == m_TLRows.end() ? nullptr : &It->second; };
+            auto Set = [&](int iL, const std::string& Field, const std::string& V, const std::string& B) -> std::string
+            { return V == B ? std::string{} : m_Undo.Execute(std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(LayerPath(iL, Field.c_str())), xeditor::Quote(V), xeditor::Quote(B))); };
+            if (Ops.rfind("rev", 0) == 0)
+            {
+                std::uint64_t Rev = 0; std::vector<tl::text_op> P;
+                if (!tl::FromText(Ops, Rev, P)) return std::format("bad plan '{}'", Ops);
+                if (auto E = TLValidateOps(Rev, P); !E.empty()) return E;
+                return AsOneStep("Timeline edit", [&]() -> std::string
+                {
+                    for (const auto& O : P)
+                    {
+                        const auto* pR = RowOf(O.m_Ref.m_Row);
+                        const int iL = pR->m_iLayer;
+                        const auto L = pOv->m_Layers[iL];                   // a copy: the writes below change the descriptor
+                        if (O.m_Kind == 's')
+                        {
+                            const auto S = std::to_string(O.m_Seg.m_Start), E = std::to_string(O.m_Seg.m_End), Ti = std::to_string(O.m_Seg.m_Offset);
+                            if (auto Err = Set(iL, "Start", S, std::to_string(L.m_Start)); !Err.empty()) return Err;
+                            const bool bKeepOpen = L.m_End < 0 && O.m_Seg.m_End == TLClipTicks();      // "to the clip's end" stays that
+                            if (!bKeepOpen) if (auto Err = Set(iL, "End", E, std::to_string(L.m_End)); !Err.empty()) return Err;
+                            if (auto Err = Set(iL, "TrimIn", Ti, std::to_string(L.m_TrimIn)); !Err.empty()) return Err;
+                            if (L.m_TrimOut >= 0)
+                                if (auto Err = Set(iL, "TrimOut", std::to_string(O.m_Seg.m_Offset + (O.m_Seg.m_End - O.m_Seg.m_Start)), std::to_string(L.m_TrimOut)); !Err.empty()) return Err;
+                        }
+                        else
+                        {
+                            const int k = int(O.m_Ref.m_Item) - 1;
+                            if (auto Err = Set(iL, std::format("Keys[G:{}]/Tick", k).c_str(), std::to_string(O.m_Seg.m_Start), std::to_string(L.m_Keys[k].m_Tick)); !Err.empty()) return Err;
+                        }
+                    }
+                    return {};
+                });
+            }
+            // row ops
+            std::vector<std::string> Parts; { std::size_t a = 0; while (a <= Ops.size()) { auto b = Ops.find(';', a); if (b == std::string::npos) b = Ops.size(); Parts.push_back(Ops.substr(a, b - a)); a = b + 1; } }
+            std::map<int, std::vector<int>> Deletes;            // layer -> key indices
+            std::vector<std::function<std::string()>> Steps;
+            for (const auto& Part : Parts)
+            {
+                char W[16] = {}; unsigned long long R = 0, X = 0;
+                const int n = std::sscanf(Part.c_str(), " %15s %llu %llu", W, &R, &X);
+                if (n <= 0) continue;
+                const std::string_view Op(W);
+                const auto* pR = RowOf(R);
+                if (!pR) return std::format("no layer row {}", R);
+                const int iL = pR->m_iLayer;
+                const auto& L = pOv->m_Layers[iL];
+                if (Op == "mute" && n == 3) Steps.push_back([=, this] { return Set(iL, "Enabled", X ? "false" : "true", SelectedOv()->m_Layers[iL].m_bEnabled ? "true" : "false"); });
+                else if (Op == "lock" && n == 3) Steps.push_back([=, this] { return Set(iL, "Lock", X ? "true" : "false", SelectedOv()->m_Layers[iL].m_bLock ? "true" : "false"); });
+                else if (Op == "delete" && n == 3)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    if (X < 1 || X > L.m_Keys.size()) return std::format("no key {} on layer '{}'", X, L.m_Name);
+                    Deletes[iL].push_back(int(X) - 1);
+                }
+                else if (Op == "move" && n == 3)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    int t = 0;                                          // the final index: above row X = right after its layer in the mix order
+                    if (X && X != tl_base_row_v)
+                    {
+                        const auto* pA = RowOf(X); if (!pA) return std::format("no row {}", X);
+                        const int a = pA->m_iLayer - (iL < pA->m_iLayer ? 1 : 0);
+                        t = a + 1;
+                    }
+                    if (t == iL) return "no change";
+                    Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Move -Index {} -ToIndex {}", xeditor::Quote(LayersPath()), iL, t)); });
+                }
+                else return std::format("unknown op '{}'", Part);
+            }
+            for (auto& [iL, Ks] : Deletes)
+            {
+                std::sort(Ks.rbegin(), Ks.rend()); Ks.erase(std::unique(Ks.begin(), Ks.end()), Ks.end());
+                for (int k : Ks) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "Keys")), k)); });
+            }
+            if (Steps.empty()) return "no change";
+            return AsOneStep("Timeline edit", [&]() -> std::string { for (auto& S : Steps) if (auto E = S(); !E.empty()) return E; return {}; });
+        }
+
+        // the document's own rules for a plan (the core already checked capabilities, locks and key collisions)
+        std::string TLValidateOps(std::uint64_t Rev, std::span<const xeditor::timeline::text_op> Ops) noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) return "no clip";
+            if (Rev != TLRevision()) return "stale plan: the layers changed since it was made";
+            for (const auto& O : Ops)
+            {
+                const auto It = m_TLRows.find(O.m_Ref.m_Row);
+                if (It == m_TLRows.end()) return std::format("row {} is not a layer (the clip row is read only)", O.m_Ref.m_Row);
+                const auto& L = pOv->m_Layers[It->second.m_iLayer];
+                if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                if (O.m_Kind == 's')
+                {
+                    if (L.m_Kind != xanim_package_desc::layer_kind::CLIP) return "only clip layers have segments";
+                    if (O.m_Seg.m_Start < 0) return "a layer cannot start before the clip";
+                    if (O.m_Seg.m_End <= O.m_Seg.m_Start) return "a layer needs a length";
+                    if (O.m_Seg.m_Offset < 0) return "the layer's source starts at 0";
+                }
+                else
+                {
+                    const int k = int(O.m_Ref.m_Item) - 1;
+                    if (k < 0 || k >= int(L.m_Keys.size())) return std::format("no key {} on layer '{}'", O.m_Ref.m_Item, L.m_Name);
+                    if (O.m_Seg.m_Start < 0) return "a key cannot be before the clip";
+                    for (int j = 0; j < int(L.m_Keys.size()); ++j)
+                        if (j != k && L.m_Keys[j].m_Bone == L.m_Keys[k].m_Bone && L.m_Keys[j].m_Tick == O.m_Seg.m_Start
+                            && std::none_of(Ops.begin(), Ops.end(), [&](const xeditor::timeline::text_op& o) { return o.m_Ref.m_Row == O.m_Ref.m_Row && int(o.m_Ref.m_Item) - 1 == j; })
+                            && std::none_of(Ops.begin(), Ops.end(), [&](const xeditor::timeline::text_op& o) { return o.m_Kind == 'k' && m_TLRows.count(o.m_Ref.m_Row) && m_TLRows[o.m_Ref.m_Row].m_iLayer == It->second.m_iLayer && int(o.m_Ref.m_Item) - 1 == j; }))
+                            return std::format("the {} key would land on another key at the same time (replace or merge it explicitly)", L.m_Keys[k].m_Bone);
+                }
+            }
+            return {};
+        }
+
+        // runs Fn (several commands) as ONE undo step: the steps it made are rolled back and replayed as one snapshot edit
+        std::string AsOneStep(const std::string& Label, const std::function<std::string()>& Fn) noexcept
+        {
+            const int UndoAt = m_Undo.GetUndoIndex();
+            xproperty::settings::context C;
+            const auto Before = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C);
+            if (auto Err = Fn(); !Err.empty()) { while (m_Undo.GetUndoIndex() > UndoAt) m_Undo.Undo(); return Err; }
+            if (m_Undo.GetUndoIndex() <= UndoAt + 1) return {};
+            const auto After = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C);
+            while (m_Undo.GetUndoIndex() > UndoAt) m_Undo.Undo();
+            return m_Undo.Execute(std::format("SnapshotEdit -Label {} -Before {} -After {}", xeditor::Quote(Label), xeditor::Quote(Before), xeditor::Quote(After)));
+        }
+
+        struct tl_document final : xeditor::timeline::document
+        {
+            session& m_S; explicit tl_document(session& S) noexcept : m_S(S) {}
+            // the same command the console runs (a query command: its own steps are the undo steps); the reply says what happened
+            std::string Run(const std::string& Ops) { return m_S.m_Undo.Query(std::format("LayerTimelineEdit -Ops {}", xeditor::Quote(Ops))); }
+            void          Rows(std::vector<xeditor::timeline::row_desc>& Out) override { m_S.TLRowsOf(Out); }
+            void          PlaybackRange(xeditor::timeline::tick& A, xeditor::timeline::tick& B) override { A = 0; B = m_S.TLClipTicks(); }
+            std::string   SetPlaybackRange(xeditor::timeline::tick, xeditor::timeline::tick) override { return "the playback range is the clip's length"; }
+            std::uint64_t Revision() override { return m_S.TLRevision(); }
+            std::string   Validate(const xeditor::timeline::plan& P) override
+            {
+                std::uint64_t Rev = 0; std::vector<xeditor::timeline::text_op> Ops;
+                if (!xeditor::timeline::FromText(xeditor::timeline::ToText(P), Rev, Ops)) return "the plan could not be read";
+                return m_S.TLValidateOps(Rev, Ops);
+            }
+            std::string   Commit(const xeditor::timeline::plan& P) override { return Run(xeditor::timeline::ToText(P)); }
+            std::string   Delete(std::span<const xeditor::timeline::item_ref> R) override
+            { std::string Ops; for (auto& r : R) if (m_S.m_TLRows.count(r.m_Row) && !m_S.m_TLRows[r.m_Row].m_Bone.empty()) Ops += std::format("delete {} {}; ", r.m_Row, r.m_Item); return Ops.empty() ? std::string("only pose keys can be deleted here") : Run(Ops); }
+            std::string   SetRowFlag(std::uint64_t Row, xeditor::timeline::row_flag F, bool bOn) override { return m_S.m_TLRows.count(Row) ? Run(std::format("{} {} {}", F == xeditor::timeline::row_flag::mute ? "mute" : "lock", Row, int(bOn))) : std::string("the clip row has no flags"); }
+            bool          CanMoveRow(std::uint64_t Row) override { return m_S.m_TLRows.count(Row) && m_S.m_TLRows[Row].m_Bone.empty(); }
+            std::string   MoveRow(std::uint64_t Row, std::uint64_t Above) override { return Run(std::format("move {} {}", Row, Above)); }
+            void          OnSelection(const std::set<xeditor::timeline::item_ref>& Sel) override { for (const auto& r : Sel) if (const auto It = m_S.m_TLRows.find(r.m_Row); It != m_S.m_TLRows.end()) { m_S.m_iLayer = It->second.m_iLayer; break; } }
+            void          Seek(xeditor::timeline::tick T) override { m_S.m_TimeSeconds = float(double(T) / double(tl_tps_v)); m_S.m_LoopsElapsed = 0; }
+        };
+
+        // the rows' items: declared; the core draws, picks, selects, snaps and drags them
+        struct tl_rows final : xeditor::timeline::row_type
+        {
+            session& m_S; explicit tl_rows(session& S) noexcept : m_S(S) {}
+            void Query(const xeditor::timeline::row_desc& R, const xeditor::timeline::query& Q, std::vector<xeditor::timeline::item>& Out) override
+            {
+                namespace tl = xeditor::timeline;
+                auto* pOv = m_S.SelectedOv();
+                if (!pOv) return;
+                if (R.m_Type == tl_base)
+                {
+                    tl::item I; I.m_Ref = { R.m_Id, 1 }; I.m_Kind = tl::item_kind::segment; I.m_Seg = { 0, m_S.TLClipTicks() }; I.m_Caps = tl::caps::none; I.m_Label = pOv->m_OriginalName;
+                    Out.push_back(std::move(I)); return;
+                }
+                const auto It = m_S.m_TLRows.find(R.m_Id);
+                if (It == m_S.m_TLRows.end()) return;
+                const auto& L = pOv->m_Layers[It->second.m_iLayer];
+                if (R.m_Type == tl_clip)
+                {
+                    tl::item I; I.m_Ref = { R.m_Id, 1 }; I.m_Kind = tl::item_kind::segment;
+                    const tl::tick End = L.m_End >= 0 ? L.m_End : m_S.TLClipTicks();
+                    tl::tick SrcLen = -1;
+                    if (const auto* pSrc = m_S.FindLayerSource(L.m_SourceKey, L.m_SourceClip); pSrc && pSrc->m_FPS > 0) SrcLen = tl::tick(std::llround(double(std::max(1, pSrc->m_nFrames - 1)) / pSrc->m_FPS * tl_tps_v));
+                    I.m_Seg = { L.m_Start, std::max(End, L.m_Start + 1), L.m_TrimIn, 0, 0, SrcLen };
+                    // trim and slip map timeline ticks onto source ticks one to one: only at rate 1, forward (else the layer moves only)
+                    const bool bPlain = L.m_Rate == 1.0 && !L.m_bReverse;
+                    I.m_Caps = tl::caps::move | (bPlain ? (tl::caps::trim | tl::caps::slip) : 0u);
+                    I.m_Label = L.m_SourceClip.empty() ? L.m_Name : L.m_SourceClip;
+                    if (!Q.m_bAggregate || (I.m_Seg.m_End >= Q.m_T0 && I.m_Seg.m_Start <= Q.m_T1)) Out.push_back(std::move(I));
+                    return;
+                }
+                if (R.m_Type == tl_pose)
+                {
+                    if (!Q.m_bAggregate) return;                // a summary has no items of its own
+                    std::map<tl::tick, std::vector<tl::item_ref>> ByTick;
+                    for (int k = 0; k < int(L.m_Keys.size()); ++k) ByTick[L.m_Keys[k].m_Tick].push_back({ TLBoneRow(R.m_Id, L.m_Keys[k].m_Bone), std::uint64_t(k + 1) });
+                    for (auto& [T, Refs] : ByTick)
+                    {
+                        if (T < Q.m_T0 || T > Q.m_T1) continue;
+                        tl::item I; I.m_Ref = { R.m_Id, std::uint64_t(T) + 1 }; I.m_Kind = tl::item_kind::key; I.m_Seg = { T, T }; I.m_Caps = tl::caps::move | tl::caps::del;
+                        I.m_Count = std::uint32_t(Refs.size()); I.m_Represents = std::move(Refs); I.m_Label = std::format("{} key(s)", I.m_Count);
+                        Out.push_back(std::move(I));
+                    }
+                    return;
+                }
+                // a bone of a pose layer: its keys
+                for (int k = 0; k < int(L.m_Keys.size()); ++k)
+                {
+                    const auto& K = L.m_Keys[k];
+                    if (K.m_Bone != It->second.m_Bone || (Q.m_bAggregate && (K.m_Tick < Q.m_T0 || K.m_Tick > Q.m_T1))) continue;
+                    tl::item I; I.m_Ref = { R.m_Id, std::uint64_t(k + 1) }; I.m_Kind = tl::item_kind::key; I.m_Seg = { K.m_Tick, K.m_Tick }; I.m_Caps = tl::caps::move | tl::caps::del;
+                    I.m_Label = std::format("{}{}{}", K.m_Bone, K.m_bOffset ? " (offset)" : "", K.m_bStep ? " (step)" : "");
+                    Out.push_back(std::move(I));
+                }
+            }
+            // a pose layer's falloff: shaded ramps before its first key and after its last
+            void Overlay(const xeditor::timeline::row_desc& R, ImDrawList& D, const xeditor::timeline::draw_args& A) override
+            {
+                if (R.m_Type != tl_pose && R.m_Type != tl_bone) return;
+                auto* pOv = m_S.SelectedOv(); const auto It = m_S.m_TLRows.find(R.m_Id);
+                if (!pOv || It == m_S.m_TLRows.end()) return;
+                const auto& L = pOv->m_Layers[It->second.m_iLayer];
+                if (L.m_Keys.empty() || L.m_Falloff <= 0) return;
+                xeditor::timeline::tick T0 = L.m_Keys[0].m_Tick, T1 = T0;
+                for (const auto& K : L.m_Keys) { T0 = std::min<xeditor::timeline::tick>(T0, K.m_Tick); T1 = std::max<xeditor::timeline::tick>(T1, K.m_Tick); }
+                const auto F = xeditor::timeline::tick(std::llround(double(L.m_Falloff) * tl_tps_v));
+                const float y0 = A.m_Min.y + 4, y1 = A.m_Max.y - 4;
+                D.AddTriangleFilled({ A.X(T0 - F), y1 }, { A.X(T0), y0 }, { A.X(T0), y1 }, IM_COL32(210, 150, 70, 55));
+                D.AddTriangleFilled({ A.X(T1), y0 }, { A.X(T1 + F), y1 }, { A.X(T1), y1 }, IM_COL32(210, 150, 70, 55));
+                if (T1 > T0) D.AddRectFilled({ A.X(T0), y0 }, { A.X(T1), y1 }, IM_COL32(210, 150, 70, 25));
+            }
+        };
+        tl_rows                                         m_TLRowType{ *this };
+
+        // The timeline under the viewport: the transport is the editor's playback (the playhead = m_TimeSeconds)
+        void RenderLayerTimeline(float Height) noexcept
+        {
+            namespace tl = xeditor::timeline;
+            static_assert(tl_tps_v == tl::animation_ticks_per_second_v);
+            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType } };
+            tl_document Doc(*this);
+            m_TLView.m_View.m_TPS = tl_tps_v;
+            if (auto* pC = SelectedClip(); pC && !m_TLView.m_bFramed) { m_TLView.m_View.m_RateNum = std::max(1, int(pC->m_FPS)); m_TLView.m_View.m_RateDen = 1; }
+            m_TLTransport.m_Time = tl::tick(std::llround(double(m_TimeSeconds) * tl_tps_v));
+            m_TLTransport.m_bPlaying = m_bPlaying;
+            tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height });
+        }
+
+        // LayerTimeline: view state changes (never the descriptor) and the timeline as text (tests read it)
+        std::string TLInfo(const std::string& Time, const std::string& SoloArg, const std::string& Fold, const std::string& Unfold, const std::string& FrameArg) noexcept
+        {
+            namespace tl = xeditor::timeline;
+            std::string A;
+            if (!(A = Time).empty()) { double s = 0; if (std::from_chars(A.data(), A.data() + A.size(), s).ec == std::errc()) { m_TimeSeconds = float(std::max(0.0, s)); m_LoopsElapsed = 0; } }
+            if (!(A = SoloArg).empty()) { unsigned long long R = 0; int On = 0; if (std::sscanf(A.c_str(), "%llu %d", &R, &On) == 2) { if (On) m_TLTransport.m_Solo.insert(R); else m_TLTransport.m_Solo.erase(R); } }
+            if (!Fold.empty()) m_TLView.m_Folded.insert(std::strtoull(Fold.c_str(), nullptr, 10));
+            if (!Unfold.empty()) m_TLView.m_Folded.erase(std::strtoull(Unfold.c_str(), nullptr, 10));
+            if (!(A = FrameArg).empty()) { double a = 0, b = 0; if (std::sscanf(A.c_str(), "%lf %lf", &a, &b) == 2) { m_TLView.m_View.Frame(tl::tick(a * tl_tps_v), tl::tick(b * tl_tps_v)); m_TLView.m_bFramed = true; } }
+            std::vector<tl::row_desc> Rows; TLRowsOf(Rows);
+            const auto& V = m_TLView.m_View;
+            std::string Sel; for (const auto& r : m_TLView.m_Selection) Sel += std::format("{}:{} ", r.m_Row, r.m_Item);
+            std::string Solo; for (auto r : m_TLTransport.m_Solo) Solo += std::format("{} ", r);
+            std::string T = std::format("revision {} dirty {}; time {} ticks; solo [{}]; selection [{}]; layer {}; view left {:.3f} px/tick {:.6f}\n", TLRevision(), int(m_Document.m_bDirty)
+                , tl::tick(std::llround(double(m_TimeSeconds) * tl_tps_v)), Solo, Sel, m_iLayer, V.m_Left, V.m_PxPerTick);
+            const auto& S = m_TLView;
+            T += std::format("body {:.1f},{:.1f}..{:.1f},{:.1f} ruler {:.1f},{:.1f}..{:.1f},{:.1f}; reply {}\n", S.m_Body.Min.x, S.m_Body.Min.y, S.m_Body.Max.x, S.m_Body.Max.y, S.m_Ruler.Min.x, S.m_Ruler.Min.y, S.m_Ruler.Max.x, S.m_Ruler.Max.y, S.m_Reply);
+            for (const auto& [Id, R] : S.m_RowRects) T += std::format("rowrect {} at y {:.1f}..{:.1f}\n", Id, R.Min.y, R.Max.y);
+            for (const auto& R : Rows)
+            {
+                T += std::format("row {} {} {} {} {} {}{}\n", R.m_Id, R.m_Type, R.m_Depth, int(R.m_bMute), int(R.m_bLock), R.m_Name, m_TLView.m_Folded.count(R.m_Id) ? " (folded)" : "");
+                std::vector<tl::item> Items; m_TLRowType.Query(R, { &V, -(tl::tick(1) << 40), tl::tick(1) << 40, R.m_Type == tl_pose }, Items);
+                for (const auto& I : Items)
+                {
+                    if (I.m_Kind == tl::item_kind::segment) T += std::format("seg {} {} {} {} caps {}\n", I.m_Ref.m_Item, I.m_Seg.m_Start, I.m_Seg.m_End, I.m_Seg.m_Offset, I.m_Caps);
+                    else T += std::format("key {} {}{}\n", I.m_Ref.m_Item, I.m_Seg.m_Start, I.m_Count > 1 ? std::format(" x{}", I.m_Count) : std::string{});
+                }
+            }
+            return T;
+        }
+
         // The selected clip's live composition, remade when its layers changed (or the sources were reloaded)
         void UpdateLiveLayers() noexcept
         {
@@ -440,7 +803,8 @@ namespace xanim_package_editor
             const bool bAny = pOv && std::any_of(pOv->m_Layers.begin(), pOv->m_Layers.end(), [](const auto& L) { return L.m_bEnabled; });
             if (!bAny || !pDesc) { m_LayerComposed.clear(); m_LayerSig.clear(); m_LayerError.clear(); m_LayerReport = {}; return; }
             if (m_iSolo >= int(pOv->m_Layers.size())) m_iSolo = -1;
-            const std::string Sig = std::format("{}:{}:{}:{}:{}", m_iSelectedSource, m_iSelectedDescriptorClip, m_LayerSources.size(), m_iSolo, LayerSignature(*pOv));
+            std::string SoloIds; for (auto Id : m_TLTransport.m_Solo) SoloIds += std::format("{},", Id);
+            const std::string Sig = std::format("{}:{}:{}:{}:{}:{}", m_iSelectedSource, m_iSelectedDescriptorClip, m_LayerSources.size(), m_iSolo, SoloIds, LayerSignature(*pOv));
             if (Sig == m_LayerSig) return;
             m_LayerSig = Sig; m_LayerComposed.clear(); m_LayerError.clear();
             const auto* pBase = FindLayerSource(pS->key(), pOv->m_OriginalName);
@@ -448,6 +812,18 @@ namespace xanim_package_editor
             xanim_package_desc::clip Audition;                              // solo: a copy with only that layer on (the descriptor is untouched)
             const xanim_package_desc::clip* pUse = pOv;
             if (m_iSolo >= 0) { Audition = *pOv; for (int i = 0; i < int(Audition.m_Layers.size()); ++i) Audition.m_Layers[i].m_bEnabled = i == m_iSolo; pUse = &Audition; }
+            else if (!m_TLTransport.m_Solo.empty())     // the timeline's solo (a layer row, or a bone row of it): only those layers on, over the clip
+            {
+                Audition = *pOv;
+                for (int i = 0; i < int(Audition.m_Layers.size()); ++i)
+                {
+                    const auto Row = TLLayerRow(Audition.m_Layers[i], i);
+                    bool bSolo = m_TLTransport.m_Solo.count(Row) != 0;
+                    for (const auto& K : Audition.m_Layers[i].m_Keys) bSolo = bSolo || m_TLTransport.m_Solo.count(TLBoneRow(Row, K.m_Bone));
+                    Audition.m_Layers[i].m_bEnabled = Audition.m_Layers[i].m_bEnabled && bSolo;
+                }
+                pUse = &Audition;
+            }
             std::vector<xmath::transform3> Out;
             const auto t0 = std::chrono::steady_clock::now();
             const bool bOk = xanim_package_layers::Compose(*pBase, *pUse, pDesc->m_ResolvedSkeletonBones, [this](const std::wstring& K, const std::string& C) { return FindLayerSource(K, C); }, Out, m_LayerReport, m_LayerError);
@@ -2301,9 +2677,11 @@ namespace xanim_package_editor
                 if (m_iSelectedDescriptorClip >= 0 && m_iSelectedDescriptorClip < int(Clips.size())) pName = Clips[m_iSelectedDescriptorClip].m_Name.c_str();
             }
 
-            // The footer line stays at the bottom; the timeline takes what is above it
+            // The footer line stays at the bottom; the layer timeline (the clip and its layers as rows) takes what is above it
             const float Footer = ImGui::GetTextLineHeightWithSpacing();
-            if (xgpu::tools::imgui::timeline::Draw(m_Timeline, m_TimeSeconds, Length, static_cast<float>(pClip->m_FPS), {}, "playback_timeline", pName, std::max(ImGui::GetContentRegionAvail().y - Footer, 0.0f)))
+            (void)pName;
+            if (SelectedOv()) RenderLayerTimeline(std::max(ImGui::GetContentRegionAvail().y - Footer, 60.0f));
+            else if (xgpu::tools::imgui::timeline::Draw(m_Timeline, m_TimeSeconds, Length, static_cast<float>(pClip->m_FPS), {}, "playback_timeline", pName, std::max(ImGui::GetContentRegionAvail().y - Footer, 0.0f)))
                 m_LoopsElapsed = 0;     // scrubbed by hand: the count of elapsed loops means nothing now
 
             ImGui::Text("Zoom: %.0f%%    FPS: %d    Frames: %d    Loop: %s    Root Motion: %s"
@@ -2446,6 +2824,19 @@ namespace xanim_package_editor
             return S.SuggestPoseAccept(iL, iC, bRefine);
         }
         case kind::layers_info: return S.LayersInfo();
+        case kind::layer_timeline_edit:
+        {
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, A)) return "LayerTimelineEdit: -Ops is required";
+            const auto E = S.TLApply(A);
+            return E.empty() ? std::format("LayerTimelineEdit: done (revision {})", S.TLRevision()) : "LayerTimelineEdit: " + E;
+        }
+        case kind::layer_timeline:
+        {
+            std::string T0, T1, T2, T3, T4;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, T0); xeditor::cmd_util::GetArg(m_Parser, m_hB, T1); xeditor::cmd_util::GetArg(m_Parser, m_hC, T2);
+            xeditor::cmd_util::GetArg(m_Parser, m_hD, T3); xeditor::cmd_util::GetArg(m_Parser, m_hE, T4);
+            return S.TLInfo(T0, T1, T2, T3, T4);
+        }
         case kind::kimodo_info:
         {
             auto* pDesc = S.Desc();

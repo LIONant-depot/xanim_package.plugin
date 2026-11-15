@@ -168,6 +168,7 @@ namespace xanim_package_desc
         std::uint64_t       m_Id          = 0;          // stable identity (commands, undo, reports); 0 = not given yet (the editor gives one)
         std::string         m_Name        = {};
         bool                m_bEnabled    = true;       // a disabled layer is not in the build (solo is the editor's, never stored)
+        bool                m_bLock       = false;      // edit lock (the timeline refuses edits of a locked layer); no effect on the build
         layer_mode          m_Mode        = layer_mode::OVERRIDE;
         additive_reference  m_Reference   = additive_reference::REST_POSE;
         std::int64_t        m_ReferenceTick = 0;        // SOURCE_FRAME: the source time of the reference frame (ticks)
@@ -197,6 +198,7 @@ namespace xanim_package_desc
         , obj_member<"Id",            &clip_layer::m_Id, member_flags<flags::SHOW_READONLY> >
         , obj_member<"Name",          &clip_layer::m_Name >
         , obj_member<"Enabled",       &clip_layer::m_bEnabled >
+        , obj_member<"Lock",          &clip_layer::m_bLock >
         , obj_member<"Mode",          &clip_layer::m_Mode, member_enum_span<layer_mode_v> >
         , obj_member<"Reference",     &clip_layer::m_Reference, member_enum_span<additive_reference_v> >
         , obj_member<"ReferenceTick", &clip_layer::m_ReferenceTick >
