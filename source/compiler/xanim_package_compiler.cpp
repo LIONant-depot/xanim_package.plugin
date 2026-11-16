@@ -1,4 +1,5 @@
 #include "xanim_package_compiler.h"
+#include "dependencies/xAnimation/source/semantic/xanimation_clip_traits.h"
 
 #include "dependencies/xraw3d/source/xraw3d.h"
 #include "dependencies/xraw3d/source/details/xraw3d_assimp_import_v3.h"
@@ -892,6 +893,19 @@ namespace xanim_package_compiler
                 D.m_NameHash = S.m_NameHash; D.m_FPS = S.m_FPS; D.m_nFrames = S.m_nFrames; D.m_bLoop = S.m_bLoop; D.m_RootMotionMode = S.m_RootMotionMode;
                 D.m_LoopDisplacement.m_X = S.m_LoopDisplacement.m_X; D.m_LoopDisplacement.m_Y = S.m_LoopDisplacement.m_Y; D.m_LoopDisplacement.m_Z = S.m_LoopDisplacement.m_Z;
                 D.m_iFirstKeyFrame = S.m_iFirstKeyFrame; D.m_iFirstRootMotion = S.m_iFirstRootMotion; D.m_iFirstEvent = S.m_iFirstEvent; D.m_nEvents = S.m_nEvents;
+                // what the clip does (soccer answer 4): measured on its final frames, with the travel its root motion took out
+                {
+                    const int nB = static_cast<int>(ResolvedBones.size());
+                    std::vector<std::int32_t> Par(nB); std::vector<std::string_view> Nm(nB);
+                    for (int b = 0; b < nB; ++b) { Par[b] = ResolvedBones[b].m_iParent; Nm[b] = ResolvedBones[b].m_Name; }
+                    xanimation::clip_view CV; CV.m_nBones = nB; CV.m_nFrames = S.m_nFrames; CV.m_FPS = S.m_FPS; CV.m_bLoop = S.m_bLoop;
+                    CV.m_Frames = { AllKeyFrames.data() + S.m_iFirstKeyFrame, std::size_t(S.m_nFrames) * nB };
+                    std::span<const xmath::fvec3> RM; if (S.m_RootMotionMode != xanim_package::root_motion_mode::NONE) RM = { AllRootMotion.data() + S.m_iFirstRootMotion, std::size_t(S.m_nFrames) };
+                    const auto Tr = xanimation::MeasureClip(xanimation::skeleton_view{ Par }, Nm, CV, RM);
+                    D.m_Speed = Tr.m_Speed; D.m_Direction = Tr.m_Direction; D.m_TurnRate = Tr.m_TurnRate; D.m_LoopError = Tr.m_LoopError; D.m_Height = Tr.m_Height;
+                    LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': moves {:.2f} units/s at {:.0f} deg from its facing, turns {:.1f} deg/s, its ends {:.1f} deg apart{}, centroid height {:.2f}"
+                        , Names[i], Tr.m_Speed, Tr.m_Direction, Tr.m_TurnRate, Tr.m_LoopError, Tr.m_LoopError < 5 ? " (loops)" : "", Tr.m_Height));
+                }
             }
 
             m_FinalPackage.m_nBones = static_cast<std::uint32_t>(ResolvedBones.size());

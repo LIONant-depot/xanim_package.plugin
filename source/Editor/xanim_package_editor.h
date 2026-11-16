@@ -5383,6 +5383,8 @@ namespace xanim_package_editor
             if (pClip) Text += std::format("time: {:.3f} / {:.3f}s\nplaying: {}\nspeed: {}\nfps: {}  frames: {}  loop: {}  root motion: {}\n"
                 , S.m_TimeSeconds, session::ClipLength(*pClip), S.m_bPlaying ? "yes" : "no", xgpu::tools::editors::g_PlaybackSpeedLabels[S.m_iSpeedIndex]
                 , pClip->m_FPS, pClip->m_nFrames, pClip->m_bLoop ? "yes" : "no", RootMotionModeName(pClip->m_RootMotionMode));
+            if (pClip) Text += std::format("does: moves {:.2f} units/s at {:.0f} deg from its facing, turns {:.1f} deg/s, ends {:.1f} deg apart{}, centroid height {:.2f}; {} events\n"
+                , pClip->m_Speed, pClip->m_Direction, pClip->m_TurnRate, pClip->m_LoopError, pClip->m_LoopError < 5 ? " (loops)" : "", pClip->m_Height, pClip->m_nEvents);
             return Text;
         }
         case kind::list_clips:

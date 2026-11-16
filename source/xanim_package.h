@@ -35,6 +35,12 @@ namespace xanim_package
         std::uint32_t       m_iFirstRootMotion  {0};    // offset into anim_package::m_pRootMotion; only meaningful if m_RootMotionMode != NONE
         std::uint32_t       m_iFirstEvent       {0};    // offset into anim_package::m_pEvents (sorted by time)
         std::uint32_t       m_nEvents           {0};
+        // what the clip does (xanimation::MeasureClip, soccer answer 4): selection and motion matching read these, never the keys
+        float               m_Speed             {0};    // horizontal travel / duration (units per second)
+        float               m_Direction         {0};    // degrees from the facing at the start to the travel (0 forward, 90 left, 180 back)
+        float               m_TurnRate          {0};    // degrees per second the facing turns (positive: to its left)
+        float               m_LoopError         {0};    // degrees between the first and last frames' local rotations (small: it loops)
+        float               m_Height            {0};    // the bones' centroid's mean height
     };
 
     // What a marker on a clip's timeline is (T5): the runtime and the tools read the kind; the name is free text (hashed)
@@ -54,7 +60,7 @@ namespace xanim_package
 
     struct anim_package
     {
-        inline static constexpr auto xserializer_version_v = 2;     // 2: events
+        inline static constexpr auto xserializer_version_v = 3;     // 2: events; 3: clip traits
 
                                         anim_package    (void)                          noexcept = default;
         inline                         anim_package    (xserializer::stream& Stream)    noexcept;
@@ -202,6 +208,8 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Clip.m_iFirstRootMotion))
             || (Err = Stream.Serialize(Clip.m_iFirstEvent))
             || (Err = Stream.Serialize(Clip.m_nEvents))
+            || (Err = Stream.Serialize(Clip.m_Speed)) || (Err = Stream.Serialize(Clip.m_Direction)) || (Err = Stream.Serialize(Clip.m_TurnRate))
+            || (Err = Stream.Serialize(Clip.m_LoopError)) || (Err = Stream.Serialize(Clip.m_Height))
             ;
         return Err;
     }
