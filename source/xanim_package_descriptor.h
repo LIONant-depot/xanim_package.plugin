@@ -12,6 +12,8 @@
 #include <functional>
 #include <format>
 #include <algorithm>
+#include <map>
+#include <limits>
 
 namespace xanim_package_desc
 {
@@ -203,6 +205,9 @@ namespace xanim_package_desc
         int                 m_Steps       = 25;
         float               m_Seconds     = 2.0f;
         std::string         m_AcceptedSig = {};
+        // Clip and Kimodo layers: the timeline row this layer is a segment of (layers with the same Row and parent are ONE row; where two
+        // overlap they crossfade - the upper one eases in or out over the overlap; three at once is an error). 0 = a row of its own.
+        std::uint64_t       m_Row         = 0;
 
         XPROPERTY_DEF
         ( "Layer", clip_layer
@@ -240,9 +245,31 @@ namespace xanim_package_desc
         , obj_member<"Steps",         &clip_layer::m_Steps >
         , obj_member<"Seconds",       &clip_layer::m_Seconds >
         , obj_member<"AcceptedSig",   &clip_layer::m_AcceptedSig, member_flags<flags::SHOW_READONLY> >
+        , obj_member<"Row",           &clip_layer::m_Row >
         )
     };
     XPROPERTY_REG(clip_layer)
+
+    // A row's segments (layers with the same Row and parent): at most two may overlap at any time (they crossfade). End -1 = the clip's end.
+    // Returns the first row where three overlap ("" when none). Segments that are off do not count.
+    template< typename T_LAYERS >
+    inline std::string RowOverlapError(const T_LAYERS& Layers, std::int64_t ClipEnd = std::numeric_limits<std::int64_t>::max())
+    {
+        std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<std::pair<std::int64_t, int>>> Ev;
+        for (const auto& L : Layers)
+            if (L.m_Row && L.m_bEnabled && (L.m_Kind == layer_kind::CLIP || L.m_Kind == layer_kind::KIMODO))      // a segment that is off plays nothing: it never conflicts
+            {
+                auto& E = Ev[{ L.m_Parent, L.m_Row }];
+                E.push_back({ L.m_Start, +1 }); E.push_back({ L.m_End >= 0 ? L.m_End : ClipEnd, -1 });
+            }
+        for (auto& [K, E] : Ev)
+        {
+            std::sort(E.begin(), E.end());          // an end before a start at the same tick: touching is not overlapping
+            int n = 0;
+            for (const auto& [T, d] : E) if ((n += d) > 2) return std::format("row {}: three segments overlap at {:.3f} s (two at most: they crossfade)", K.second, double(T) / 6000.0);
+        }
+        return {};
+    }
 
     // A sparse override entry for one imported clip, matched BY m_OriginalName against its OWNING
     // import_source's own details::source::m_ClipList - a raw clip's name is only ever guaranteed
@@ -355,6 +382,8 @@ namespace xanim_package_desc
                 if (S.bPackage() && S.m_Package.empty())      Errors.push_back(std::format("Import source {}: an animation package kind needs its Package", i));
                 if (S.bDifferent() && S.m_Retarget.empty())   Errors.push_back(std::format("Import source {}: a different-skeleton kind needs its Retarget", i));
                 for (const auto& C : S.m_Clips)
+                {
+                    if (auto E = RowOverlapError(C.m_Layers); !E.empty()) Errors.push_back(std::format("Clip '{}', {}", C.m_Name, E));
                     for (const auto& L : C.m_Layers)
                     {
                         const auto Where = std::format("Clip '{}', layer '{}'", C.m_Name, L.m_Name);
@@ -367,6 +396,7 @@ namespace xanim_package_desc
                         if (L.m_End >= 0 && L.m_End <= L.m_Start)              Errors.push_back(Where + ": it ends before it starts");
                         if (L.m_TrimOut >= 0 && L.m_TrimOut < L.m_TrimIn)      Errors.push_back(Where + ": trim out is before trim in");
                     }
+                }
             }
         }
 

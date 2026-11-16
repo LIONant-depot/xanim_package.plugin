@@ -132,6 +132,8 @@ namespace xanim_package_layers
             In[i] = bOn;
         }
 
+        if (auto E = xanim_package_desc::RowOverlapError(LL, ToTick(double(nFrames) / FPS)); !E.empty()) { Error = E; return false; }
+
         std::vector<prepared> Layers;
         Layers.reserve(Ov.m_Layers.size());
         std::vector<std::uint64_t> PreparedParent;
@@ -201,6 +203,34 @@ namespace xanim_package_layers
             std::sort(P.m_Keys.begin(), P.m_Keys.end(), [](const auto& A, const auto& B) { return A.m_Tick < B.m_Tick; });
         }
 
+        // Rows (T4b): Clip/Kimodo layers with the same Row and parent are one timeline row; where two overlap they crossfade. The upper one
+        // eases in (it starts later) or out (it ends earlier) over the overlap with a smoothstep; over an override that is the crossfade
+        // itself; an additive lower one eases the other way so the sum does not double. One covering the other entirely: no fade (it wins).
+        auto RowFade = [&](std::size_t i, xanimation::tick T) -> float
+        {
+            const auto& Pi = *Layers[i].m_pDesc;
+            if (!Pi.m_Row || (Pi.m_Kind != kind::CLIP && Pi.m_Kind != kind::KIMODO)) return 1.0f;
+            // the upper layer U's weight over the lower D at T; -1 when no crossfade applies (outside the overlap, or U covers D)
+            auto Fade = [&](const prepared& U, const prepared& D) -> float
+            {
+                const auto a = std::max(U.m_Time.m_Start, D.m_Time.m_Start), b = std::min(U.m_Time.m_End, D.m_Time.m_End);
+                if (b <= a || T < a || T >= b) return -1.0f;
+                const float u = float(double(T - a) / double(b - a)), s = u * u * (3.0f - 2.0f * u);
+                if (U.m_Time.m_Start > D.m_Time.m_Start) return s;
+                if (U.m_Time.m_End < D.m_Time.m_End)     return 1.0f - s;
+                return -1.0f;
+            };
+            float W = 1.0f;
+            for (std::size_t j = 0; j < Layers.size(); ++j)
+            {
+                const auto& Pj = *Layers[j].m_pDesc;
+                if (j == i || Pj.m_Row != Pi.m_Row || PreparedParent[j] != PreparedParent[i] || (Pj.m_Kind != kind::CLIP && Pj.m_Kind != kind::KIMODO)) continue;
+                if (j < i) { if (const float f = Fade(Layers[i], Layers[j]); f >= 0) W *= f; }                                             // i is the upper one
+                else if (Pi.m_Mode == xanim_package_desc::layer_mode::ADDITIVE) { if (const float f = Fade(Layers[j], Layers[i]); f >= 0) W *= 1.0f - f; }   // i additive, under j
+            }
+            return W;
+        };
+
         // layer by layer over the whole clip (each layer sees the finished stack below it: an additive Pose layer's anchors read it)
         xanimation::pose Pose; Pose.resize(nSkel);
         xanimation::layer_sample Sample; Sample.resize(nSkel);
@@ -237,7 +267,7 @@ namespace xanim_package_layers
                 for (int s = 0; s < nSkel; ++s) Pose.set(s, Out[static_cast<std::size_t>(f) * nSkel + s]);
                 xanimation::layer_apply A;
                 A.m_Mode       = bAdd ? xanimation::layer_mode::ADDITIVE : xanimation::layer_mode::OVERRIDE;
-                A.m_Weight     = xanimation::EvaluateWeight(P.m_Keys, T, P.m_pDesc->m_Weight);
+                A.m_Weight     = xanimation::EvaluateWeight(P.m_Keys, T, P.m_pDesc->m_Weight) * RowFade(std::size_t(&P - Layers.data()), T);
                 A.m_Mask       = P.m_Mask;
                 A.m_pReference = bAdd ? &P.m_Reference : nullptr;
                 A.m_Root       = (bPose || P.m_pDesc->m_Root == xanim_package_desc::layer_root::FROM_LAYER) ? xanimation::root_policy::FROM_LAYER : xanimation::root_policy::INHERIT_BELOW;   // a pose layer's positioned key is the user's intent, the root's too

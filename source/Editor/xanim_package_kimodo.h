@@ -184,6 +184,24 @@ namespace xanim_package_editor::kimodo
             return true;
         }
 
+        // a run with its own arguments (constraints, frames, steps): the same client, never waited on
+        bool StartArgs(const std::wstring& Exe, const std::wstring& Args, const std::wstring& Bvh, const std::wstring& Log, std::string& Error) noexcept
+        {
+            m_Bvh = Bvh; m_Log = Log;
+            std::error_code Ec; std::filesystem::remove(m_Bvh, Ec);
+            std::wstring Cmd = std::format(L"\"{}\" {}", Exe, Args);
+            if (const wchar_t* M = _wgetenv(L"XKIMODO_MODELS"); M && *M) Cmd += std::format(L" --models \"{}\"", M);
+            SECURITY_ATTRIBUTES SA{ sizeof(SA), nullptr, TRUE };
+            HANDLE hLog = CreateFileW(m_Log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &SA, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            STARTUPINFOW SI{ sizeof(SI) };
+            SI.dwFlags = STARTF_USESTDHANDLES; SI.hStdOutput = hLog; SI.hStdError = hLog; SI.hStdInput = nullptr;
+            const BOOL Ok = CreateProcessW(nullptr, Cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &SI, &m_PI);
+            if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+            if (!Ok) { Error = std::format("xkimodo could not start (error {})", GetLastError()); return false; }
+            m_bRunning = true; m_StartTime = ImGui::GetTime();
+            return true;
+        }
+
         // true when it just ended; Ok tells whether the BVH is there
         bool Poll(bool& Ok, std::string& Message) noexcept
         {

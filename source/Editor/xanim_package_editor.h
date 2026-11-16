@@ -162,6 +162,7 @@ namespace xanim_package_editor
             case kind::kimodo_regenerate:
                 m_hA = m_Parser.addOption("Layer", "The Kimodo layer's index in the selected clip", true, 1);
                 m_hB = m_Parser.addOption("Seeds", "\"1 2 3\": one candidate per seed (alternatives); default: the layer's seed", false, 1);
+                m_hC = m_Parser.addOption("Wait",  "1: wait for the background run to end (scripts)", false, 1);
                 break;
             case kind::kimodo_accept_candidate: m_hA = m_Parser.addOption("Candidate", "Which candidate (default 0)", false, 1); break;
             case kind::kimodo_show:             m_hA = m_Parser.addOption("Candidate", "A candidate to preview at the playhead, -1: none", true, 1); break;
@@ -521,7 +522,7 @@ namespace xanim_package_editor
             std::string S;
             for (const auto& L : C.m_Layers)
             {
-                S += std::format("{}|{}|{}|{}|{}|", int(L.m_Space), int(L.m_Kind), L.m_Id, L.m_Parent, L.m_SharedMask);
+                S += std::format("{}|{}|{}|{}|{}|r{}|", int(L.m_Space), int(L.m_Kind), L.m_Id, L.m_Parent, L.m_SharedMask, L.m_Row);
                 for (const auto& K : L.m_Keys) S += std::format("p{},{},{},{},{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Bone, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bOffset, K.m_bStep, K.m_bPosition, K.m_PX, K.m_PY, K.m_PZ);
                 S += std::format("s{},{}|", L.m_bSmooth, L.m_Falloff);
                 S += std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", L.m_bEnabled, int(L.m_Mode), int(L.m_Reference), L.m_ReferenceTick, xstrtool::To(L.m_SourceKey), L.m_SourceClip
@@ -539,7 +540,7 @@ namespace xanim_package_editor
         // folding, solo and selection never touch the descriptor.
         //----------------------------------------------------------------------------------------
         static constexpr std::uint64_t tl_base_row_v = 0xB000000000000001ull;
-        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4, tl_folder = 5, tl_group = 6 };
+        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4, tl_folder = 5, tl_group = 6, tl_weight = 7 };     // tl_weight: a layer's weight curve lane
 
         // contract v3: a layer's effective parent (its folder or group in this clip; 0 = the top level). A parent that names nothing, or
         // loops, is the top level - the same rule as the composition (xanim_package_layers::Compose)
@@ -564,7 +565,20 @@ namespace xanim_package_editor
             }
             return false;
         }
-        struct tl_row { int m_iLayer = -1; std::string m_Bone; };
+        struct tl_row { int m_iLayer = -1; std::string m_Bone; bool m_bMerged = false; bool m_bWeight = false; };    // merged: Clip/Kimodo layers sharing a Row (T4b); m_iLayer = the top one, the items name their layer
+        static std::uint64_t TLMergedRow(std::uint64_t Parent, std::uint64_t Row) noexcept { return ((Row * 0x9E3779B97F4A7C15ull) ^ Parent) & 0x3FFFFFFFFFFFFFFFull | 0x8000000000000000ull; }
+        // the layers of a timeline row: one, or every member of a merged row
+        std::vector<int> TLMembers(std::uint64_t RowId) noexcept
+        {
+            std::vector<int> M; auto* pOv = SelectedOv(); const auto It = m_TLRows.find(RowId);
+            if (!pOv || It == m_TLRows.end()) return M;
+            if (!It->second.m_bMerged) { M.push_back(It->second.m_iLayer); return M; }
+            const auto& H = pOv->m_Layers[It->second.m_iLayer];
+            for (int i = 0; i < int(pOv->m_Layers.size()); ++i)
+                if (pOv->m_Layers[i].m_Row == H.m_Row && TLParentOf(*pOv, i) == TLParentOf(*pOv, It->second.m_iLayer)
+                    && (pOv->m_Layers[i].m_Kind == xanim_package_desc::layer_kind::CLIP || pOv->m_Layers[i].m_Kind == xanim_package_desc::layer_kind::KIMODO)) M.push_back(i);
+            return M;
+        }
         std::unordered_map<std::uint64_t, tl_row>       m_TLRows;               // rebuilt with the rows: row id -> layer (and bone)
         std::set<std::uint64_t>                         m_TLSeen;               // pose rows seen (a new one starts folded)
         xeditor::timeline::state                        m_TLView;
@@ -599,6 +613,7 @@ namespace xanim_package_editor
             if (!pOv) return;
             // the tree (contract v3): top first in mix order; a folder's or group's children indented under it, top first too
             using kind = xanim_package_desc::layer_kind;
+            std::set<std::uint64_t> MergedDone;
             std::function<void(std::uint64_t, int, bool, bool)> Emit = [&](std::uint64_t Parent, int Depth, bool bMuteUp, bool bLockUp)
             {
                 for (int i = int(pOv->m_Layers.size()) - 1; i >= 0; --i)
@@ -606,8 +621,10 @@ namespace xanim_package_editor
                     const auto& L = pOv->m_Layers[i];
                     if (TLParentOf(*pOv, i) != Parent) continue;
                     const bool bPose = L.m_Kind == kind::POSE, bFolder = L.m_Kind == kind::FOLDER, bGroup = L.m_Kind == kind::GROUP;
+                    const bool bMerged = L.m_Row && (L.m_Kind == kind::CLIP || L.m_Kind == kind::KIMODO);
+                    if (bMerged && !MergedDone.insert(TLMergedRow(Parent, L.m_Row)).second) continue;     // its row is drawn already (by its top member)
                     xeditor::timeline::row_desc R;
-                    R.m_Id = TLLayerRow(L, i); R.m_Type = bPose ? tl_pose : bFolder ? tl_folder : bGroup ? tl_group : tl_clip;
+                    R.m_Id = bMerged ? TLMergedRow(Parent, L.m_Row) : TLLayerRow(L, i); R.m_Type = bPose ? tl_pose : bFolder ? tl_folder : bGroup ? tl_group : tl_clip;
                     R.m_Depth = Depth;
                     R.m_Name = L.m_Name.empty() ? "(unnamed)" : L.m_Name;     // weight, mode and mask are the row's header widgets
                     R.m_bMute = !L.m_bEnabled || bMuteUp; R.m_bLock = L.m_bLock || bLockUp;
@@ -618,9 +635,17 @@ namespace xanim_package_editor
                     bool bKids = !Bones.empty();
                     if (bContainer) for (int j = 0; j < int(pOv->m_Layers.size()) && !bKids; ++j) bKids = j != i && TLParentOf(*pOv, j) == L.m_Id && L.m_Id;
                     R.m_bHasChildren = bKids;
-                    if (bPose && m_TLSeen.insert(R.m_Id).second) m_TLView.m_Folded.insert(R.m_Id);      // a pose layer starts folded: its summary row
-                    Out.push_back(R); m_TLRows[R.m_Id] = { i, {} };
+                    const bool bLane = !bContainer && !bMerged;          // a layer's weight curve lane (its first child row)
+                    if (bLane) { R.m_bHasChildren = true; if (m_TLSeen.insert(R.m_Id).second) m_TLView.m_Folded.insert(R.m_Id); }     // folded at first: the summary row
+                    if (bMerged) R.m_Name = std::format("{} (row)", R.m_Name);
+                    Out.push_back(R); m_TLRows[R.m_Id] = { i, {}, bMerged };
                     if (bContainer) { if (L.m_Id) Emit(L.m_Id, Depth + 1, R.m_bMute, R.m_bLock); continue; }
+                    if (bLane)
+                    {
+                        xeditor::timeline::row_desc Wl; Wl.m_Id = TLBoneRow(R.m_Id, "#weight"); Wl.m_Type = tl_weight; Wl.m_Depth = Depth + 1; Wl.m_Name = "Weight";
+                        Wl.m_bMute = R.m_bMute; Wl.m_bLock = R.m_bLock; Wl.m_Color = IM_COL32(120, 200, 150, 255); Wl.m_bToggles = false;
+                        Out.push_back(Wl); m_TLRows[Wl.m_Id] = { i, "#weight", false, true };
+                    }
                     for (const auto& B : Bones)
                     {
                         xeditor::timeline::row_desc C; C.m_Id = TLBoneRow(R.m_Id, B); C.m_Type = tl_bone; C.m_Depth = Depth + 1; C.m_Name = B;
@@ -656,7 +681,7 @@ namespace xanim_package_editor
                     for (const auto& O : P)
                     {
                         const auto* pR = RowOf(O.m_Ref.m_Row);
-                        const int iL = pR->m_iLayer;
+                        const int iL = pR->m_bMerged ? int(O.m_Ref.m_Item) - 1 : pR->m_iLayer;     // a merged row's segment names its layer
                         const auto L = pOv->m_Layers[iL];                   // a copy: the writes below change the descriptor
                         if (O.m_Kind == 's')
                         {
@@ -667,6 +692,13 @@ namespace xanim_package_editor
                             if (auto Err = Set(iL, "TrimIn", Ti, std::to_string(L.m_TrimIn)); !Err.empty()) return Err;
                             if (L.m_TrimOut >= 0)
                                 if (auto Err = Set(iL, "TrimOut", std::to_string(O.m_Seg.m_Offset + (O.m_Seg.m_End - O.m_Seg.m_Start)), std::to_string(L.m_TrimOut)); !Err.empty()) return Err;
+                        }
+                        else if (pR->m_bWeight)           // a weight key: its time and its value (0..1)
+                        {
+                            const int k = int(O.m_Ref.m_Item) - 1;
+                            if (auto Err = Set(iL, std::format("WeightKeys[G:{}]/Tick", k).c_str(), std::to_string(O.m_Seg.m_Start), std::to_string(L.m_WeightKeys[k].m_Tick)); !Err.empty()) return Err;
+                            if (O.m_Value == O.m_Value)
+                                if (auto Err = Set(iL, std::format("WeightKeys[G:{}]/Value", k).c_str(), std::format("{}", std::clamp(O.m_Value, 0.0f, 1.0f)), std::format("{}", L.m_WeightKeys[k].m_Value)); !Err.empty()) return Err;
                         }
                         else
                         {
@@ -679,7 +711,7 @@ namespace xanim_package_editor
             }
             // row ops
             std::vector<std::string> Parts; { std::size_t a = 0; while (a <= Ops.size()) { auto b = Ops.find(';', a); if (b == std::string::npos) b = Ops.size(); Parts.push_back(Ops.substr(a, b - a)); a = b + 1; } }
-            std::map<int, std::vector<int>> Deletes;            // layer -> key indices
+            std::map<int, std::vector<int>> Deletes, WDeletes;  // layer -> key indices (pose keys, weight keys)
             std::vector<std::function<std::string()>> Steps;
             for (const auto& Part : Parts)
             {
@@ -693,25 +725,92 @@ namespace xanim_package_editor
                 if (!pR) return std::format("no layer row {}", R);
                 const int iL = pR->m_iLayer;
                 const auto& L = pOv->m_Layers[iL];
-                if (Op == "mute" && n == 3) Steps.push_back([=, this] { return Set(iL, "Enabled", X ? "false" : "true", SelectedOv()->m_Layers[iL].m_bEnabled ? "true" : "false"); });
-                else if (Op == "lock" && n == 3) Steps.push_back([=, this] { return Set(iL, "Lock", X ? "true" : "false", SelectedOv()->m_Layers[iL].m_bLock ? "true" : "false"); });
+                const std::vector<int> Mem = pR->m_bMerged ? TLMembers(R) : std::vector<int>{ iL };     // a merged row's header acts on all its segments
+                if (Op == "mute" && n == 3) { for (int m : Mem) Steps.push_back([=, this] { return Set(m, "Enabled", X ? "false" : "true", SelectedOv()->m_Layers[m].m_bEnabled ? "true" : "false"); }); }
+                else if (Op == "lock" && n == 3) { for (int m : Mem) Steps.push_back([=, this] { return Set(m, "Lock", X ? "true" : "false", SelectedOv()->m_Layers[m].m_bLock ? "true" : "false"); }); }
                 else if (Op == "weight" && n == 3)
                 {
-                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
-                    if (!L.m_WeightKeys.empty()) return std::format("layer '{}' has a weight curve: edit its keys", L.m_Name);
                     if (F < 0 || F > 1) return "a weight is 0..1";
-                    Steps.push_back([=, this] { return Set(iL, "Weight", std::format("{}", float(F)), std::format("{}", SelectedOv()->m_Layers[iL].m_Weight)); });
+                    for (int m : Mem)
+                    {
+                        const auto& Lm = pOv->m_Layers[m];
+                        if (Lm.m_bLock) return std::format("layer '{}' is locked", Lm.m_Name);
+                        if (!Lm.m_WeightKeys.empty()) return std::format("layer '{}' has a weight curve: edit its keys", Lm.m_Name);
+                        Steps.push_back([=, this] { return Set(m, "Weight", std::format("{}", float(F)), std::format("{}", SelectedOv()->m_Layers[m].m_Weight)); });
+                    }
                 }
                 else if (Op == "mode" && n == 3)
                 {
+                    for (int m : Mem)
+                    {
+                        if (pOv->m_Layers[m].m_bLock) return std::format("layer '{}' is locked", pOv->m_Layers[m].m_Name);
+                        Steps.push_back([=, this] { return Set(m, "Mode", X ? "Additive" : "Override", SelectedOv()->m_Layers[m].m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "Additive" : "Override"); });
+                    }
+                }
+                else if (Op == "join" && n == 3)        // "join row target_row": a Clip/Kimodo row becomes segments of the target's row (they crossfade where they overlap)
+                {
+                    const auto* pT = RowOf(X);
+                    if (!pT || !pT->m_Bone.empty() || X == R) return std::format("no other clip row {}", X);
+                    auto IsSeg = [&](int i) { const auto K = pOv->m_Layers[i].m_Kind; return K == xanim_package_desc::layer_kind::CLIP || K == xanim_package_desc::layer_kind::KIMODO; };
+                    const auto TMem = pT->m_bMerged ? TLMembers(X) : std::vector<int>{ pT->m_iLayer };
+                    for (int m : Mem)  if (!IsSeg(m)) return "only clip and Kimodo rows have segments";
+                    for (int m : TMem) if (!IsSeg(m)) return "only clip and Kimodo rows have segments";
+                    if (TLParentOf(*pOv, Mem[0]) != TLParentOf(*pOv, TMem[0])) return "the two rows are in different folders or groups (move one first)";
+                    const auto& TL0 = pOv->m_Layers[TMem[0]];
+                    const std::uint64_t RowId = TL0.m_Row ? TL0.m_Row : (TL0.m_Id ? TL0.m_Id : 0x5EED0000ull + std::uint64_t(TMem[0]));
+                    auto After = pOv->m_Layers;
+                    for (int m : TMem) After[m].m_Row = RowId;
+                    for (int m : Mem)  After[m].m_Row = RowId;
+                    if (auto E = xanim_package_desc::RowOverlapError(After, TLClipTicks()); !E.empty()) return E;
+                    for (int m : TMem) if (pOv->m_Layers[m].m_Row != RowId) Steps.push_back([=, this] { return Set(m, "Row", std::to_string(RowId), std::to_string(SelectedOv()->m_Layers[m].m_Row)); });
+                    for (int m : Mem)  Steps.push_back([=, this] { return Set(m, "Row", std::to_string(RowId), std::to_string(SelectedOv()->m_Layers[m].m_Row)); });
+                }
+                else if (Op == "split" && n == 3)       // "split row layer_index": that segment leaves the row (a row of its own)
+                {
+                    if (std::find(Mem.begin(), Mem.end(), int(X)) == Mem.end() || !pR->m_bMerged) return std::format("layer {} is not a segment of row {}", X, R);
+                    const int m = int(X);
+                    Steps.push_back([=, this] { return Set(m, "Row", "0", std::to_string(SelectedOv()->m_Layers[m].m_Row)); });
+                }
+                else if (Op == "joinfolder" && n >= 2)  // "joinfolder folder_row": the clip/Kimodo layers directly in that folder become ONE row (the old "several takes = a folder of Kimodo layers")
+                {
+                    const auto& FL = pOv->m_Layers[iL];
+                    if (FL.m_Kind != xanim_package_desc::layer_kind::FOLDER || !FL.m_Id) return std::format("'{}' is not a folder", FL.m_Name);
+                    auto After = pOv->m_Layers; std::vector<int> Kids;
+                    for (int i = 0; i < int(After.size()); ++i)
+                        if (TLParentOf(*pOv, i) == FL.m_Id && (After[i].m_Kind == xanim_package_desc::layer_kind::CLIP || After[i].m_Kind == xanim_package_desc::layer_kind::KIMODO)) { After[i].m_Row = FL.m_Id; Kids.push_back(i); }
+                    if (Kids.size() < 2) return "the folder needs two clip or Kimodo layers";
+                    if (auto E = xanim_package_desc::RowOverlapError(After, TLClipTicks()); !E.empty()) return E;
+                    for (int m : Kids) if (pOv->m_Layers[m].m_Row != FL.m_Id) Steps.push_back([=, this] { return Set(m, "Row", std::to_string(FL.m_Id), std::to_string(SelectedOv()->m_Layers[m].m_Row)); });
+                }
+                else if (Op == "delete" && n == 3 && pR->m_bWeight)
+                {
                     if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
-                    Steps.push_back([=, this] { return Set(iL, "Mode", X ? "Additive" : "Override", SelectedOv()->m_Layers[iL].m_Mode == xanim_package_desc::layer_mode::ADDITIVE ? "Additive" : "Override"); });
+                    if (X < 1 || X > L.m_WeightKeys.size()) return std::format("no weight key {} on layer '{}'", X, L.m_Name);
+                    WDeletes[iL].push_back(int(X) - 1);
                 }
                 else if (Op == "delete" && n == 3)
                 {
                     if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
                     if (X < 1 || X > L.m_Keys.size()) return std::format("no key {} on layer '{}'", X, L.m_Name);
                     Deletes[iL].push_back(int(X) - 1);
+                }
+                else if (Op == "addw" && pR->m_bWeight)        // "addw weight_row tick value": a weight key (0..1); one at that time already: refused
+                {
+                    long long Tk = 0; float Val = 0;
+                    if (std::sscanf(Part.c_str(), " %*s %*llu %lld %f", &Tk, &Val) != 2 || Tk < 0 || !(Val >= 0 && Val <= 1)) return "addw row tick value(0..1)";
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    for (const auto& K : L.m_WeightKeys) if (K.m_Tick == Tk) return "a weight key is already at that time";
+                    const int nW = int(L.m_WeightKeys.size());
+                    Steps.push_back([=, this] { return Set(iL, "WeightKeys[]", std::to_string(nW + 1), std::to_string(nW)); });
+                    Steps.push_back([=, this] { return Set(iL, std::format("WeightKeys[G:{}]/Tick", nW), std::to_string(Tk), "0"); });
+                    Steps.push_back([=, this] { return Set(iL, std::format("WeightKeys[G:{}]/Value", nW), std::format("{}", Val), std::format("{}", SelectedOv()->m_Layers[iL].m_WeightKeys[nW].m_Value)); });
+                }
+                else if (Op == "wstep" && n == 3 && pR->m_bWeight)  // "wstep weight_row item": that key holds until the next (or blends again)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    if (X < 1 || X > L.m_WeightKeys.size()) return std::format("no weight key {} on layer '{}'", X, L.m_Name);
+                    const int k = int(X) - 1; const bool bNow = L.m_WeightKeys[k].m_bStep;
+                    Steps.push_back([=, this] { return Set(iL, std::format("WeightKeys[G:{}]/Step", k), bNow ? "false" : "true", bNow ? "true" : "false"); });
                 }
                 else if (Op == "move" && n == 3)
                 {
@@ -751,6 +850,11 @@ namespace xanim_package_editor
                 std::sort(Ks.rbegin(), Ks.rend()); Ks.erase(std::unique(Ks.begin(), Ks.end()), Ks.end());
                 for (int k : Ks) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "Keys")), k)); });
             }
+            for (auto& [iL, Ks] : WDeletes)
+            {
+                std::sort(Ks.rbegin(), Ks.rend()); Ks.erase(std::unique(Ks.begin(), Ks.end()), Ks.end());
+                for (int k : Ks) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "WeightKeys")), k)); });
+            }
             if (Steps.empty()) return "no change";
             return AsOneStep("Timeline edit", [&]() -> std::string { for (auto& S : Steps) if (auto E = S(); !E.empty()) return E; return {}; });
         }
@@ -765,7 +869,9 @@ namespace xanim_package_editor
             {
                 const auto It = m_TLRows.find(O.m_Ref.m_Row);
                 if (It == m_TLRows.end()) return std::format("row {} is not a layer (the clip row is read only)", O.m_Ref.m_Row);
-                const auto& L = pOv->m_Layers[It->second.m_iLayer];
+                const int iLv = It->second.m_bMerged ? int(O.m_Ref.m_Item) - 1 : It->second.m_iLayer;
+                if (iLv < 0 || iLv >= int(pOv->m_Layers.size())) return std::format("row {} has no segment {}", O.m_Ref.m_Row, O.m_Ref.m_Item);
+                const auto& L = pOv->m_Layers[iLv];
                 if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
                 if (O.m_Kind == 's')
                 {
@@ -773,6 +879,16 @@ namespace xanim_package_editor
                     if (O.m_Seg.m_Start < 0) return "a layer cannot start before the clip";
                     if (O.m_Seg.m_End <= O.m_Seg.m_Start) return "a layer needs a length";
                     if (O.m_Seg.m_Offset < 0) return "the layer's source starts at 0";
+                }
+                else if (It->second.m_bWeight)
+                {
+                    const int k = int(O.m_Ref.m_Item) - 1;
+                    if (k < 0 || k >= int(L.m_WeightKeys.size())) return std::format("no weight key {} on layer '{}'", O.m_Ref.m_Item, L.m_Name);
+                    if (O.m_Seg.m_Start < 0) return "a key cannot be before the clip";
+                    if (O.m_Value == O.m_Value && !(O.m_Value >= 0 && O.m_Value <= 1)) return "a weight is 0..1";
+                    for (int j = 0; j < int(L.m_WeightKeys.size()); ++j)
+                        if (j != k && L.m_WeightKeys[j].m_Tick == O.m_Seg.m_Start && std::none_of(Ops.begin(), Ops.end(), [&](const xeditor::timeline::text_op& o) { return o.m_Ref.m_Row == O.m_Ref.m_Row && int(o.m_Ref.m_Item) - 1 == j; }))
+                            return "the weight key would land on another weight key at the same time";
                 }
                 else
                 {
@@ -786,6 +902,16 @@ namespace xanim_package_editor
                             return std::format("the {} key would land on another key at the same time (replace or merge it explicitly)", L.m_Keys[k].m_Bone);
                 }
             }
+            // a row crossfades two segments at most: the result of the plan is checked whole
+            auto After = pOv->m_Layers;
+            for (const auto& O : Ops)
+            {
+                if (O.m_Kind != 's') continue;
+                const auto& R = m_TLRows[O.m_Ref.m_Row];
+                auto& L = After[R.m_bMerged ? int(O.m_Ref.m_Item) - 1 : R.m_iLayer];
+                L.m_Start = O.m_Seg.m_Start; L.m_End = O.m_Seg.m_End;
+            }
+            if (auto E = xanim_package_desc::RowOverlapError(After, TLClipTicks()); !E.empty()) return E;
             return {};
         }
 
@@ -821,16 +947,22 @@ namespace xanim_package_editor
             std::string   Delete(std::span<const xeditor::timeline::item_ref> R) override
             { std::string Ops; for (auto& r : R) if (m_S.m_TLRows.count(r.m_Row) && !m_S.m_TLRows[r.m_Row].m_Bone.empty()) Ops += std::format("delete {} {}; ", r.m_Row, r.m_Item); return Ops.empty() ? std::string("only pose keys can be deleted here") : Run(Ops); }
             std::string   SetRowFlag(std::uint64_t Row, xeditor::timeline::row_flag F, bool bOn) override { return m_S.m_TLRows.count(Row) ? Run(std::format("{} {} {}", F == xeditor::timeline::row_flag::mute ? "mute" : "lock", Row, int(bOn))) : std::string("the clip row has no flags"); }
-            bool          CanMoveRow(std::uint64_t Row) override { return m_S.m_TLRows.count(Row) && m_S.m_TLRows[Row].m_Bone.empty(); }
+            bool          CanMoveRow(std::uint64_t Row) override { return m_S.m_TLRows.count(Row) && m_S.m_TLRows[Row].m_Bone.empty() && !m_S.m_TLRows[Row].m_bMerged; }   // ponytail: a row of segments is reordered by its layers (split, move, join)
             std::string   MoveRow(std::uint64_t Row, std::uint64_t Above) override { return Run(std::format("move {} {}", Row, Above)); }
             bool          CanDropInto(std::uint64_t Row) override
             {
                 const auto It = m_S.m_TLRows.find(Row); auto* pOv = m_S.SelectedOv();
                 if (!pOv || It == m_S.m_TLRows.end() || !It->second.m_Bone.empty()) return false;
                 const auto K = pOv->m_Layers[It->second.m_iLayer].m_Kind;
-                return K == xanim_package_desc::layer_kind::FOLDER || K == xanim_package_desc::layer_kind::GROUP;
+                return K == xanim_package_desc::layer_kind::FOLDER || K == xanim_package_desc::layer_kind::GROUP
+                    || K == xanim_package_desc::layer_kind::CLIP || K == xanim_package_desc::layer_kind::KIMODO;       // onto a clip row: its segments join that row
             }
-            std::string   DropInto(std::uint64_t Row, std::uint64_t Into) override { return Run(std::format("into {} {}", Row, Into)); }
+            std::string   DropInto(std::uint64_t Row, std::uint64_t Into) override
+            {
+                const auto It = m_S.m_TLRows.find(Into); auto* pOv = m_S.SelectedOv();
+                const bool bSeg = pOv && It != m_S.m_TLRows.end() && (pOv->m_Layers[It->second.m_iLayer].m_Kind == xanim_package_desc::layer_kind::CLIP || pOv->m_Layers[It->second.m_iLayer].m_Kind == xanim_package_desc::layer_kind::KIMODO);
+                return Run(std::format("{} {} {}", bSeg ? "join" : "into", Row, Into));
+            }
             void          OnSelection(const std::set<xeditor::timeline::item_ref>& Sel) override { for (const auto& r : Sel) if (const auto It = m_S.m_TLRows.find(r.m_Row); It != m_S.m_TLRows.end()) { m_S.m_iLayer = It->second.m_iLayer; break; } }
             void          Seek(xeditor::timeline::tick T) override { m_S.m_TimeSeconds = float(double(T) / double(tl_tps_v)); m_S.m_LoopsElapsed = 0; }
         };
@@ -855,7 +987,10 @@ namespace xanim_package_editor
                 if (R.m_Type == tl_folder || R.m_Type == tl_group) return;     // a container has no items of its own: its children are its rows
                 if (R.m_Type == tl_clip)
                 {
-                    tl::item I; I.m_Ref = { R.m_Id, 1 }; I.m_Kind = tl::item_kind::segment;
+                    for (int m : (It->second.m_bMerged ? m_S.TLMembers(R.m_Id) : std::vector<int>{ It->second.m_iLayer }))
+                    {
+                    const auto& L = pOv->m_Layers[m];
+                    tl::item I; I.m_Ref = { R.m_Id, It->second.m_bMerged ? std::uint64_t(m + 1) : 1 }; I.m_Kind = tl::item_kind::segment;
                     const tl::tick End = L.m_End >= 0 ? L.m_End : m_S.TLClipTicks();
                     tl::tick SrcLen = -1;
                     if (const auto* pSrc = m_S.FindLayerSource(L.m_SourceKey, L.m_SourceClip); pSrc && pSrc->m_FPS > 0) SrcLen = tl::tick(std::llround(double(std::max(1, pSrc->m_nFrames - 1)) / pSrc->m_FPS * tl_tps_v));
@@ -865,6 +1000,7 @@ namespace xanim_package_editor
                     I.m_Caps = tl::caps::move | (bPlain ? (tl::caps::trim | tl::caps::slip) : 0u);
                     I.m_Label = L.m_Kind == xanim_package_desc::layer_kind::KIMODO ? m_S.KimodoLabel(L) : (L.m_SourceClip.empty() ? L.m_Name : L.m_SourceClip);
                     if (!Q.m_bAggregate || (I.m_Seg.m_End >= Q.m_T0 && I.m_Seg.m_Start <= Q.m_T1)) Out.push_back(std::move(I));
+                    }
                     return;
                 }
                 if (R.m_Type == tl_pose)
@@ -877,6 +1013,17 @@ namespace xanim_package_editor
                         if (T < Q.m_T0 || T > Q.m_T1) continue;
                         tl::item I; I.m_Ref = { R.m_Id, std::uint64_t(T) + 1 }; I.m_Kind = tl::item_kind::key; I.m_Seg = { T, T }; I.m_Caps = tl::caps::move | tl::caps::del;
                         I.m_Count = std::uint32_t(Refs.size()); I.m_Represents = std::move(Refs); I.m_Label = std::format("{} key(s)", I.m_Count);
+                        Out.push_back(std::move(I));
+                    }
+                    return;
+                }
+                if (R.m_Type == tl_weight)             // the weight curve: its keys as valued points (0..1), dragged in time and value
+                {
+                    for (int k = 0; k < int(L.m_WeightKeys.size()); ++k)
+                    {
+                        const auto& K = L.m_WeightKeys[k];
+                        tl::item I; I.m_Ref = { R.m_Id, std::uint64_t(k + 1) }; I.m_Kind = tl::item_kind::key; I.m_Seg = { K.m_Tick, K.m_Tick }; I.m_Caps = tl::caps::move | tl::caps::del;
+                        I.m_Value = K.m_Value; I.m_ValueMin = 0; I.m_ValueMax = 1; I.m_Label = std::format("weight {:.2f}{}", K.m_Value, K.m_bStep ? " (step)" : "");
                         Out.push_back(std::move(I));
                     }
                     return;
@@ -894,7 +1041,39 @@ namespace xanim_package_editor
             // a pose layer's falloff: shaded ramps before its first key and after its last
             void Overlay(const xeditor::timeline::row_desc& R, ImDrawList& D, const xeditor::timeline::draw_args& A) override
             {
-                if (R.m_Type == tl_clip) { m_S.KimodoOverlay(R, D, A); return; }
+                if (R.m_Type == tl_clip)
+                {
+                    m_S.KimodoOverlay(R, D, A);
+                    // a row's crossfades: an X across each overlap of two segments (the policy: "Overlap: Crossfade", two at most)
+                    if (auto* pOv = m_S.SelectedOv(); pOv && m_S.m_TLRows.count(R.m_Id) && m_S.m_TLRows[R.m_Id].m_bMerged)
+                    {
+                        const auto Mem = m_S.TLMembers(R.m_Id);
+                        const auto ClipEnd = m_S.TLClipTicks();
+                        auto Span = [&](int m) { const auto& L = pOv->m_Layers[m]; return std::pair<xeditor::timeline::tick, xeditor::timeline::tick>{ L.m_Start, L.m_End >= 0 ? L.m_End : ClipEnd }; };
+                        for (std::size_t a = 0; a < Mem.size(); ++a)
+                            for (std::size_t b = a + 1; b < Mem.size(); ++b)
+                            {
+                                const auto [s0, e0] = Span(Mem[a]); const auto [s1, e1] = Span(Mem[b]);
+                                const auto t0 = std::max(s0, s1), t1 = std::min(e0, e1);
+                                if (t1 <= t0) continue;
+                                const float x0 = A.X(t0), x1 = A.X(t1), y0 = A.m_Min.y + 3, y1 = A.m_Max.y - 3;
+                                D.AddRectFilled({ x0, y0 }, { x1, y1 }, IM_COL32(255, 255, 255, 30));
+                                D.AddLine({ x0, y0 }, { x1, y1 }, IM_COL32(255, 255, 255, 170), 1.5f);
+                                D.AddLine({ x0, y1 }, { x1, y0 }, IM_COL32(255, 255, 255, 170), 1.5f);
+                            }
+                    }
+                    return;
+                }
+                if (R.m_Type == tl_weight)             // no keys: the constant weight as a dashed line (+ Key starts the curve)
+                {
+                    auto* pOw = m_S.SelectedOv(); const auto Iw = m_S.m_TLRows.find(R.m_Id);
+                    if (!pOw || Iw == m_S.m_TLRows.end()) return;
+                    const auto& L = pOw->m_Layers[Iw->second.m_iLayer];
+                    if (!L.m_WeightKeys.empty()) return;
+                    const float y0 = A.m_Min.y + 3, y1 = A.m_Max.y - 3, y = y1 - std::clamp(L.m_Weight, 0.0f, 1.0f) * (y1 - y0);
+                    for (float x = A.m_Min.x; x < A.m_Max.x; x += 10) D.AddLine({ x, y }, { std::min(x + 5, A.m_Max.x), y }, IM_COL32(120, 200, 150, 160), 1.5f);
+                    return;
+                }
                 if (R.m_Type != tl_pose && R.m_Type != tl_bone) return;
                 auto* pOv = m_S.SelectedOv(); const auto It = m_S.m_TLRows.find(R.m_Id);
                 if (!pOv || It == m_S.m_TLRows.end()) return;
@@ -912,7 +1091,7 @@ namespace xanim_package_editor
             // a layer row's header widgets: its weight (a slider: dragging previews, the release is ONE command), its mode, its mask chip
             static constexpr float weight_w_v = 70, mode_w_v = 40, mask_w_v = 58;
             // a group: weight and mask, no mode (over its own base override and additive are the same); a folder: only eye / solo / lock
-            float HeaderWidth(const xeditor::timeline::row_desc& R) override { return (R.m_Type == tl_clip || R.m_Type == tl_pose || R.m_Type == tl_group) ? weight_w_v + mode_w_v + mask_w_v + 8 : 0; }
+            float HeaderWidth(const xeditor::timeline::row_desc& R) override { return (R.m_Type == tl_clip || R.m_Type == tl_pose || R.m_Type == tl_group) ? weight_w_v + mode_w_v + mask_w_v + 8 : R.m_Type == tl_weight ? 110 : 0; }
             void  Header(const xeditor::timeline::row_desc& R, xeditor::timeline::document&, const ImRect& Box) override
             {
                 auto* pOv = m_S.SelectedOv(); auto* pDesc = m_S.Desc(); const auto It = m_S.m_TLRows.find(R.m_Id);
@@ -920,6 +1099,27 @@ namespace xanim_package_editor
                 const int iL = It->second.m_iLayer;
                 auto& L = pOv->m_Layers[iL];
                 const float h = Box.GetHeight();
+                if (R.m_Type == tl_weight)             // + Key: the weight at the playhead becomes a key; Step: the selected keys hold
+                {
+                    ImGui::SetCursorScreenPos(Box.Min);
+                    ImGui::BeginDisabled(L.m_bLock);
+                    if (ImGui::Button("+ Key", { 52, h }))
+                    {
+                        const auto T = std::int64_t(std::llround(double(m_S.m_TimeSeconds) * 6000.0));
+                        std::vector<xanimation::weight_key> Ks; for (const auto& K : L.m_WeightKeys) Ks.push_back({ .m_Tick = K.m_Tick, .m_Value = K.m_Value, .m_Interp = K.m_bStep ? xanimation::weight_key::interp::STEP : xanimation::weight_key::interp::LINEAR });
+                        std::sort(Ks.begin(), Ks.end(), [](const auto& a, const auto& b) { return a.m_Tick < b.m_Tick; });
+                        m_S.m_TLView.m_Reply = m_S.TLRun(std::format("addw {} {} {}", R.m_Id, T, xanimation::EvaluateWeight(Ks, T, L.m_Weight)));
+                    }
+                    ImGui::SameLine(0, 4);
+                    if (ImGui::Button("Step", { 50, h }))
+                    {
+                        std::string Ops; for (const auto& r : m_S.m_TLView.m_Selection) if (r.m_Row == R.m_Id) Ops += std::format("wstep {} {}; ", R.m_Id, r.m_Item);
+                        m_S.m_TLView.m_Reply = Ops.empty() ? std::string("select weight keys first") : m_S.TLRun(Ops);
+                    }
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Step / smooth: the selected weight keys hold until the next (or blend again)");
+                    return;
+                }
                 m_S.m_TLHeaderBoxes[R.m_Id] = Box;                          // tests drive the widgets with the virtual mouse
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { 4, std::max(0.0f, (h - ImGui::GetTextLineHeight()) * 0.5f - 1) });
 
@@ -996,7 +1196,7 @@ namespace xanim_package_editor
         {
             namespace tl = xeditor::timeline;
             static_assert(tl_tps_v == tl::animation_ticks_per_second_v);
-            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType }, { tl_folder, &m_TLRowType }, { tl_group, &m_TLRowType } };
+            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType }, { tl_folder, &m_TLRowType }, { tl_group, &m_TLRowType }, { tl_weight, &m_TLRowType } };
             tl_document Doc(*this);
             m_iMaskHover = m_iMaskHoverNext; m_iMaskHoverNext = -1;          // last frame's hovered mask chip (the viewport draws before this panel)
             m_TLHeaderBoxes.clear();
@@ -1037,7 +1237,7 @@ namespace xanim_package_editor
                 for (const auto& I : Items)
                 {
                     if (I.m_Kind == tl::item_kind::segment) T += std::format("seg {} {} {} {} caps {}\n", I.m_Ref.m_Item, I.m_Seg.m_Start, I.m_Seg.m_End, I.m_Seg.m_Offset, I.m_Caps);
-                    else T += std::format("key {} {}{}\n", I.m_Ref.m_Item, I.m_Seg.m_Start, I.m_Count > 1 ? std::format(" x{}", I.m_Count) : std::string{});
+                    else T += std::format("key {} {}{}{}\n", I.m_Ref.m_Item, I.m_Seg.m_Start, I.m_Count > 1 ? std::format(" x{}", I.m_Count) : std::string{}, I.HasValue() ? std::format(" value {}", I.m_Value) : std::string{});
                 }
             }
             return T;
@@ -1885,9 +2085,17 @@ namespace xanim_package_editor
             int                             m_W = 0;            // frames (30 fps)
             std::vector<kimodo_layer_cand>  m_Cands;
             int                             m_iShow = -1;
-            std::string                     m_Job = "idle";     // idle, candidate, failed (generation runs blocking)
+            std::string                     m_Job = "idle";     // idle, running, candidate, failed, stale (a late result whose segment changed)
             std::string                     m_LastError;
+            // the background run (T4b): seeds still to make, what each run needs, and the request it was made for (a late result binds only
+            // to the same layer with the same request and span)
+            std::vector<int>                m_Pending;
+            std::wstring                    m_Exe, m_Stem, m_Prompt;
+            int                             m_Steps = 25;
+            std::vector<xmath::fvec3>       m_B0, m_B1;         // the stack below's first/last frame (the seam measure)
+            std::string                     m_Text;             // the report so far
         } m_KL;
+        kimodo::job                         m_KLJob;            // one xkimodo client run at a time, polled once a frame
 
         static std::string KimodoReqSig(const xanim_package_desc::clip_layer& L)
         {
@@ -1901,6 +2109,8 @@ namespace xanim_package_editor
             {
                 if (m_KL.m_Job == "candidate") S += std::format(", {} candidate(s){}", m_KL.m_Cands.size(), m_KL.m_Sig == LayersSigNow() ? "" : " (stale)");
                 if (m_KL.m_Job == "failed") S += ", generation failed: " + m_KL.m_LastError;
+                if (m_KL.m_Job == "running") S += std::format(", generating ({} done)...", m_KL.m_Cands.size() - 1);
+                if (m_KL.m_Job == "stale") S += ", " + m_KL.m_LastError;
             }
             return S;
         }
@@ -1915,8 +2125,10 @@ namespace xanim_package_editor
         {
             auto* pOv = SelectedOv(); const auto It = m_TLRows.find(R.m_Id);
             if (!pOv || It == m_TLRows.end()) return;
-            const auto& L = pOv->m_Layers[It->second.m_iLayer];
-            if (L.m_Kind != xanim_package_desc::layer_kind::KIMODO) return;
+            for (int m : TLMembers(R.m_Id))
+            {
+            const auto& L = pOv->m_Layers[m];
+            if (L.m_Kind != xanim_package_desc::layer_kind::KIMODO) continue;
             const auto T0 = L.m_Start, T1 = L.m_End >= 0 ? L.m_End : TLClipTicks();
             const float y0 = A.m_Min.y + 3, y1 = A.m_Max.y - 3, x0 = A.X(T0), x1 = A.X(T1);
             if (L.m_SourceKey.empty() || KimodoReqSig(L) != L.m_AcceptedSig)
@@ -1929,6 +2141,12 @@ namespace xanim_package_editor
             {
                 const auto C1 = m_KL.m_Start + std::int64_t(std::llround(double(m_KL.m_W - 1) / 30.0 * 6000.0));
                 D.AddRect(ImVec2(A.X(m_KL.m_Start), y0 - 2), ImVec2(A.X(C1), y1 + 2), IM_COL32(120, 220, 255, 220), 2.0f, 0, 2.0f);
+            }
+            if (L.m_Id && m_KL.m_LayerId == L.m_Id && m_KL.m_Job == "running")     // generating in the background: a moving dash along the span
+            {
+                const float Ph = float(std::fmod(ImGui::GetTime() * 60.0, 12.0));
+                for (float x = x0 - 12 + Ph; x < x1; x += 12) D.AddLine(ImVec2(std::max(x, x0), y1 + 1), ImVec2(std::min(x + 6, x1), y1 + 1), IM_COL32(120, 220, 255, 230), 2.0f);
+            }
             }
         }
 
@@ -2048,31 +2266,59 @@ namespace xanim_package_editor
             auto Pos = [&](const std::vector<xmath::transform3>& F, int f) { xanimation::pose P; P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, F[std::size_t(f) * nB + b]); FK.ComputeWorld(P); std::vector<xmath::fvec3> V(nB); for (int b = 0; b < nB; ++b) V[b] = FK.WorldPosition(b); return V; };
             const auto B0 = Pos(Win, 0), B1 = Pos(Win, W - 1);
 
+            // in the background (T4b): the seeds run one after another through the xkimodo client, polled once a frame; this returns at once
+            m_KLJob.Cancel();
             m_KL = {};
             m_KL.m_LayerId = L.m_Id; m_KL.m_Sig = LayersSigNow(); m_KL.m_ReqSig = KimodoReqSig(L); m_KL.m_KS = KS; m_KL.m_Start = L.m_Start; m_KL.m_W = W;
+            m_KL.m_Exe = Exe; m_KL.m_Stem = Stem; m_KL.m_Steps = std::clamp(L.m_Steps, 1, 200); m_KL.m_B0 = B0; m_KL.m_B1 = B1;
+            m_KL.m_Prompt = xstrtool::To(L.m_Prompt.empty() ? std::string("A person.") : L.m_Prompt);
+            for (auto& c : m_KL.m_Prompt) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
             std::istringstream In(Seeds.empty() ? std::to_string(L.m_Seed) : Seeds); int Seed = 0;
-            while (In >> Seed)
-            {
-                const auto s0 = clock::now();
-                const auto Bvh = std::format(L"{}_s{}.bvh", Stem, Seed);
-                std::wstring P = xstrtool::To(L.m_Prompt.empty() ? std::string("A person.") : L.m_Prompt);
-                for (auto& c : P) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
-                const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --steps {} --seed {} --constraints \"{}.json\" --bvh \"{}\"", P, W, std::clamp(L.m_Steps, 1, 200), Seed, Stem, Bvh);
-                if (!kimodo::RunBlocking(Exe, Args, Stem + L".log", 600000, Err)) { m_KL.m_Job = "failed"; m_KL.m_LastError = Err; return Text + "KimodoRegenerate: " + Err; }
-                kimodo::bvh B;
-                if (!B.Load(Bvh, Err) || B.m_nFrames < W) { m_KL.m_Job = "failed"; m_KL.m_LastError = Err.empty() ? "too few frames" : Err; return Text + "KimodoRegenerate: the generated BVH: " + m_KL.m_LastError; }
-                kimodo_layer_cand C; C.m_Seed = Seed; C.m_Bvh = Bvh;
-                C.m_Frames = FromKimodo(*pCtx, B, KS, nB); C.m_Frames.resize(std::size_t(W) * nB);
-                const auto C0 = Pos(C.m_Frames, 0), C1 = Pos(C.m_Frames, W - 1);
-                for (int b = 0; b < nB; ++b) C.m_SeamCm = std::max({ C.m_SeamCm, (C0[b] - B0[b]).Length() * 100.0f, (C1[b] - B1[b]).Length() * 100.0f });
-                C.m_Ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
-                Text += std::format("  candidate {} (seed {}): {:.0f} ms; the seam (first/last frame vs the stack below) max {:.2f} cm\n", m_KL.m_Cands.size(), Seed, C.m_Ms, C.m_SeamCm);
-                m_KL.m_Cands.push_back(std::move(C));
-            }
-            m_KL.m_Job = m_KL.m_Cands.empty() ? "idle" : "candidate";
-            m_KL.m_iShow = m_KL.m_Cands.empty() ? -1 : 0;
-            Text += "  nothing is written yet: KimodoAcceptCandidate -Candidate i (one undo step; the current take is kept on disk)";
-            return Text;
+            while (In >> Seed) m_KL.m_Pending.push_back(Seed);
+            if (m_KL.m_Pending.empty()) return Text + "KimodoRegenerate: no seed";
+            m_KL.m_Text = Text;
+            if (!KimodoLayerStartNext(Err)) return Text + "KimodoRegenerate: " + Err;
+            return Text + std::format("  running in the background ({} seed(s)); the row shows it; KimodoRegenerate -Wait 1 waits", m_KL.m_Pending.size() + 1);
+        }
+
+        bool KimodoLayerStartNext(std::string& Err) noexcept
+        {
+            const int Seed = m_KL.m_Pending.front(); m_KL.m_Pending.erase(m_KL.m_Pending.begin());
+            const auto Bvh = std::format(L"{}_s{}.bvh", m_KL.m_Stem, Seed);
+            const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --steps {} --seed {} --constraints \"{}.json\" --bvh \"{}\"", m_KL.m_Prompt, m_KL.m_W, m_KL.m_Steps, Seed, m_KL.m_Stem, Bvh);
+            if (!m_KLJob.StartArgs(m_KL.m_Exe, Args, Bvh, std::format(L"{}_s{}.log", m_KL.m_Stem, Seed), Err)) { m_KL.m_Job = "failed"; m_KL.m_LastError = Err; return false; }
+            m_KL.m_Job = "running";
+            m_KL.m_Cands.push_back({ .m_Seed = Seed, .m_Bvh = Bvh });           // its frames when it ends
+            return true;
+        }
+
+        // Once a frame: a finished seed becomes a candidate - only for the same layer with the same request and span (a late result never
+        // binds to a changed, moved or deleted segment: it is dropped as stale)
+        void KimodoLayerPoll() noexcept
+        {
+            bool Ok = false; std::string Msg;
+            if (!m_KLJob.Poll(Ok, Msg) || m_KL.m_Job != "running" || m_KL.m_Cands.empty()) return;
+            auto& C = m_KL.m_Cands.back();
+            const xanim_package_desc::clip_layer* pL = nullptr;
+            if (auto* pOv = SelectedOv()) for (const auto& L : pOv->m_Layers) if (L.m_Id == m_KL.m_LayerId) pL = &L;
+            if (!pL || KimodoReqSig(*pL) != m_KL.m_ReqSig) { m_KL.m_Job = "stale"; m_KL.m_LastError = "the segment changed while it generated (moved, edited or deleted): regenerate"; m_KL.m_Cands.clear(); m_KL.m_Pending.clear(); return; }
+            std::string Err;
+            auto* pCtx = KimodoRetargetCtx(Err); auto* pDesc = Desc();
+            kimodo::bvh B;
+            if (!Ok || !pCtx || !pDesc || !B.Load(C.m_Bvh, Err) || B.m_nFrames < m_KL.m_W)
+            { m_KL.m_Job = "failed"; m_KL.m_LastError = !Ok ? (Msg.empty() ? "xkimodo failed" : Msg) : Err.empty() ? "too few frames" : Err; m_KL.m_Cands.pop_back(); m_KL.m_Pending.clear(); return; }
+            const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size()), W = m_KL.m_W;
+            C.m_Frames = FromKimodo(*pCtx, B, m_KL.m_KS, nB); C.m_Frames.resize(std::size_t(W) * nB);
+            std::vector<std::int32_t> Parents(nB);
+            for (int b = 0; b < nB; ++b) Parents[b] = pDesc->m_ResolvedSkeletonBones.m_Bones[b].m_iParent;
+            xanimation::body_ik FK; FK.Setup(Parents);
+            auto Pos = [&](int f) { xanimation::pose P; P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, C.m_Frames[std::size_t(f) * nB + b]); FK.ComputeWorld(P); std::vector<xmath::fvec3> V(nB); for (int b = 0; b < nB; ++b) V[b] = FK.WorldPosition(b); return V; };
+            const auto C0 = Pos(0), C1 = Pos(W - 1);
+            if (int(m_KL.m_B0.size()) == nB) for (int b = 0; b < nB; ++b) C.m_SeamCm = std::max({ C.m_SeamCm, (C0[b] - m_KL.m_B0[b]).Length() * 100.0f, (C1[b] - m_KL.m_B1[b]).Length() * 100.0f });
+            C.m_Ms = (ImGui::GetTime() - m_KLJob.m_StartTime) * 1000.0;
+            m_KL.m_Text += std::format("  candidate {} (seed {}): {:.0f} ms; the seam (first/last frame vs the stack below) max {:.2f} cm\n", m_KL.m_Cands.size() - 1, C.m_Seed, C.m_Ms, C.m_SeamCm);
+            if (!m_KL.m_Pending.empty()) { if (!KimodoLayerStartNext(Err)) m_KL.m_Text += "  " + Err + "\n"; return; }
+            m_KL.m_Job = "candidate"; m_KL.m_iShow = 0;
         }
 
         // a generated window into the clip's space: the root's channels un-normalized (Kimodo starts at the origin facing +Z), the rest kept
@@ -2192,7 +2438,11 @@ namespace xanim_package_editor
             if (!StackFramesFor(iLayer, Below, FPSb, nFb, Err)) return "BakeToPose: " + Err;
             const double T0 = L.m_Start / 6000.0, T1 = (L.m_End >= 0 ? L.m_End : TLClipTicks()) / 6000.0;
             Every = std::max(1, Every);
-            std::vector<double> Times; for (double t = T0; t < T1 - 1e-6; t += Every / 30.0) Times.push_back(t); Times.push_back(T1);
+            // the keys on the clip's own frames (the composition samples there): keys between frames would be interpolated twice
+            std::vector<double> Times;
+            for (int f = int(std::ceil(T0 * FPS - 1e-6)); f / double(FPS) < T1 - 1e-6; f += Every) Times.push_back(f / double(FPS));
+            if (Times.empty() || Times.front() > T0 + 1e-6) Times.insert(Times.begin(), T0);
+            Times.push_back(T1);
             // the bones the layer changes (anywhere in the span), the root bone excluded (it carries the clip's motion)
             std::vector<char> Use(nB, 0);
             int iHips = -1;
@@ -2236,13 +2486,19 @@ namespace xanim_package_editor
             std::string Note;
             if (SuggestClipFrames(pF, FPS, nF, Err))
             {
-                float Max = 0; std::string MB;
-                for (double t = T0; t <= T1 + 1e-9; t += 1.0 / 30.0)
+                float Max = 0, MaxAll = 0; std::string MB; double MT = 0;
+                for (int f = int(std::ceil(T0 * FPS - 1e-6)); f / double(FPS) <= T1 + 1e-9; ++f)
                 {
+                    const double t = f / double(FPS);
                     const auto A = SamplePose(Played, FPS, nF, nB, t), B = SamplePose(*pF, FPS, nF, nB, t);
-                    for (int b = 0; b < nB; ++b) if (Use[b]) { const float a = AngleDeg(A[b].m_Rotation, B[b].m_Rotation); if (a > Max) { Max = a; MB = Man[b].m_Name; } }
+                    for (int b = 0; b < nB; ++b)
+                    {
+                        const float a = AngleDeg(A[b].m_Rotation, B[b].m_Rotation);
+                        if (Use[b] && a > Max) { Max = a; MB = Man[b].m_Name; MT = t; }
+                        MaxAll = std::max(MaxAll, a);
+                    }
                 }
-                Note = std::format("; the clip now against before, every frame of the span: max {:.4f} deg ({})", Max, MB);
+                Note = std::format("; the clip now against before, every frame of the span ({} fps): max {:.4f} deg ({} at {:.4f} s), all bones {:.4f} deg", FPS, Max, MB, MT, MaxAll);
             }
             return std::format("BakeToPose: {} keys on new Pose layer '{}' (layer {}), the Kimodo layer off, its take kept; one undo step{}", nKeys, Name, iLayer + 1, Note);
         }
@@ -2256,24 +2512,71 @@ namespace xanim_package_editor
             if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "KimodoTakesToLayers: -Layer is not a layer of the selected clip";
             const auto Takes = pOv->m_Layers[iLayer].m_Takes;
             if (Takes.empty()) return "KimodoTakesToLayers: that layer has no stored takes";
+            // re-attach (T4b): each stored window (Kimodo's own frame) is re-oriented into the clip's space - the same turn and origin the refine
+            // used, from the clip's root at the window's first frame - and becomes the accepted take of a segment; all the takes of this
+            // layer are ONE row (their overlaps crossfade). The segments are off: the Pose layer's keys already play this motion (never both).
+            auto* pDesc = Desc();
+            std::string Err;
+            auto* pCtx = KimodoRetargetCtx(Err);
+            const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0;
+            const bool bFrames = pCtx && SuggestClipFrames(pF, FPS, nF, Err);
+            const auto TakeDir = ProjectPath() / L"Cache" / L"KimodoTakes" / std::format(L"{:016X}", m_Document.m_Guid.m_Instance.m_Value);
+            const std::wstring Folder = pDesc ? pDesc->m_Kimodo.m_Folder : std::wstring(L"Assets\\Kimodo");
+            const auto Dir = ProjectPath() / Folder;
+            std::error_code Ec; std::filesystem::create_directories(Dir, Ec);
+            struct attached { std::wstring m_Rel; std::string m_Stem; };
+            std::vector<attached> Att(Takes.size());
+            int nAtt = 0;
+            for (std::size_t i = 0; i < Takes.size() && bFrames; ++i)
+            {
+                const auto& T = Takes[i];
+                const auto Src = TakeDir / (xstrtool::To(T.m_File) + L".bvh");
+                kimodo::bvh B;
+                if (!std::filesystem::exists(Src) || !B.Load(Src.wstring(), Err)) continue;
+                const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size()), W = B.m_nFrames;
+                std::vector<xmath::transform3> Win(std::size_t(W) * nB);
+                for (int f = 0; f < W; ++f) { const auto P = SamplePose(*pF, FPS, nF, nB, T.m_Offset / 6000.0 + f / 30.0); std::copy(P.begin(), P.end(), Win.begin() + std::size_t(f) * nB); }
+                kimodo_space KS; std::vector<kimodo::soma_pose> SP;
+                if (!ToKimodo(*pCtx, Win, W, nB, KS, SP, Err)) continue;
+                std::wstring File = xstrtool::To(T.m_File) + L".bvh";
+                if (!std::filesystem::exists(Dir / File) && !DenormalizeBvh(Src.wstring(), (Dir / File).wstring(), KS, Err)) continue;
+                Att[i] = { Folder + L"\\" + File, T.m_File }; ++nAtt;
+            }
             int nNew = 0;
-            const auto E = DirectOneStep("Takes to Kimodo layers", [&](desc& D) -> std::string
+            const std::uint64_t RowId = pOv->m_Layers[iLayer].m_Id ? pOv->m_Layers[iLayer].m_Id : 0x7A4E0000ull + std::uint64_t(iLayer);
+            const auto E = DirectOneStep("Takes to Kimodo segments", [&](desc& D) -> std::string
             {
                 auto* pO = SelectedOv();
-                for (const auto& T : Takes)
+                for (std::size_t i = 0; i < Takes.size(); ++i)
                 {
+                    const auto& T = Takes[i];
                     const auto Name = "Take " + T.m_File;
                     if (std::any_of(pO->m_Layers.begin(), pO->m_Layers.end(), [&](const auto& X) { return X.m_Name == Name; })) continue;
+                    if (!Att[i].m_Rel.empty() && D.findImportSource(Att[i].m_Rel) == -1)
+                    {
+                        auto& S = D.m_ImportSources.emplace_back();
+                        S.m_Kind = xanim_package_desc::import_kind::DIFFERENT_SKELETON_ASSET; S.m_Path = Att[i].m_Rel; S.m_Retarget = D.m_Kimodo.m_Retarget;
+                        auto& Cl = S.m_Clips.emplace_back(); Cl.m_OriginalName = "Motion"; Cl.m_Name = Att[i].m_Stem; Cl.m_bDelete = true;    // a layer's source, not an output clip
+                    }
+                    pO = SelectedOv();
                     auto& L = pO->m_Layers.emplace_back();
                     L.m_Id = NextLayerId(D); L.m_Name = Name; L.m_Kind = xanim_package_desc::layer_kind::KIMODO; L.m_bEnabled = false;
                     L.m_Prompt = T.m_Prompt; L.m_Seed = T.m_Seed; L.m_Steps = T.m_Steps; L.m_Start = T.m_Start; L.m_End = std::max(T.m_End, T.m_Start + 1);
-                    L.m_Seconds = float((L.m_End - L.m_Start) / 6000.0); L.m_bPosition = true;
+                    L.m_Seconds = float((L.m_End - L.m_Start) / 6000.0); L.m_bPosition = true; L.m_Row = RowId;
+                    if (!Att[i].m_Rel.empty())
+                    {
+                        L.m_SourceKey = Att[i].m_Rel; L.m_SourceClip = "Motion";
+                        L.m_TrimIn = std::max<std::int64_t>(0, T.m_Start - T.m_Offset);     // the take's frame 0 is clip time Offset
+                        L.m_AcceptedSig = KimodoReqSig(L);
+                    }
                     ++nNew;
                 }
                 return {};
             });
             if (!E.empty() && E != "no change") return "KimodoTakesToLayers: " + E;
-            return std::format("KimodoTakesToLayers: {} new Kimodo layer(s) (off, no take yet: KimodoRegenerate each); {} already there", nNew, int(Takes.size()) - nNew);
+            if (nAtt) { (void)m_Undo.Query("Save"); (void)m_Undo.Query("Compile"); }
+            return std::format("KimodoTakesToLayers: {} new Kimodo segment(s) in one row, {} with their stored take re-attached (off: the Pose layer's keys play this motion; never both){}; {} already there"
+                , nNew, nAtt, nAtt ? "; the package is compiling" : "", int(Takes.size()) - nNew);
         }
 
         std::string KimodoTakeCheck() noexcept
@@ -3910,6 +4213,7 @@ namespace xanim_package_editor
         void Render() noexcept override
         {
             KimodoPoll();
+            KimodoLayerPoll();
             if (m_K.m_bPreview && m_K.m_bPlaying)
             {
                 const float Len = m_K.m_Preview.m_nFrames * m_K.m_Preview.m_FrameTime;
@@ -4361,7 +4665,12 @@ namespace xanim_package_editor
             std::string L, Sd; int iL = -1;
             if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "KimodoRegenerate: -Layer n";
             xeditor::cmd_util::GetArg(m_Parser, m_hB, Sd);
-            return S.KimodoRegenerate(iL, Sd);
+            std::string Wt; xeditor::cmd_util::GetArg(m_Parser, m_hC, Wt);
+            auto R = S.KimodoRegenerate(iL, Sd);
+            if (Wt != "1" || S.m_KL.m_Job != "running") return R;
+            // -Wait 1: the same background run, waited on here (scripts); the editor's frame loop would poll it the same way
+            for (int i = 0; i < 6000 && S.m_KL.m_Job == "running"; ++i) { Sleep(20); S.KimodoLayerPoll(); }
+            return S.m_KL.m_Text + (S.m_KL.m_Job == "candidate" ? "  nothing is written yet: KimodoAcceptCandidate -Candidate i (one undo step; the current take is kept on disk)" : std::format("  KimodoRegenerate: {} - {}", S.m_KL.m_Job, S.m_KL.m_LastError));
         }
         case kind::kimodo_accept_candidate:
         {
