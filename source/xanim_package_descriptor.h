@@ -308,6 +308,36 @@ namespace xanim_package_desc
         return {};
     }
 
+    static constexpr auto event_kind_v = std::array
+    { xproperty::settings::enum_item("Marker",   xanim_package::event_kind::MARKER)
+    , xproperty::settings::enum_item("Footstep", xanim_package::event_kind::FOOTSTEP)
+    , xproperty::settings::enum_item("Contact",  xanim_package::event_kind::CONTACT)
+    , xproperty::settings::enum_item("Sync",     xanim_package::event_kind::SYNC)
+    };
+
+    // A marker on the clip's timeline (T5): a point, or an interval (a contact bar: EndTick >= Tick). In the clip's composition ticks (the
+    // layers' time: the source's own, before the trim); the compiler moves them into the compiled clip's time and drops what the trim cuts.
+    struct clip_event
+    {
+        std::uint64_t               m_Id      = 0;          // stable identity (commands, undo)
+        std::string                 m_Name    = {};
+        xanim_package::event_kind   m_Kind    = xanim_package::event_kind::MARKER;
+        std::int64_t                m_Tick    = 0;          // 6000 per second
+        std::int64_t                m_EndTick = -1;         // -1: a point
+        std::string                 m_Bone    = {};         // the bone it is about (a foot for a footstep); empty: none
+
+        XPROPERTY_DEF
+        ( "Event", clip_event
+        , obj_member<"Id",      &clip_event::m_Id, member_flags<flags::SHOW_READONLY> >
+        , obj_member<"Name",    &clip_event::m_Name >
+        , obj_member<"Kind",    &clip_event::m_Kind, member_enum_span<event_kind_v> >
+        , obj_member<"Tick",    &clip_event::m_Tick >
+        , obj_member<"EndTick", &clip_event::m_EndTick, member_help<"-1: a point; else the end of the interval (a contact)"> >
+        , obj_member<"Bone",    &clip_event::m_Bone >
+        )
+    };
+    XPROPERTY_REG(clip_event)
+
     // A sparse override entry for one imported clip, matched BY m_OriginalName against its OWNING
     // import_source's own details::source::m_ClipList - a raw clip's name is only ever guaranteed
     // unique WITHIN the file it came from (see xanim_package_details.h's own comment on why), so this
@@ -323,6 +353,7 @@ namespace xanim_package_desc
         int                               m_TrimEndFrame   = -1;   // frame index; -1 = to the end
         xanim_package::root_motion_mode   m_RootMotion     = xanim_package::root_motion_mode::NONE;
         std::vector<clip_layer>           m_Layers         = {};   // the layered edit mode: baked into this clip before its trim/downsample/root motion
+        std::vector<clip_event>           m_Events         = {};   // markers, footsteps, contacts, sync points (T5)
 
         XPROPERTY_DEF
         ( "Clip", clip
@@ -335,6 +366,7 @@ namespace xanim_package_desc
         , obj_member<"TrimEndFrame",    &clip::m_TrimEndFrame >
         , obj_member<"RootMotion",      &clip::m_RootMotion, member_enum_span<root_motion_mode_v> >
         , obj_member<"Layers",          &clip::m_Layers >
+        , obj_member<"Events",          &clip::m_Events >
         )
     };
     XPROPERTY_REG(clip)

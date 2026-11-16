@@ -271,6 +271,7 @@ namespace xanim_package_compiler
         , std::vector<xmath::transform3>&                     AllKeyFrames
         , std::vector<xmath::fvec3>&                          AllRootMotion
         , const std::vector<xmath::transform3>*               pComposed = nullptr
+        , std::vector<xanim_package::event>*                  pAllEvents = nullptr
         )
         {
             const auto& ResolvedBones = Manifest.m_Bones;
@@ -311,6 +312,33 @@ namespace xanim_package_compiler
             Out.m_iFirstKeyFrame  = static_cast<std::uint32_t>(AllKeyFrames.size());
             Out.m_iFirstRootMotion = static_cast<std::uint32_t>(AllRootMotion.size());
             Out.m_LoopDisplacement = xmath::fvec3::fromZero();
+
+            // the clip's events (T5): composition ticks (the source's time) -> the compiled clip's seconds; what the trim cuts is dropped, an
+            // interval is clipped to the clip; sorted by time (the runtime's crossing walk reads them in order)
+            if (pAllEvents && pOv)
+            {
+                Out.m_iFirstEvent = static_cast<std::uint32_t>(pAllEvents->size());
+                const double T0 = double(StartFrame) / FinalFPS, Len = double(OutFrames - 1) / FinalFPS;
+                std::vector<xanim_package::event> Ev;
+                for (const auto& E : pOv->m_Events)
+                {
+                    double A = double(E.m_Tick) / 6000.0 - T0, B = E.m_EndTick >= E.m_Tick ? double(E.m_EndTick) / 6000.0 - T0 : A;
+                    if (B < 0 || A > Len + 1e-6) { LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': event '{}' is outside the trimmed clip: dropped", CompiledName, E.m_Name)); continue; }
+                    A = std::clamp(A, 0.0, Len); B = std::clamp(B, A, Len);
+                    xanim_package::event R{};
+                    R.m_NameHash = xstrtool::CRC32(E.m_Name); R.m_Kind = E.m_Kind; R.m_Time = float(A); R.m_Duration = E.m_EndTick >= E.m_Tick ? float(B - A) : 0.0f;
+                    R.m_iBone = -1;
+                    if (!E.m_Bone.empty())
+                    {
+                        for (int s = 0; s < static_cast<int>(ResolvedBones.size()); ++s) if (ResolvedBones[s].m_Name == E.m_Bone) { R.m_iBone = static_cast<std::int16_t>(s); break; }
+                        if (R.m_iBone < 0) LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': event '{}' names bone '{}', which the skeleton does not have", CompiledName, E.m_Name, E.m_Bone));
+                    }
+                    Ev.push_back(R);
+                }
+                std::stable_sort(Ev.begin(), Ev.end(), [](const auto& a, const auto& b) { return a.m_Time < b.m_Time; });
+                Out.m_nEvents = static_cast<std::uint32_t>(Ev.size());
+                pAllEvents->insert(pAllEvents->end(), Ev.begin(), Ev.end());
+            }
 
             // Map each skeleton bone (by name) to its raw-clip bone slot, if any - a small, one-time,
             // compile-time lookup, not a runtime cost.
@@ -803,6 +831,7 @@ namespace xanim_package_compiler
             std::vector<std::string>               Names;
             std::vector<xmath::transform3>          AllKeyFrames;
             std::vector<xmath::fvec3>               AllRootMotion;
+            std::vector<xanim_package::event>       AllEvents;
 
             // every raw clip on this skeleton first (retargeted or folded): a clip's layers may take any other clip of the package as their source
             for (auto& Raw : m_RawClips)
@@ -839,7 +868,7 @@ namespace xanim_package_compiler
 
                 bool                  Skip = false;
                 xanim_package::clip   Compiled{};
-                if (auto Err = BuildCompiledClip(Raw, pOv, Manifest, Skip, Compiled, AllKeyFrames, AllRootMotion, bLayers ? &Composed : nullptr); Err)
+                if (auto Err = BuildCompiledClip(Raw, pOv, Manifest, Skip, Compiled, AllKeyFrames, AllRootMotion, bLayers ? &Composed : nullptr, &AllEvents); Err)
                     return Err;
                 if (Skip) continue;
 
@@ -862,7 +891,7 @@ namespace xanim_package_compiler
                 auto& D = m_FinalPackage.m_pClips[i]; const auto& S = Clips[i];
                 D.m_NameHash = S.m_NameHash; D.m_FPS = S.m_FPS; D.m_nFrames = S.m_nFrames; D.m_bLoop = S.m_bLoop; D.m_RootMotionMode = S.m_RootMotionMode;
                 D.m_LoopDisplacement.m_X = S.m_LoopDisplacement.m_X; D.m_LoopDisplacement.m_Y = S.m_LoopDisplacement.m_Y; D.m_LoopDisplacement.m_Z = S.m_LoopDisplacement.m_Z;
-                D.m_iFirstKeyFrame = S.m_iFirstKeyFrame; D.m_iFirstRootMotion = S.m_iFirstRootMotion;
+                D.m_iFirstKeyFrame = S.m_iFirstKeyFrame; D.m_iFirstRootMotion = S.m_iFirstRootMotion; D.m_iFirstEvent = S.m_iFirstEvent; D.m_nEvents = S.m_nEvents;
             }
 
             m_FinalPackage.m_nBones = static_cast<std::uint32_t>(ResolvedBones.size());
@@ -879,6 +908,18 @@ namespace xanim_package_compiler
             // compiles of the same package without root motion differed by those 8 bytes (2026-11-15)
             m_FinalPackage.m_pRootMotion = AllRootMotion.empty() ? nullptr : new xmath::fvec3[AllRootMotion.size()];
             std::copy(AllRootMotion.begin(), AllRootMotion.end(), m_FinalPackage.m_pRootMotion);
+            m_FinalPackage.m_nTotalEvents = static_cast<std::uint32_t>(AllEvents.size());
+            if (!AllEvents.empty())
+            {
+                m_FinalPackage.m_pEvents = new xanim_package::event[AllEvents.size()];
+                std::memset(static_cast<void*>(m_FinalPackage.m_pEvents), 0, sizeof(xanim_package::event) * AllEvents.size());      // padding: the file follows from the content only
+                for (std::size_t i = 0; i < AllEvents.size(); ++i)
+                {
+                    auto& D = m_FinalPackage.m_pEvents[i]; const auto& S = AllEvents[i];
+                    D.m_NameHash = S.m_NameHash; D.m_Kind = S.m_Kind; D.m_iBone = S.m_iBone; D.m_Time = S.m_Time; D.m_Duration = S.m_Duration;
+                }
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Events: {}", AllEvents.size()));
+            }
 
             // the content's fingerprint, field by field (never the struct bytes: padding): two compiles of the same input print the same numbers
             {

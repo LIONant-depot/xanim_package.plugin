@@ -33,11 +33,28 @@ namespace xanim_package
 
         std::uint32_t       m_iFirstKeyFrame    {0};    // offset into anim_package::m_pKeyFrame; this clip's block is m_nFrames*anim_package::m_nBones entries, frame-major: [iFrame*m_nBones+iBone]
         std::uint32_t       m_iFirstRootMotion  {0};    // offset into anim_package::m_pRootMotion; only meaningful if m_RootMotionMode != NONE
+        std::uint32_t       m_iFirstEvent       {0};    // offset into anim_package::m_pEvents (sorted by time)
+        std::uint32_t       m_nEvents           {0};
+    };
+
+    // What a marker on a clip's timeline is (T5): the runtime and the tools read the kind; the name is free text (hashed)
+    enum class event_kind : std::uint8_t { MARKER, FOOTSTEP, CONTACT, SYNC };
+
+    // A clip's event, compiled: a point (Duration 0) or an interval (a contact bar). Fires once when the playing time crosses Time
+    // (xanimation::Advance: the crossing rules). Bone: the skeleton bone it is about (a foot, a hand), -1 none; a mirrored clip reports the
+    // mirror bone.
+    struct event
+    {
+        std::uint32_t       m_NameHash  {};     // CRC32 of the event's name
+        event_kind          m_Kind      {};
+        std::int16_t        m_iBone     {-1};
+        float               m_Time      {};     // seconds into the compiled clip
+        float               m_Duration  {};     // 0: a point
     };
 
     struct anim_package
     {
-        inline static constexpr auto xserializer_version_v = 1;
+        inline static constexpr auto xserializer_version_v = 2;     // 2: events
 
                                         anim_package    (void)                          noexcept = default;
         inline                         anim_package    (xserializer::stream& Stream)    noexcept;
@@ -58,6 +75,7 @@ namespace xanim_package
             if (C.m_RootMotionMode == root_motion_mode::NONE) return {};
             return { m_pRootMotion + C.m_iFirstRootMotion, static_cast<std::size_t>(C.m_nFrames) };
         }
+        inline std::span<event>                 getClipEvents      (int iClip)     const noexcept { auto& C = m_pClips[iClip]; return { m_pEvents + C.m_iFirstEvent, C.m_nEvents }; }
 
         clip*               m_pClips            {nullptr};   // m_nClips entries
         std::uint32_t*      m_pBoneNameHashes   {nullptr};   // m_nBones entries, package-wide, SAME order as
@@ -66,10 +84,12 @@ namespace xanim_package
                                                                // read per-frame
         xmath::transform3*  m_pKeyFrame         {nullptr};   // m_nTotalKeyFrames entries, concatenated per-clip
         xmath::fvec3*       m_pRootMotion       {nullptr};   // m_nTotalRootMotionFrames entries, concatenated across clips with root motion
+        event*              m_pEvents           {nullptr};   // m_nTotalEvents entries, concatenated per clip
         std::uint16_t       m_nClips                  {0};
         std::uint32_t       m_nBones                  {0};   // shared bone width/order for every clip
         std::uint32_t       m_nTotalKeyFrames         {0};
         std::uint32_t       m_nTotalRootMotionFrames  {0};
+        std::uint32_t       m_nTotalEvents            {0};
     };
 
     //-------------------------------------------------------------------------
@@ -95,6 +115,7 @@ namespace xanim_package
         if (m_pBoneNameHashes) delete[] m_pBoneNameHashes;
         if (m_pKeyFrame)       delete[] m_pKeyFrame;
         if (m_pRootMotion)     delete[] m_pRootMotion;
+        if (m_pEvents)         delete[] m_pEvents;
 
         Initialize();
     }
@@ -151,6 +172,20 @@ namespace xserializer::io_functions
 
     //-------------------------------------------------------------------------
     template<> inline
+    xerr SerializeIO<xanim_package::event>(xserializer::stream& Stream, const xanim_package::event& E) noexcept
+    {
+        xerr Err;
+        false
+            || (Err = Stream.Serialize(E.m_NameHash))
+            || (Err = Stream.Serialize(E.m_Kind))
+            || (Err = Stream.Serialize(E.m_iBone))
+            || (Err = Stream.Serialize(E.m_Time))
+            || (Err = Stream.Serialize(E.m_Duration))
+            ;
+        return Err;
+    }
+    //-------------------------------------------------------------------------
+    template<> inline
     xerr SerializeIO<xanim_package::clip>(xserializer::stream& Stream, const xanim_package::clip& Clip) noexcept
     {
         xerr Err;
@@ -165,6 +200,8 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Clip.m_LoopDisplacement.m_Z))
             || (Err = Stream.Serialize(Clip.m_iFirstKeyFrame))
             || (Err = Stream.Serialize(Clip.m_iFirstRootMotion))
+            || (Err = Stream.Serialize(Clip.m_iFirstEvent))
+            || (Err = Stream.Serialize(Clip.m_nEvents))
             ;
         return Err;
     }
@@ -183,6 +220,8 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Package.m_pKeyFrame,        Package.m_nTotalKeyFrames))
             || (Err = Stream.Serialize(Package.m_nTotalRootMotionFrames))
             || (Err = Stream.Serialize(Package.m_pRootMotion,      Package.m_nTotalRootMotionFrames))
+            || (Err = Stream.Serialize(Package.m_nTotalEvents))
+            || (Err = Stream.Serialize(Package.m_pEvents,          Package.m_nTotalEvents))
             ;
         return Err;
     }
