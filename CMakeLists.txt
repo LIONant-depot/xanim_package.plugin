@@ -22,6 +22,11 @@ source_group("AnimPackage_Compiler" FILES
   "source/compiler/main.cpp"
 )
 
+# the compiler's translation unit passes MSVC's section limit in Debug (C1128: IK keys + body_ik + layers in one unit)
+if(MSVC)
+  target_compile_options(${TARGET_PROJECT} PRIVATE /bigobj)
+endif()
+
 # Allow access to other plugins
 target_include_directories(${TARGET_PROJECT} PRIVATE $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/../../>)
 

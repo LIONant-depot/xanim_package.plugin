@@ -549,8 +549,9 @@ namespace xanim_package_editor
             for (const auto& L : C.m_Layers)
             {
                 S += std::format("{}|{}|{}|{}|{}|r{}|", int(L.m_Space), int(L.m_Kind), L.m_Id, L.m_Parent, L.m_SharedMask, L.m_Row);
-                for (const auto& K : L.m_Keys) S += std::format("p{},{},{},{},{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Bone, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bOffset, K.m_bStep, K.m_bPosition, K.m_PX, K.m_PY, K.m_PZ);
-                S += std::format("s{},{}|", L.m_bSmooth, L.m_Falloff);
+                for (const auto& K : L.m_Keys) S += std::format("p{},{},{},{},{},{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Bone, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bOffset, K.m_bStep, K.m_bPosition, K.m_PX, K.m_PY, K.m_PZ, K.m_bLinear);
+                S += std::format("s{},{},{}|", L.m_bSmooth, L.m_Falloff, L.m_bBoneLimits);
+                for (const auto& K : L.m_IkKeys) S += std::format("i{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{};", K.m_Tick, K.m_Effector, K.m_PX, K.m_PY, K.m_PZ, K.m_bRotation, K.m_X, K.m_Y, K.m_Z, K.m_W, K.m_bPinned, K.m_bStep, K.m_bLinear, K.m_AX, K.m_AY, K.m_AZ);
                 S += std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", L.m_bEnabled, int(L.m_Mode), int(L.m_Reference), L.m_ReferenceTick, xstrtool::To(L.m_SourceKey), L.m_SourceClip
                     , L.m_Start, L.m_End, L.m_TrimIn, L.m_TrimOut, L.m_Rate, L.m_bReverse, L.m_Weight, L.m_bRotation, L.m_bPosition, int(L.m_Root), L.m_Name);
                 for (const auto& K : L.m_WeightKeys) S += std::format("k{},{},{};", K.m_Tick, K.m_Value, K.m_bStep);
@@ -3815,7 +3816,7 @@ namespace xanim_package_editor
         {
             const auto& R = m_PT.m_Rig;
             const int nB = R.count();
-            xanimation::body_ik S; S.Setup(R.m_Par, R.m_Lim, {}, R.m_Limbs);
+            xanimation::body_ik S; S.Setup(R.m_Par, PoseLimitsOn() ? std::span<const xanimation::joint_limit>(R.m_Lim) : std::span<const xanimation::joint_limit>{}, {}, R.m_Limbs);
             S.ComputeWorld(Base);
             std::vector<xanimation::ik_task> Tasks;
             std::vector<std::uint8_t> W = R.m_Owned;
@@ -3847,6 +3848,15 @@ namespace xanim_package_editor
             Note = Rep[0].m_Status == xanimation::ik_status::REACHED ? "reached" : std::format("missed by {:.1f} cm: {}", Rep[0].m_PosMiss * 100.0f, Reason);
             if (pPinErrCm) { *pPinErrCm = 0; for (std::size_t t = 1; t < Rep.size(); ++t) *pPinErrCm = std::max(*pPinErrCm, Rep[t].m_PosMiss * 100.0f); }
             return true;
+        }
+
+        // the IK respects the skeleton's limits unless the layer posing writes to (the top Pose layer) has BoneLimits off (C59)
+        bool PoseLimitsOn() noexcept
+        {
+            const auto* pOv = SelectedOv();
+            if (!pOv || pOv->m_Layers.empty()) return true;
+            const auto& L = pOv->m_Layers.back();
+            return L.m_Kind != xanim_package_desc::layer_kind::POSE || L.m_bBoneLimits;
         }
 
         // the top layer of the selected clip as a Pose layer (one is added when it is not): where posing writes
@@ -4009,7 +4019,15 @@ namespace xanim_package_editor
             xanimation::pose Cur; if (!PoseAt(Seconds, Cur, Err)) return "IkKey: " + Err;
             xanimation::body_ik FK; FK.Setup(m_PT.m_Rig.m_Par); FK.ComputeWorld(Cur);
             const auto P = HandleModel(FK, b), H = FK.WorldPosition(m_PT.m_Rig.m_Hips >= 0 ? m_PT.m_Rig.m_Hips : 0);
-            return std::format("IkKey probe {} at {:.4f} s: {:.5f} {:.5f} {:.5f}; hips {:.5f} {:.5f} {:.5f}", m_PT.m_Rig.Name(b), Seconds, P.m_X, P.m_Y, P.m_Z, H.m_X, H.m_Y, H.m_Z);
+            // the pose against the skeleton's limits (as the package's compile sees them): the worst joint outside, degrees (C59's gate)
+            std::string Lim = "no limits (the skeleton's are off)";
+            if (const auto L = xanim_package_layers::ManifestLimits(Desc()->m_ResolvedSkeletonBones); int(L.size()) == Cur.count())
+            {
+                float Worst = 0; int iW = -1;
+                for (int j = 0; j < Cur.count(); ++j) if (const auto Ev = xanimation::Evaluate(L[j], Cur.m_Rotation[j]); Ev.m_Excess > Worst) { Worst = Ev.m_Excess; iW = j; }
+                Lim = iW < 0 ? "limits: all inside" : std::format("limits: worst {:.3f} deg outside ({})", Worst * 57.29578f, m_PT.m_Rig.Name(iW));
+            }
+            return std::format("IkKey probe {} at {:.4f} s: {:.5f} {:.5f} {:.5f}; hips {:.5f} {:.5f} {:.5f}; {}", m_PT.m_Rig.Name(b), Seconds, P.m_X, P.m_Y, P.m_Z, H.m_X, H.m_Y, H.m_Z, Lim);
         }
 
         // K: the pending pose (auto-key off), else the selected bone (FK), else the last dragged handle as an IK key. Shift+K: every bone the
@@ -4428,6 +4446,18 @@ namespace xanim_package_editor
             const auto& R = m_PT.m_Rig;
             ImGui::SameLine(); ImGui::TextDisabled("Pins:");
             Preset("Feet", { R.m_LF, R.m_RF }); Preset("Hands", { R.m_LH, R.m_RH }); Preset("Both", { R.m_LF, R.m_RF, R.m_LH, R.m_RH }); Preset("None", {});
+            {   // Bone limits: the top Pose layer's BoneLimits (posing and its IK keys respect the skeleton's joint limits); one undo step
+                auto* pOv = SelectedOv();
+                const int iTop = pOv ? int(pOv->m_Layers.size()) - 1 : -1;
+                const bool bPoseTop = iTop >= 0 && pOv->m_Layers[iTop].m_Kind == xanim_package_desc::layer_kind::POSE;
+                bool bOn = PoseLimitsOn();
+                ImGui::SameLine(); ImGui::BeginDisabled(!bPoseTop || R.m_Lim.empty());
+                if (ImGui::Checkbox("Bone limits", &bOn)) SetLayer(iTop, "BoneLimits", bOn ? "true" : "false", bOn ? "false" : "true");
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text(R.m_Lim.empty()
+                    ? "The skeleton's joint limits are off (turn them on in the Skeleton Editor's Joints mode): posing is free"
+                    : "Posing and IK keys keep every joint inside the skeleton's limits (this Pose layer's BoneLimits).\nTurn off only for an impossible pose, such as a broken leg.");
+            }
             ImGui::SameLine(); ImGui::Checkbox("Auto feet", &m_PT.m_bAutoPins);
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button, m_PT.m_bAutoKey ? IM_COL32(170, 40, 40, 255) : IM_COL32(70, 70, 70, 255));
@@ -4472,7 +4502,7 @@ namespace xanim_package_editor
             if (!PoseRig(Err)) return "PoseTool: " + Err;
             const auto& R = m_PT.m_Rig;
             const auto Pins = PoseEffectivePins(m_TimeSeconds);
-            std::string T = std::format("PoseTool: {}; time {:.3f} s; limits {}; auto feet {}\n", m_PT.m_bOn ? "on" : "off", m_TimeSeconds, R.m_Lim.empty() ? "none (the skeleton's limits are off)" : "the skeleton's", m_PT.m_bAutoPins ? "on" : "off");
+            std::string T = std::format("PoseTool: {}; time {:.3f} s; limits {}; auto feet {}\n", m_PT.m_bOn ? "on" : "off", m_TimeSeconds, R.m_Lim.empty() ? "none (the skeleton's limits are off)" : PoseLimitsOn() ? "the skeleton's" : "off for this layer (BoneLimits)", m_PT.m_bAutoPins ? "on" : "off");
             for (int b : R.Effectors())
             {
                 ImVec2 S(-1, -1); for (const auto& [h, P] : m_PT.m_Screen) if (h == b) S = P;

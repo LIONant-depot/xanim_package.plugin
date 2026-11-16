@@ -229,6 +229,7 @@ namespace xanim_package_desc
         std::vector<layer_pose_key> m_Keys = {};                    // Pose layers: sparse keys (a track per bone); their mask, when empty, is the whole body
         std::vector<layer_ik_key>   m_IkKeys = {};                  // Pose layers: IK keys (a track per effector), solved per frame after the layer's own keys
         bool                m_bSmooth     = false;      // Pose layers: a smooth curve through the keys (new pose layers: on; off = linear, as layers made before)
+        bool                m_bBoneLimits = true;       // Pose layers: the IK (posing, IK keys) respects the skeleton's joint limits; off for the rare impossible pose (a broken leg)
         float               m_Falloff     = 0.0f;       // Pose layers: seconds the layer eases in before its first key and out after its last (new pose layers: 0.5; 0 = ramp to the section ends)
         std::vector<layer_take> m_Takes   = {};         // Pose layers: the generated takes (Kimodo) some of the keys came from (provenance; nothing composes from it)
         std::uint64_t       m_Parent      = 0;          // the Id of the folder or group this layer is in; 0 = the top level (contract v3)
@@ -271,6 +272,7 @@ namespace xanim_package_desc
         , obj_member<"Keys",          &clip_layer::m_Keys >
         , obj_member<"IkKeys",        &clip_layer::m_IkKeys >
         , obj_member<"Smooth",        &clip_layer::m_bSmooth >
+        , obj_member<"BoneLimits",    &clip_layer::m_bBoneLimits, member_help<"The IK respects the skeleton's joint limits (posing and IK keys). Off only for an impossible pose (a broken leg)"> >
         , obj_member<"Falloff",       &clip_layer::m_Falloff >
         , obj_member<"Takes",         &clip_layer::m_Takes >
         , obj_member<"Parent",        &clip_layer::m_Parent >
