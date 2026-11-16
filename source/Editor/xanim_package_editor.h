@@ -1563,8 +1563,7 @@ namespace xanim_package_editor
                             const double FT = std::clamp(xanimation::TicksToSeconds(K.m_Tick) * m_LayerComposedFPS, 0.0, double(m_LayerComposedFrames - 1));
                             const int A = int(FT), B = std::min(A + 1, m_LayerComposedFrames - 1);
                             const auto Q = xmath::fquat::Slerp(m_LayerComposed[std::size_t(A) * nB + b].m_Rotation, m_LayerComposed[std::size_t(B) * nB + b].m_Rotation, float(FT - A));
-                            const double Dot = std::min(1.0, std::abs(double(Q.m_X) * K.m_X + double(Q.m_Y) * K.m_Y + double(Q.m_Z) * K.m_Z + double(Q.m_W) * K.m_W) / std::max(1e-12, std::sqrt(double(K.m_X) * K.m_X + double(K.m_Y) * K.m_Y + double(K.m_Z) * K.m_Z + double(K.m_W) * K.m_W)));
-                            T += std::format(" live hit {:.4f} deg", 2.0 * std::acos(Dot) * 57.29577951308232);
+                            T += std::format(" live hit {:.4f} deg", AngleDeg(Q, xmath::fquat(K.m_X, K.m_Y, K.m_Z, K.m_W)));
                         }
                         T += "\n";
                     }
@@ -1986,9 +1985,14 @@ namespace xanim_package_editor
             for (int i = 0; i < nB; ++i) P[i] = xmath::transform3::fromBlend(Frames[std::size_t(A) * nB + i], Frames[std::size_t(B) * nB + i], T);
             return P;
         }
+        // the angle between two rotations: 2 atan2(|v|, |w|) of A * inverse(B), in double (2 acos(|dot|) in float cannot resolve angles under
+        // ~0.07 deg: a dot one or two float steps below 1 already reads 0.04-0.07 deg - it made a bit-exact bake look 0.0685 deg off)
         static float AngleDeg(const xmath::fquat& A, const xmath::fquat& B) noexcept
         {
-            return 2.0f * std::acos(std::min(1.0f, std::abs(xmath::fquat::Dot(A.NormalizeCopy(), B.NormalizeCopy())))) * 57.29578f;
+            const double ax = A.m_X, ay = A.m_Y, az = A.m_Z, aw = A.m_W, bx = -B.m_X, by = -B.m_Y, bz = -B.m_Z, bw = B.m_W;
+            const double w = aw * bw - ax * bx - ay * by - az * bz;
+            const double x = aw * bx + ax * bw + ay * bz - az * by, y = aw * by - ax * bz + ay * bw + az * bx, z = aw * bz + ax * by - ay * bx + az * bw;
+            return float(2.0 * std::atan2(std::sqrt(x * x + y * y + z * z), std::abs(w)) * 57.29577951308232);
         }
 
         // Kimodo's space for a window of this skeleton's frames: the Retarget's links reversed into SOMA 77, the window's first root at the
