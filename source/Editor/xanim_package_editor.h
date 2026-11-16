@@ -342,6 +342,8 @@ namespace xanim_package_editor
         std::vector<xmath::fmat4>                       m_RestWorlds, m_PoseWorlds;
         xgeom_skin_editor::skin_under                   m_SkinUnder;            // the descriptor's PreviewSkin drawn under the bones (Skin button)
         bool                                            m_bShowSkin = true;
+        bool                                            m_bFollow = true;       // the camera's target moves with the character (a walk stays in view)
+        bool                                            m_bFollowHas = false; xmath::fvec3 m_FollowLast;
         xrsc::geom_skin                                 m_SkinRef;              // (our reference to the PreviewSkin: released on close or when it changes)
         xrsc::skeleton                                  m_SkinSkelRef;          // (the skin's own skeleton: its bones follow ours by name)
         std::vector<xmath::fmat4>                       m_SkinWorlds;
@@ -5105,7 +5107,16 @@ namespace xanim_package_editor
         void RenderViewport() noexcept
         {
             m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Viewport.m_Scene.m_State, [this] { RenderViewportBody(); }
-                                  , [this](bool bHorizontal, float ButtonHeight) { xgeom_skin_editor::skin_under::Button(m_bShowSkin, bHorizontal, ButtonHeight, "The preview skin (the description's PreviewSkin), lit, under the bones"); });
+                                  , [this](bool bHorizontal, float ButtonHeight)
+                                    {
+                                        xgeom_skin_editor::skin_under::Button(m_bShowSkin, bHorizontal, ButtonHeight, "The preview skin (the description's PreviewSkin), lit, under the bones");
+                                        if (bHorizontal) ImGui::SameLine();
+                                        const bool bOn = m_bFollow;
+                                        if (bOn) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_Header]);
+                                        if (ImGui::Button(bHorizontal ? "Follow###Follow" : "F###Follow", bHorizontal ? ImVec2(60.0f, ButtonHeight) : ImVec2(32.0f, ButtonHeight))) { m_bFollow = !m_bFollow; m_bFollowHas = false; }
+                                        if (bOn) ImGui::PopStyleColor();
+                                        if (ImGui::IsItemHovered()) xeditor::hint::Text("The camera follows the character as it moves (%s)", bOn ? "on" : "off");
+                                    });
         }
 
         void RenderViewportBody() noexcept
@@ -5136,6 +5147,12 @@ namespace xanim_package_editor
             // Play / pause is the AnimPackage/Preview/PlayPause action (P; Space belongs to the drawer).
             PoseToolbar();
             EvaluatePose(*pSkeleton);
+            if (m_bFollow && !m_PoseBones.empty())      // the camera's target moves by the character's move (its bones' centre, on the ground plane): the user's own offset is kept
+            {
+                xmath::fvec3 C(0, 0, 0); for (const auto& B : m_PoseBones) C = C + B.m_Position; C = C * (1.0f / float(m_PoseBones.size())); C.m_Y = 0;
+                if (m_bFollowHas) m_Viewport.m_Scene.m_Target = m_Viewport.m_Scene.m_Target + (C - m_FollowLast);
+                m_FollowLast = C; m_bFollowHas = true;
+            }
             UpdateMaskShown();
             PoseBeforeRender();
             KimodoPreviewBones();
