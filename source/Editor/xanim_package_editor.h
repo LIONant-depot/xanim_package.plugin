@@ -5104,6 +5104,28 @@ namespace xanim_package_editor
             }
         }
 
+        // the description's PreviewProps as wire shapes over the bones (the shared shape the Ragdoll editor draws its bodies with)
+        void DrawPreviewProps() noexcept
+        {
+            auto* pDesc = Desc();
+            if (!pDesc) return;
+            const auto& Names = pDesc->m_ResolvedSkeletonBones.m_Bones;
+            for (const auto& P : pDesc->m_PreviewProps)
+            {
+                xmath::fvec3 At = P.m_Offset; xmath::fquat Q = xmath::fquat::fromIdentity();
+                if (!P.m_Bone.empty())
+                {
+                    int b = -1; for (int i = 0; i < int(Names.size()) && i < int(m_PoseWorlds.size()); ++i) if (Names[i].m_Name == P.m_Bone) { b = i; break; }
+                    if (b < 0) continue;            // (a bone the skeleton lacks: nothing drawn; the Description shows the name)
+                    const auto& W = m_PoseWorlds[std::size_t(b)];
+                    Q = W.ExtractRotation().NormalizeSafeCopy();
+                    At = W * P.m_Offset;
+                }
+                const int K = P.m_Shape == xanim_package_desc::prop_shape::CAPSULE ? 0 : P.m_Shape == xanim_package_desc::prop_shape::SPHERE ? 1 : 2;
+                xskeleton_editor::EmitWireShape(m_Viewport.m_ExtraLines, K, P.m_Size.m_X, P.m_Size.m_Y, P.m_Size, At, Q, IM_COL32(255, 200, 60, 255));
+            }
+        }
+
         void RenderViewport() noexcept
         {
             m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Viewport.m_Scene.m_State, [this] { RenderViewportBody(); }
@@ -5175,6 +5197,7 @@ namespace xanim_package_editor
                         m_Viewport.m_Under = [this, pSkin, pSkinSkel](const ImVec2& Min, const ImVec2& Avail) { m_SkinUnder.Render(*pSkin, *pSkinSkel, m_SkinWorlds, m_Viewport, Min, Avail, m_bOpen); };
                     }
                 }
+            DrawPreviewProps();
             m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
             m_Viewport.m_Under = nullptr;
             PoseAfterRender(Item);

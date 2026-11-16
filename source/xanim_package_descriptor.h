@@ -339,6 +339,34 @@ namespace xanim_package_desc
     };
     XPROPERTY_REG(clip_event)
 
+    enum class prop_shape : std::uint8_t { SPHERE, BOX, CAPSULE };
+    static constexpr auto prop_shape_v = std::array
+    { xproperty::settings::enum_item("Sphere",  prop_shape::SPHERE)
+    , xproperty::settings::enum_item("Box",     prop_shape::BOX)
+    , xproperty::settings::enum_item("Capsule", prop_shape::CAPSULE)
+    };
+
+    // A prop in the preview (editor only, never compiled): a ball, a bat, a chair - a simple shape held by a bone (Bone: the hand) or standing
+    // in the scene (Bone empty), so the animator sees what the motion is about (soccer: the ball at the foot). Model units, the bone's frame.
+    struct preview_prop
+    {
+        std::string     m_Name    = "Ball";
+        prop_shape      m_Shape   = prop_shape::SPHERE;
+        xmath::fvec3    m_Size    = xmath::fvec3(0.11f, 0.11f, 0.11f);    // sphere: x the radius; box: half extents; capsule: x the radius, y the half length
+        std::string     m_Bone    = {};
+        xmath::fvec3    m_Offset  = xmath::fvec3(0, 0.11f, 0.3f);        // from the bone (in its frame), or from the model origin
+
+        XPROPERTY_DEF
+        ( "Prop", preview_prop
+        , obj_member<"Name",   &preview_prop::m_Name >
+        , obj_member<"Shape",  &preview_prop::m_Shape, member_enum_span<prop_shape_v> >
+        , obj_member<"Size",   &preview_prop::m_Size, member_help<"Sphere: X is the radius; Box: half extents; Capsule: X the radius, Y half the length (model units)"> >
+        , obj_member<"Bone",   &preview_prop::m_Bone, member_help<"The bone that holds it (a hand, a foot); empty: it stands in the scene"> >
+        , obj_member<"Offset", &preview_prop::m_Offset, member_help<"Where it is from the bone, in the bone's frame (empty Bone: from the model origin)"> >
+        )
+    };
+    XPROPERTY_REG(preview_prop)
+
     // A sparse override entry for one imported clip, matched BY m_OriginalName against its OWNING
     // import_source's own details::source::m_ClipList - a raw clip's name is only ever guaranteed
     // unique WITHIN the file it came from (see xanim_package_details.h's own comment on why), so this
@@ -583,6 +611,7 @@ namespace xanim_package_desc
         kimodo_settings                 m_Kimodo                = {};   // editor only: where generated clips go and how they are retargeted
 
         xrsc::geom_skin                 m_PreviewSkin = {};             // editor only: the skin the preview poses (the compiler never reads it)
+        std::vector<preview_prop>       m_PreviewProps = {};            // editor only: shapes the preview draws (props held by bones or standing)
         xskeleton_desc::bone_manifest   m_ResolvedSkeletonBones = {};   // NOT saved - populated in Serialize() above
 
         XPROPERTY_VDEF
@@ -590,6 +619,7 @@ namespace xanim_package_desc
         , obj_member<"SkeletonRef",             &descriptor::m_SkeletonRef >          // first: the skeleton every source ends up on
         , obj_member<"ImportSources",           &descriptor::m_ImportSources >
         , obj_member<"Kimodo",                  &descriptor::m_Kimodo >
+        , obj_member<"PreviewProps",            &descriptor::m_PreviewProps, member_help<"Editor only (not in the build): simple props the preview draws (a ball at the foot, a prop in a hand)"> >
         , obj_member<"PreviewSkin",             &descriptor::m_PreviewSkin, member_help<"Editor only (not in the build): the skin the preview draws the animations on (a GeomSkin of this skeleton). Empty: the bones only"> >
         , obj_member<"ResolvedSkeletonBones",   &descriptor::m_ResolvedSkeletonBones, member_flags<flags::DONT_SHOW, flags::DONT_SAVE> >
         )
