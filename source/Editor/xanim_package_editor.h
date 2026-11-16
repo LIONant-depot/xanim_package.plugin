@@ -59,7 +59,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight };
 
         session&    m_Session;
         kind        m_Kind;
@@ -201,6 +201,12 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
                 break;
             case kind::kimodo_takes_to_layers:  m_hA = m_Parser.addOption("Layer", "The Pose layer whose stored takes become Kimodo layers", true, 1); break;
+            case kind::ball_flight:
+                m_hA = m_Parser.addOption("Effector", "What kicks it: RightFoot (default), LeftFoot, a hand or a bone", false, 1);
+                m_hB = m_Parser.addOption("Time",     "Seconds: the contact (default: the playhead)", false, 1);
+                m_hC = m_Parser.addOption("Prop",     "The ball: a preview prop's name (default Ball)", false, 1);
+                m_hD = m_Parser.addOption("Off",      "1: hide the flight", false, 1);
+                break;
             case kind::clip_event:
                 m_hA = m_Parser.addOption("Add",    "A new event's name (at -Time, default the playhead)", false, 1);
                 m_hB = m_Parser.addOption("Id",     "The event to change (its id, hex, as the list shows)", false, 1);
@@ -251,7 +257,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
-        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight;
         // the last accepted candidate (its frames on this skeleton): KimodoTakeCheck compares the compiled take with it
         std::uint64_t m_KAcceptedLayer = 0; std::vector<xmath::transform3> m_KAcceptedFrames; int m_KAcceptedW = 0;
 
@@ -408,6 +414,7 @@ namespace xanim_package_editor
             , m_KeySelected          (m_Undo, *this, playback_cmd::kind::key_selected,            "KeySelected",          "K: keys the selected bone (or the last dragged handle as an IK key, or the pending pose when auto-key is off) at the playhead; -All 1 (Shift+K): every bone the layer owns. One undo step. Usage: KeySelected [-All 1] [-Time s]")
             , m_AutoKey              (m_Undo, *this, playback_cmd::kind::auto_key,                "AutoKey",              "Auto-key on (edits write keys) or off (an edit is a pending pose, shown, that K keys). Usage: AutoKey -On 1|0")
             , m_ClipEvent            (m_Undo, *this, playback_cmd::kind::clip_event,              "ClipEvent",            "The selected clip's events (T5: markers, footsteps, contacts, sync points; one undo step each). Usage: ClipEvent (list) | -Add name [-Kind k] [-Time s] [-End s] [-Bone b] | -Id id [-Time s] [-End s] [-Kind k] [-Name n] [-Bone b] | -Delete id")
+            , m_BallFlight           (m_Undo, *this, playback_cmd::kind::ball_flight,             "BallFlight",           "A kick's check: the ball (a preview prop) leaves with the kicking handle's speed at the contact (x1.1: a typical instep kick's transfer), its flight drawn for 2 s or to the ground (no air drag); reports speed, launch angle, height, distance. Usage: BallFlight [-Effector RightFoot] [-Time s] [-Prop Ball] [-Off 1]")
             , m_DetectFootsteps      (m_Undo, *this, playback_cmd::kind::detect_footsteps,        "DetectFootsteps",      "Finds each foot's support contacts in the clip as composed: a Footstep where it lands and a Contact bar over the support (replaces only what it detected before; one undo step). Usage: DetectFootsteps")
             , m_KimodoTakeCheck      (m_Undo, *this, playback_cmd::kind::kimodo_take_check,       "KimodoTakeCheck",      "The compiled take of the last accepted Kimodo candidate against the candidate itself (every frame, every bone). Usage: KimodoTakeCheck")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
@@ -4263,6 +4270,55 @@ namespace xanim_package_editor
             return true;
         }
 
+        // A kick's check (soccer answer 1): the ball leaves with the kicking handle's velocity at the contact (central difference over one frame
+        // at 60 Hz) times 1.1 (an instep kick: (1 + e) M / (M + m) with e 0.5, the leg's 1.2 kg against the ball's 0.43); a parabola under
+        // gravity (model units are metres; no air drag) until it comes back to the ball's start height or 2 s. ponytail: no spin, no drag.
+        std::vector<xmath::fvec3> m_Flight;
+        std::string BallFlight(const std::string& Effector, double Seconds, const std::string& Prop) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "BallFlight: " + Err;
+            const int b = m_PT.m_Rig.Find(Effector);
+            if (b < 0) return std::format("BallFlight: no handle or bone '{}'", Effector);
+            xmath::fvec3 Ball; if (!PropAt(Prop, Seconds, Ball, Err)) return "BallFlight: " + Err;
+            auto At = [&](double s, xmath::fvec3& P) { xanimation::pose Cur; if (!PoseAt(s, Cur, Err)) return false; xanimation::body_ik FK; FK.Setup(m_PT.m_Rig.m_Par); FK.ComputeWorld(Cur); P = HandleModel(FK, b); return true; };
+            constexpr double H = 1.0 / 60.0;
+            xmath::fvec3 A, B, Foot; if (!At(std::max(0.0, Seconds - H), A) || !At(Seconds + H, B) || !At(Seconds, Foot)) return "BallFlight: " + Err;
+            const auto Vf = (B - A) * float(1.0 / (Seconds + H - std::max(0.0, Seconds - H)));
+            auto V = Vf * 1.1f;
+            m_Flight.clear();
+            xmath::fvec3 P = Ball; float Top = Ball.m_Y, Dist = 0;
+            const bool bRoll = V.m_Y <= 0.0f;           // kicked down or level: the ground holds it - it rolls (grass: 0.5 m/s2 of rolling resistance)
+            if (bRoll)
+            {
+                V.m_Y = 0;
+                const float S0 = std::sqrt(V.m_X * V.m_X + V.m_Z * V.m_Z);
+                const auto Dir = S0 > 1e-6f ? V * (1.0f / S0) : xmath::fvec3(0, 0, 0);
+                for (int i = 0; i <= 200; ++i)
+                {
+                    const float t = std::min(0.01f * float(i), S0 / 0.5f);
+                    m_Flight.push_back(Ball + Dir * (S0 * t - 0.25f * t * t));
+                    if (t >= S0 / 0.5f) break;
+                }
+            }
+            else
+                for (int i = 0; i <= 200; ++i)
+                {
+                    const float t = 0.01f * float(i);
+                    P = Ball + V * t + xmath::fvec3(0, -4.905f * t * t, 0);
+                    if (i > 0 && P.m_Y < Ball.m_Y) break;
+                    m_Flight.push_back(P); Top = std::max(Top, P.m_Y);
+                }
+            const auto D = m_Flight.back() - Ball; Dist = std::sqrt(D.m_X * D.m_X + D.m_Z * D.m_Z);
+            const float Sp = std::sqrt(V.Dot(V)), Hs = std::sqrt(V.m_X * V.m_X + V.m_Z * V.m_Z);
+            const auto Gap = Foot - Ball;
+            if (bRoll)
+                return std::format("BallFlight: {} at {:.3f} s moves at {:.2f} m/s, downward {:.1f} deg: the ball rolls at {:.2f} m/s and stops {:.2f} m away{} ({} points drawn); the handle is {:.1f} cm from the ball's centre at the contact"
+                    , m_PT.m_Rig.Name(b), Seconds, std::sqrt(Vf.Dot(Vf)), std::atan2(Vf.m_Y, std::sqrt(Vf.m_X * Vf.m_X + Vf.m_Z * Vf.m_Z)) * 57.29578f, Sp, Dist, m_Flight.size() > 200 ? " (still rolling after 2 s)" : "", m_Flight.size(), std::sqrt(Gap.Dot(Gap)) * 100.0f);
+            return std::format("BallFlight: {} at {:.3f} s moves at {:.2f} m/s; the ball leaves at {:.2f} m/s, {:.1f} deg up, rises {:.2f} m, lands {:.2f} m away{} ({} points drawn); the handle is {:.1f} cm from the ball's centre at the contact"
+                , m_PT.m_Rig.Name(b), Seconds, std::sqrt(Vf.Dot(Vf)), Sp, std::atan2(V.m_Y, Hs) * 57.29578f, Top - Ball.m_Y, Dist, m_Flight.size() > 200 ? " (still flying after 2 s)" : "", m_Flight.size(), std::sqrt(Gap.Dot(Gap)) * 100.0f);
+        }
+
         // where a handle is at a time in the composed animation (model space; the gates measure IK keys with it)
         std::string HandleProbe(const std::string& Effector, double Seconds) noexcept
         {
@@ -5143,6 +5199,7 @@ namespace xanim_package_editor
                 const int K = P.m_Shape == xanim_package_desc::prop_shape::CAPSULE ? 0 : P.m_Shape == xanim_package_desc::prop_shape::SPHERE ? 1 : 2;
                 xskeleton_editor::EmitWireShape(m_Viewport.m_ExtraLines, K, P.m_Size.m_X, P.m_Size.m_Y, P.m_Size, At, Q, IM_COL32(255, 200, 60, 255));
             }
+            for (std::size_t i = 1; i < m_Flight.size(); ++i) xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, m_Flight[i - 1], m_Flight[i], IM_COL32(90, 230, 255, 255), IM_COL32(90, 230, 255, 255));     // the last BallFlight
         }
 
         void RenderViewport() noexcept
@@ -5543,7 +5600,15 @@ namespace xanim_package_editor
             xeditor::cmd_util::GetArg(m_Parser, m_hE, T); xeditor::cmd_util::GetArg(m_Parser, m_hF, E); xeditor::cmd_util::GetArg(m_Parser, m_hG, B); xeditor::cmd_util::GetArg(m_Parser, m_hH, N);
             return S.ClipEvent(A, I, D, K, T, E, B, N);
         }
-        case kind::detect_footsteps: return S.DetectFootsteps();        case kind::auto_key:
+        case kind::detect_footsteps: return S.DetectFootsteps();
+        case kind::ball_flight:
+        {
+            std::string Eff = "RightFoot", Time, Prop = "Ball", Off; double T = S.m_TimeSeconds;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Eff); xeditor::cmd_util::GetArg(m_Parser, m_hC, Prop); xeditor::cmd_util::GetArg(m_Parser, m_hD, Off);
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "BallFlight: -Time is seconds";
+            if (Off == "1" || Off == "true") { S.m_Flight.clear(); return "BallFlight: hidden"; }
+            return S.BallFlight(Eff, T, Prop);
+        }        case kind::auto_key:
         {
             std::string On; xeditor::cmd_util::GetArg(m_Parser, m_hA, On);
             S.m_PT.m_bAutoKey = On == "1" || On == "true";
