@@ -421,7 +421,7 @@ namespace xanim_package_editor
             AddPanel("Clips",                dock::right,  [this] { RenderClips(); });
             AddPanel("Kimodo",               dock::right,  [this] { RenderKimodo(); });
             AddPanel("Layers",               dock::right,  [this] { RenderLayers(); });
-            if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value);
+            if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value, 320.0f, 200.0f);     // (with Skin and Follow)
             AddPanel("AnimPackage Viewport", dock::center, [this] { RenderViewport(); }, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             AddPanel("Timeline",             dock::bottom_wide, [this] { RenderPlayback(); });       // under the viewport and the side columns
             m_TLView.m_HeaderWidth = 380;                                                               // name + weight + mode + mask + eye/solo/lock
