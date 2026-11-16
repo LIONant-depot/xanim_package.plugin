@@ -5,6 +5,7 @@
 #include "plugins/xskeleton.plugin/source/xskeleton_xgpu_rsc_loader.h"
 #include "plugins/xskeleton.plugin/source/xskeleton_bone_manifest.h"
 #include "plugins/xretarget.plugin/source/xretarget_ref.h"
+#include "plugins/xgeom_skin.plugin/source/xgeom_skin_xgpu_rsc_loader.h"
 #include "xanim_package.h"
 #include "xanim_package_xgpu_rsc_loader.h"
 #include "xanim_package_details.h"
@@ -570,6 +571,7 @@ namespace xanim_package_desc
             if (auto Err = File.Open(true, ManifestPath, xtextfile::file_type::TEXT); Err)
                 return xerr::create_f<xresource_pipeline::state, "Error opening the referenced skeleton's bone manifest - has it been compiled yet?">(Err);
 
+
             if (auto Err = xproperty::sprop::serializer::Stream(File, m_ResolvedSkeletonBones, C); Err)
                 return xerr::create_f<xresource_pipeline::state, "Error reading the referenced skeleton's bone manifest">(Err);
 
@@ -580,6 +582,7 @@ namespace xanim_package_desc
         xrsc::skeleton                  m_SkeletonRef           = {};   // required - Validate() errors if empty
         kimodo_settings                 m_Kimodo                = {};   // editor only: where generated clips go and how they are retargeted
 
+        xrsc::geom_skin                 m_PreviewSkin = {};             // editor only: the skin the preview poses (the compiler never reads it)
         xskeleton_desc::bone_manifest   m_ResolvedSkeletonBones = {};   // NOT saved - populated in Serialize() above
 
         XPROPERTY_VDEF
@@ -587,6 +590,7 @@ namespace xanim_package_desc
         , obj_member<"SkeletonRef",             &descriptor::m_SkeletonRef >          // first: the skeleton every source ends up on
         , obj_member<"ImportSources",           &descriptor::m_ImportSources >
         , obj_member<"Kimodo",                  &descriptor::m_Kimodo >
+        , obj_member<"PreviewSkin",             &descriptor::m_PreviewSkin, member_help<"Editor only (not in the build): the skin the preview draws the animations on (a GeomSkin of this skeleton). Empty: the bones only"> >
         , obj_member<"ResolvedSkeletonBones",   &descriptor::m_ResolvedSkeletonBones, member_flags<flags::DONT_SHOW, flags::DONT_SAVE> >
         )
     };

@@ -12,6 +12,8 @@
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_inspector_pickers.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_resources.h"
 #include "plugins/xskeleton.plugin/source/Editor/xskeleton_viewport.h"
+#include "plugins/xgeom_skin.plugin/source/Editor/xgeom_skin_editor_under.h"     // the skin under the bones (shared with the Ragdoll editor)
+#include "plugins/xgeom_skin.plugin/source/xgeom_skin_xgpu_runtime.h"
 #include "plugins/xanim_package.plugin/source/xanim_package.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_descriptor.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.h"
@@ -338,6 +340,12 @@ namespace xanim_package_editor
         bool                                            m_bShowable = false;    // the package and its skeleton are loaded and agree
 
         std::vector<xmath::fmat4>                       m_RestWorlds, m_PoseWorlds;
+        xgeom_skin_editor::skin_under                   m_SkinUnder;            // the descriptor's PreviewSkin drawn under the bones (Skin button)
+        bool                                            m_bShowSkin = true;
+        xrsc::geom_skin                                 m_SkinRef;              // (our reference to the PreviewSkin: released on close or when it changes)
+        xrsc::skeleton                                  m_SkinSkelRef;          // (the skin's own skeleton: its bones follow ours by name)
+        std::vector<xmath::fmat4>                       m_SkinWorlds;
+        xgpu::device*                                   m_pDevice = nullptr;
         std::vector<xskeleton_editor::bone_world>       m_PoseBones;
         std::vector<e19::draw_vert>                     m_Lines;
 
@@ -419,6 +427,7 @@ namespace xanim_package_editor
 
             m_Viewport.m_pOpen = &m_bOpen;
             m_bReady = pDevice && m_Viewport.Init(*pDevice);
+            m_pDevice = pDevice;
             Reload();
         }
 
@@ -427,6 +436,9 @@ namespace xanim_package_editor
             xresource::g_Mgr.ReleaseRef(m_Ref);
             xresource::g_Mgr.ReleaseRef(m_SkeletonRef);
             xresource::g_Mgr.ReleaseRef(m_K.m_SkeletonRef);
+            xresource::g_Mgr.ReleaseRef(m_SkinRef);
+            xresource::g_Mgr.ReleaseRef(m_SkinSkelRef);
+            m_SkinUnder.Release();
             m_Viewport.Release();
         }
 
@@ -5092,7 +5104,8 @@ namespace xanim_package_editor
 
         void RenderViewport() noexcept
         {
-            m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Viewport.m_Scene.m_State, [this] { RenderViewportBody(); });
+            m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Viewport.m_Scene.m_State, [this] { RenderViewportBody(); }
+                                  , [this](bool bHorizontal, float ButtonHeight) { xgeom_skin_editor::skin_under::Button(m_bShowSkin, bHorizontal, ButtonHeight, "The preview skin (the description's PreviewSkin), lit, under the bones"); });
         }
 
         void RenderViewportBody() noexcept
@@ -5129,7 +5142,24 @@ namespace xanim_package_editor
             std::set<int> PoseSel; if (m_PT.m_bOn && m_PT.m_FKBone >= 0) PoseSel.insert(m_PT.m_FKBone);
             const std::set<int>* pSel = !m_MaskShown.empty() ? &m_MaskShown : PoseSel.empty() ? nullptr : &PoseSel;
             const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSkeleton, .m_Bones = m_PoseBones, .m_pSelected = pSel };
+            // the preview skin under the bones: its own skeleton follows ours by bone name (skin_under::PoseFrom)
+            if (auto* pDesc = Desc(); pDesc && pDesc->m_PreviewSkin.m_Instance.m_Value != m_SkinRef.m_Instance.m_Value)
+            {
+                xresource::g_Mgr.ReleaseRef(m_SkinRef); xresource::g_Mgr.ReleaseRef(m_SkinSkelRef);
+                m_SkinRef = {}; m_SkinRef.m_Instance = pDesc->m_PreviewSkin.m_Instance; m_SkinSkelRef = {};
+            }
+            if (m_bShowSkin && !m_SkinRef.empty() && m_PoseWorlds.size() == pSkeleton->getBones().size())
+                if (auto* pSkin = xresource::g_Mgr.getResource(m_SkinRef); pSkin && m_SkinUnder.Ready(m_pDevice))
+                {
+                    if (m_SkinSkelRef.empty()) { m_SkinSkelRef = {}; m_SkinSkelRef.m_Instance = pSkin->getSkeletonRef().m_Instance; }
+                    if (auto* pSkinSkel = xresource::g_Mgr.getResource(m_SkinSkelRef))
+                    {
+                        m_SkinUnder.PoseFrom(*pSkeleton, m_PoseWorlds, *pSkinSkel, m_SkinWorlds);
+                        m_Viewport.m_Under = [this, pSkin, pSkinSkel](const ImVec2& Min, const ImVec2& Avail) { m_SkinUnder.Render(*pSkin, *pSkinSkel, m_SkinWorlds, m_Viewport, Min, Avail, m_bOpen); };
+                    }
+                }
             m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
+            m_Viewport.m_Under = nullptr;
             PoseAfterRender(Item);
 
             // mask editing: a click on a bone adds it (with its branch; Shift: alone) to the selected layer's mask, or removes it
