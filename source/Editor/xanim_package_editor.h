@@ -24,6 +24,8 @@
 #include "plugins/xanim_package.plugin/source/xanim_package_layers.h"
 #include "plugins/xskeleton.plugin/source/xskeleton_joints.h"
 #include "source/Tools/Editor/xeditor_timeline.h"
+#include "plugins/xskeleton.plugin/source/Editor/xskeleton_posing_handles.h"
+#include "dependencies/ImGuizmo/src/ImGuizmo.h"
 
 #include <charconv>
 #include <functional>
@@ -55,7 +57,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate };
 
         session&    m_Session;
         kind        m_Kind;
@@ -167,6 +169,11 @@ namespace xanim_package_editor
                 m_hA = m_Parser.addOption("Layer", "The Kimodo layer's index", true, 1);
                 m_hB = m_Parser.addOption("Every", "A key every N frames (default 1: every frame)", false, 1);
                 break;
+            case kind::pose_rotate:
+                m_hA = m_Parser.addOption("Bone", "The bone (its name)", true, 1);
+                m_hB = m_Parser.addOption("Turn", "\"x y z\" degrees about the model's axes, applied to the bone's current world rotation", true, 1);
+                m_hC = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
+                break;
             case kind::kimodo_takes_to_layers:  m_hA = m_Parser.addOption("Layer", "The Pose layer whose stored takes become Kimodo layers", true, 1); break;
             default: break;
             }
@@ -209,7 +216,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
-        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate;
         // the last accepted candidate (its frames on this skeleton): KimodoTakeCheck compares the compiled take with it
         std::uint64_t m_KAcceptedLayer = 0; std::vector<xmath::transform3> m_KAcceptedFrames; int m_KAcceptedW = 0;
 
@@ -352,6 +359,7 @@ namespace xanim_package_editor
             , m_KimodoShow           (m_Undo, *this, playback_cmd::kind::kimodo_show,             "KimodoShow",           "Previews a Kimodo candidate at the playhead (-1: none). Usage: KimodoShow -Candidate i")
             , m_BakeToPose           (m_Undo, *this, playback_cmd::kind::bake_to_pose,            "BakeToPose",           "Turns a Kimodo layer into an editable Pose layer (keys of what the clip plays over its span); the Kimodo layer goes off, its take is kept; one undo step. Usage: BakeToPose -Layer n [-Every 1]")
             , m_KimodoTakesToLayers  (m_Undo, *this, playback_cmd::kind::kimodo_takes_to_layers,  "KimodoTakesToLayers",  "A Pose layer's stored takes (from the refine) as Kimodo layers with their requests, off (idempotent). Usage: KimodoTakesToLayers -Layer n")
+            , m_PoseRotate           (m_Undo, *this, playback_cmd::kind::pose_rotate,             "PoseRotate",           "Turns one bone (what the rotate gizmo does) and writes its key on the top Pose layer, one undo step. Usage: PoseRotate -Bone name -Turn \"x y z\" [-Time s]")
             , m_KimodoTakeCheck      (m_Undo, *this, playback_cmd::kind::kimodo_take_check,       "KimodoTakeCheck",      "The compiled take of the last accepted Kimodo candidate against the candidate itself (every frame, every bone). Usage: KimodoTakeCheck")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
@@ -3063,6 +3071,8 @@ namespace xanim_package_editor
             std::vector<std::uint8_t>               m_Owned;        // the bones a drag may turn: all but the roots
             std::vector<xanimation::joint_limit>    m_Lim;          // the skeleton's compiled limits (JointLimits On), else empty: free
             std::vector<xanimation::two_bone_chain> m_Limbs;
+            std::vector<xmath::fvec3>               m_AttachM;      // a handle's point in its bone's frame, model units (palm, sole; 0: the joint)
+            std::vector<xmath::fvec3>               m_AttachB;      // the same in the bone's own units (body_ik's ik_task::m_Attach: scaled like the bone)
             int count() const noexcept { return int(m_Par.size()); }
             int Find(std::string_view N) const noexcept
             {
@@ -3102,6 +3112,13 @@ namespace xanim_package_editor
             std::vector<std::pair<int, ImVec2>> m_Screen;               // the handles as drawn last frame (bone, screen)
             ImVec2                              m_TipScreen{ -1, -1 };
             std::string                         m_ContactText;          // the contacts found (feet), for the info
+            std::set<int>                       m_Unpinned;             // feet in contact the user unpinned (auto pins they override)
+            std::vector<std::pair<int, std::pair<ImVec2, ImVec2>>> m_PinBoxes;   // the pin icons as drawn last frame (handle, box)
+            int                                 m_PinHover = -1;
+            std::map<int, xmath::fvec3>         m_HandleAt;             // the handles as drawn (drawn space: palm, sole, else the joint)
+            bool                                m_bGizmo = true;        // the selected bone's rotate gizmo
+            bool                                m_bGizmoUsing = false, m_bGizmoCancelled = false;
+            xanimation::pose                    m_GizmoBase; double m_GizmoTime = 0;
         } m_PT;
 
         bool PoseRig(std::string& Err) noexcept
@@ -3137,8 +3154,37 @@ namespace xanim_package_editor
                 for (int b = 0; b < nB; ++b) R.m_Lim[b] = xskeleton_joints::FromRuntime(pSk->m_pJoints[b], pSk->m_pBoneRests[b].m_RestPose.m_Rotation.NormalizeSafeCopy());
             }
             for (int E : { R.m_LH, R.m_RH, R.m_LF, R.m_RF }) if (E >= 0) if (const int p = R.m_Par[E]; p >= 0 && R.m_Par[p] >= 0) R.m_Limbs.push_back({ R.m_Par[p], p, E });
+            // the handles where a hand or a foot is held: the palm (halfway to the middle finger) and the sole (between the foot and its toe,
+            // at the toe's height: the ground), when the skeleton has those bones; else the joint itself
+            {
+                R.m_AttachM.assign(nB, xmath::fvec3(0, 0, 0)); R.m_AttachB.assign(nB, xmath::fvec3(0, 0, 0));
+                std::vector<xmath::fquat> Rw; std::vector<xmath::fvec3> Pw, Sc;
+                xanimation::details::WorldRPS(xanimation::skeleton_view{ R.m_Par }, R.m_Rest, Rw, Pw, Sc);
+                auto Child = [&](int b, const char* pPrefer) { int First = -1; for (int c = b + 1; c < nB; ++c) if (R.m_Par[c] == b) { if (First < 0) First = c; if (pPrefer && xstrtool::findI(R.m_Names[c], pPrefer) != std::string::npos) return c; } return First; };
+                auto Set = [&](int b, const xmath::fvec3& Point)
+                {
+                    const auto A = Rw[b].ConjugateCopy() * (Point - Pw[b]);
+                    R.m_AttachM[b] = A;
+                    R.m_AttachB[b] = xmath::fvec3(A.m_X / std::max(1e-9f, Sc[b].m_X), A.m_Y / std::max(1e-9f, Sc[b].m_Y), A.m_Z / std::max(1e-9f, Sc[b].m_Z));
+                };
+                for (int F : { R.m_LF, R.m_RF }) if (F >= 0) if (const int T = Child(F, "toe"); T >= 0) { auto P = (Pw[F] + Pw[T]) * 0.5f; P.m_Y = Pw[T].m_Y; Set(F, P); }
+                for (int H : { R.m_LH, R.m_RH })                // the middle finger's base, else the fingers' bases' centre: the palm halfway there
+                {
+                    if (H < 0) continue;
+                    xmath::fvec3 Sum(0, 0, 0); int n = 0, Mid = -1;
+                    for (int c = H + 1; c < nB; ++c) if (R.m_Par[c] == H) { Sum = Sum + Pw[c]; ++n; if (xstrtool::findI(R.m_Names[c], "middle") != std::string::npos) Mid = c; }
+                    if (n) Set(H, Pw[H] + ((Mid >= 0 ? Pw[Mid] : Sum * (1.0f / n)) - Pw[H]) * 0.5f);
+                }
+            }
             m_PT.m_Rig = std::move(R); m_PT.m_RigKey = Key;
             return true;
+        }
+
+        // where a handle is (its palm or sole when it has one), model space
+        xmath::fvec3 HandleModel(const xanimation::body_ik& FK, int b) const noexcept
+        {
+            const auto& R = m_PT.m_Rig;
+            return FK.WorldPosition(b) + (b >= 0 && b < int(R.m_AttachM.size()) ? FK.WorldRotation(b) * R.m_AttachM[b] : xmath::fvec3(0, 0, 0));
         }
 
         bool PoseAt(double Seconds, xanimation::pose& P, std::string& Err) noexcept
@@ -3190,8 +3236,14 @@ namespace xanim_package_editor
         std::set<int> PoseEffectivePins(double Seconds) noexcept
         {
             auto P = m_PT.m_Pins;
-            if (m_PT.m_bAutoPins) for (int b : PoseContactsAt(Seconds)) P.insert(b);
+            if (m_PT.m_bAutoPins) for (int b : PoseContactsAt(Seconds)) if (!m_PT.m_Unpinned.count(b)) P.insert(b);
             return P;
+        }
+        // a handle's pin, on or off: the user's pin, or a foot pinned by its contact (then the contact pin is overridden)
+        void PoseTogglePin(int b) noexcept
+        {
+            if (PoseEffectivePins(m_TimeSeconds).count(b)) { if (m_PT.m_Pins.count(b)) m_PT.m_Pins.erase(b); else m_PT.m_Unpinned.insert(b); }
+            else { m_PT.m_Unpinned.erase(b); m_PT.m_Pins.insert(b); }
         }
 
         static std::string PoseReason(std::uint8_t r) noexcept
@@ -3225,12 +3277,12 @@ namespace xanim_package_editor
             }
             else
             {
-                xanimation::ik_task T; T.m_Bone = Eff; T.m_bPosition = true; T.m_Position = TargetModel; Tasks.push_back(T);
+                xanimation::ik_task T; T.m_Bone = Eff; T.m_bPosition = true; T.m_Position = TargetModel; T.m_Attach = R.m_AttachB[Eff]; Tasks.push_back(T);
                 Set.m_TranslateBone = R.m_Hips;
                 for (int b : Pins)
                 {
                     if (b == Eff || b < 0 || b >= nB) continue;
-                    xanimation::ik_task Pn; Pn.m_Bone = b; Pn.m_bPosition = true; Pn.m_Position = S.WorldPosition(b);
+                    xanimation::ik_task Pn; Pn.m_Bone = b; Pn.m_bPosition = true; Pn.m_Position = S.WorldPosition(b) + S.WorldRotation(b) * R.m_AttachM[b]; Pn.m_Attach = R.m_AttachB[b];
                     Pn.m_bOrientation = true; Pn.m_Orientation = S.WorldRotation(b); Pn.m_bHard = true; Tasks.push_back(Pn);
                 }
             }
@@ -3298,7 +3350,7 @@ namespace xanim_package_editor
             xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(Base);
             int Moved = Eff;
             if (bFK) for (int c = Eff + 1; c < R.count(); ++c) if (R.m_Par[c] == Eff) { Moved = c; break; }
-            const auto Target = FK.WorldPosition(Moved) + MoveCm * 0.01f;
+            const auto Target = (bFK ? FK.WorldPosition(Moved) : HandleModel(FK, Eff)) + MoveCm * 0.01f;
             xanimation::pose Out; std::string Note; float PinErr = 0;
             if (!PoseSolve(Base, Eff, Target, bFK, Pins, Out, Note, &PinErr)) return "PoseDrag: " + Note;
             m_PT.m_Note = Note; m_PT.m_LastEff = Eff;
@@ -3433,7 +3485,8 @@ namespace xanim_package_editor
                 }
                 m_Viewport.m_bGizmoHot = m_Viewport.m_bGizmoDrag = m_PT.m_Drag >= 0;
             }
-            else if (m_PT.m_Hover >= 0) m_Viewport.m_bGizmoHot = true;
+            else if (m_PT.m_Hover >= 0 || m_PT.m_PinHover >= 0) m_Viewport.m_bGizmoHot = true;
+            if (m_PT.m_bGizmo && m_PT.m_FKBone >= 0 && (ImGuizmo::IsOver() || ImGuizmo::IsUsing() || m_PT.m_bGizmoUsing)) { m_Viewport.m_bGizmoHot = true; if (ImGuizmo::IsUsing()) m_Viewport.m_bGizmoDrag = true; }
             // the previewed pose: a drag, or a Suggest candidate
             if (m_PT.m_bPreview) PoseToBones(m_PT.m_Preview, m_PT.m_Offset);
             else if (m_PT.m_Cand >= 0 && m_PT.m_Cand < int(m_Suggest.m_Candidates.size()))
@@ -3455,15 +3508,34 @@ namespace xanim_package_editor
             const auto& R = m_PT.m_Rig;
             auto* DL = ImGui::GetWindowDrawList();
             const auto Pins = m_PT.m_Drag >= 0 ? m_PT.m_DragPins : PoseEffectivePins(m_TimeSeconds);
+            // the handles where the shown pose has them (the palm, the sole): a drag's preview, else the clip at the playhead
+            m_PT.m_HandleAt.clear(); m_PT.m_PinBoxes.clear();
+            {
+                xanimation::pose Shown; std::string E2;
+                const bool bHave = m_PT.m_bPreview ? (Shown = m_PT.m_Preview, true) : PoseAt(m_TimeSeconds, Shown, E2);
+                if (bHave && Shown.count() == R.count())
+                {
+                    xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(Shown);
+                    const auto Off = m_PoseBones[0].m_Position - FK.WorldPosition(0);
+                    for (int b : R.Effectors()) m_PT.m_HandleAt[b] = HandleModel(FK, b) + Off;
+                }
+            }
             for (int b : R.Effectors())
             {
-                ImVec2 S; if (!m_Viewport.Project(m_PoseBones[b].m_Position, S)) continue;
+                const auto At = m_PT.m_HandleAt.find(b);
+                ImVec2 S; if (!m_Viewport.Project(At != m_PT.m_HandleAt.end() ? At->second : m_PoseBones[b].m_Position, S)) continue;
                 m_PT.m_Screen.push_back({ b, S });
                 const bool bPin = Pins.count(b) > 0, bHot = m_PT.m_Hover == b && !m_PT.m_bHoverTip, bDrag = m_PT.m_Drag == b && !m_PT.m_bFK;
-                const ImU32 Col = bDrag ? IM_COL32(255, 200, 60, 255) : bHot ? IM_COL32(255, 235, 120, 255) : bPin ? IM_COL32(230, 70, 70, 255) : IM_COL32(255, 150, 40, 255);
-                if (bPin) { DL->AddRectFilled(ImVec2(S.x - 6, S.y - 6), ImVec2(S.x + 6, S.y + 6), Col); DL->AddRect(ImVec2(S.x - 6, S.y - 6), ImVec2(S.x + 6, S.y + 6), IM_COL32(20, 20, 20, 255)); }
-                else    { DL->AddCircleFilled(S, 7.0f, Col); DL->AddCircle(S, 7.0f, IM_COL32(20, 20, 20, 255)); }
-                if (bHot) DL->AddText(ImVec2(S.x + 10, S.y - 8), IM_COL32(255, 255, 255, 255), std::format("{}{}", R.Name(b), bPin ? " (pinned: right-click unpins)" : " (drag; right-click pins)").c_str());
+                xskeleton_editor::handles::Draw(*DL, S, bPin ? xskeleton_editor::handles::kind::pinned : xskeleton_editor::handles::kind::effector, bHot, bDrag);
+                const bool bPinHot = m_PT.m_PinHover == b;
+                m_PT.m_PinBoxes.push_back({ b, xskeleton_editor::handles::PinIcon(*DL, S, bPin, bPinHot) });
+                if (bHot) DL->AddText(ImVec2(S.x + 22, S.y - 8), IM_COL32(255, 255, 255, 255), std::format("{}{}", R.Name(b), bPin ? " (pinned)" : " (drag it)").c_str());
+                if (bPinHot) DL->AddText(ImVec2(S.x + 22, S.y - 22), IM_COL32(255, 255, 255, 255), bPin ? "click: unpin" : "click: pin here");
+            }
+            {
+                const ImVec2 M = ImGui::GetIO().MousePos;
+                m_PT.m_PinHover = -1;
+                if (m_PT.m_Drag < 0 && !m_PT.m_bGizmoUsing) for (const auto& [b, Box] : m_PT.m_PinBoxes) if (xskeleton_editor::handles::In(Box, M)) m_PT.m_PinHover = b;
             }
             if (m_PT.m_FKBone >= 0 && m_PT.m_FKBone < R.count())
             {   // the selected bone's tip: dragging it turns that bone alone
@@ -3477,12 +3549,14 @@ namespace xanim_package_editor
                     if (bHot) DL->AddText(ImVec2(S.x + 10, S.y - 8), IM_COL32(255, 255, 255, 255), std::format("{}: turn (FK)", R.m_Names[m_PT.m_FKBone]).c_str());
                 }
             }
+            PoseGizmo();
             // the ghost: where the handle was asked to go, the line to where it got, why it stopped
             if (m_PT.m_Drag >= 0)
             {
                 ImVec2 T, A;
                 const int Got = m_PT.m_bFK ? [&] { for (int c = m_PT.m_Drag + 1; c < R.count(); ++c) if (R.m_Par[c] == m_PT.m_Drag) return c; return m_PT.m_Drag; }() : m_PT.m_Drag;
-                if (m_Viewport.Project(m_PT.m_Target, T) && m_Viewport.Project(m_PoseBones[Got].m_Position, A))
+                const auto GotAt = m_PT.m_bFK ? m_PoseBones[Got].m_Position : (m_PT.m_HandleAt.count(Got) ? m_PT.m_HandleAt[Got] : m_PoseBones[Got].m_Position);
+                if (m_Viewport.Project(m_PT.m_Target, T) && m_Viewport.Project(GotAt, A))
                 {
                     const bool bMiss = m_PT.m_Note != "reached";
                     DL->AddCircle(T, 9.0f, bMiss ? IM_COL32(255, 80, 80, 230) : IM_COL32(255, 255, 255, 160), 0, 2.0f);
@@ -3500,7 +3574,8 @@ namespace xanim_package_editor
             if (m_Viewport.Over() && m_PT.m_Drag < 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Middle))
             {
                 const ImVec2 Mouse = ImGui::GetIO().MousePos;
-                if (m_PT.m_Hover >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                if (m_PT.m_PinHover >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) PoseTogglePin(m_PT.m_PinHover);
+                else if (m_PT.m_Hover >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 {
                     std::string E2;
                     if (PoseAt(m_TimeSeconds, m_PT.m_Base, E2))
@@ -3511,16 +3586,16 @@ namespace xanim_package_editor
                         int Grab = m_PT.m_Drag;
                         if (m_PT.m_bFK) for (int c = Grab + 1; c < R.count(); ++c) if (R.m_Par[c] == m_PT.m_Drag) { Grab = c; break; }
                         m_PT.m_Offset = m_PoseBones[Grab].m_Position - FK.WorldPosition(Grab);
-                        m_PT.m_Plane = m_PT.m_Start = m_PT.m_Target = m_PoseBones[Grab].m_Position;
+                        m_PT.m_Plane = m_PT.m_Start = m_PT.m_Target = m_PT.m_bFK ? m_PoseBones[Grab].m_Position : HandleModel(FK, Grab) + m_PT.m_Offset;
                         m_PT.m_Normal = m_Viewport.m_Scene.m_View.RayFromScreen(Mouse.x, Mouse.y).NormalizeSafeCopy();
                     }
                     else m_PT.m_Note = E2;
                 }
                 else if (m_PT.m_Hover >= 0 && !m_PT.m_bHoverTip && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
                 {
-                    if (m_PT.m_Pins.count(m_PT.m_Hover)) m_PT.m_Pins.erase(m_PT.m_Hover); else m_PT.m_Pins.insert(m_PT.m_Hover);
+                    PoseTogglePin(m_PT.m_Hover);
                 }
-                else if (!m_bMaskEdit && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                else if (!m_bMaskEdit && !ImGuizmo::IsOver() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 {
                     int iBone = -1; float T = 0;
                     m_PT.m_FKBone = m_Viewport.PickBone(Item, Mouse, iBone, T) ? iBone : -1;
@@ -3537,6 +3612,75 @@ namespace xanim_package_editor
                     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) m_PT.m_Cand = -1;
                 }
             }
+        }
+
+        // The selected bone's rotate gizmo (ImGuizmo, the bone's own axes: twist and swing): a drag previews the turn, the release writes it as
+        // the bone's key on the top Pose layer (ONE undo step), Esc cancels. Its console twin: PoseRotate.
+        void PoseGizmo() noexcept
+        {
+            const auto& R = m_PT.m_Rig;
+            const int b = m_PT.m_FKBone;
+            const bool bOn = m_PT.m_bGizmo && b >= 0 && b < R.count() && R.m_Par[b] >= 0 && m_PT.m_Drag < 0 && m_Viewport.RectSize().x > 1 && m_Viewport.RectSize().y > 1;
+            if (!bOn) { m_PT.m_bGizmoUsing = false; return; }
+            std::string Err;
+            xanimation::pose Base;
+            if (m_PT.m_bGizmoUsing) Base = m_PT.m_GizmoBase;
+            else if (!PoseAt(m_TimeSeconds, Base, Err)) return;
+            const xanimation::pose& Cur = (m_PT.m_bGizmoUsing && m_PT.m_bPreview) ? m_PT.m_Preview : Base;
+            xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(Cur);
+            const auto Off = m_PoseBones[0].m_Position - FK.WorldPosition(0);
+            xmath::fmat4 World(xmath::fvec3(1, 1, 1), FK.WorldRotation(b), FK.WorldPosition(b) + Off);
+
+            ImGuizmo::BeginFrame();
+            ImGuizmo::SetOrthographic(false);
+            ImGuizmo::SetDrawlist();
+            ImGuizmo::SetRect(m_Viewport.RectMin().x, m_Viewport.RectMin().y, m_Viewport.RectSize().x, m_Viewport.RectSize().y);
+            const xmath::fmat4 W2V = m_Viewport.m_Scene.m_View.getW2V();
+            xmath::fmat4 Proj = m_Viewport.m_Scene.m_View.getV2C();
+            Proj.m_10 = -Proj.m_10; Proj.m_11 = -Proj.m_11; Proj.m_12 = -Proj.m_12; Proj.m_13 = -Proj.m_13;      // ImGuizmo is OpenGL-convention (undo the Vulkan Y flip)
+            const float Snap[3] = { 15.0f, 15.0f, 15.0f };
+            const bool bChanged = ImGuizmo::Manipulate(reinterpret_cast<const float*>(&W2V), reinterpret_cast<const float*>(&Proj), ImGuizmo::ROTATE, ImGuizmo::LOCAL
+                                                      , reinterpret_cast<float*>(&World), nullptr, ImGui::GetIO().KeyCtrl ? Snap : nullptr);
+            const bool bUsing = ImGuizmo::IsUsing();
+            if (!bUsing) m_PT.m_bGizmoCancelled = false;
+            if (bUsing && !m_PT.m_bGizmoUsing && !m_PT.m_bGizmoCancelled) { m_PT.m_bGizmoUsing = true; m_PT.m_GizmoBase = Base; m_PT.m_GizmoTime = m_TimeSeconds; m_PT.m_Cand = -1; }
+            if (m_PT.m_bGizmoUsing && ImGui::IsKeyPressed(ImGuiKey_Escape)) { m_PT.m_bGizmoUsing = false; m_PT.m_bGizmoCancelled = true; m_PT.m_bPreview = false; m_PT.m_Note = "cancelled"; return; }
+            if (m_PT.m_bGizmoUsing && bChanged)
+            {
+                xanimation::body_ik FB; FB.Setup(R.m_Par); FB.ComputeWorld(m_PT.m_GizmoBase);
+                const auto Rp = FB.WorldRotation(R.m_Par[b]);
+                m_PT.m_Preview = m_PT.m_GizmoBase;
+                m_PT.m_Preview.m_Rotation[b] = (Rp.ConjugateCopy() * World.ExtractRotation()).NormalizeCopy();
+                m_PT.m_bPreview = true;
+            }
+            if (m_PT.m_bGizmoUsing && !bUsing)
+            {   // released: the key, one undo step
+                m_PT.m_bGizmoUsing = false;
+                if (m_PT.m_bPreview)
+                {
+                    const auto P = m_PT.m_Preview; m_PT.m_bPreview = false;
+                    const auto C = PoseCommit(P, m_PT.m_GizmoTime, std::format("Pose rotate {}", R.m_Names[b]));
+                    m_PT.m_Note = C.find(" keys on layer ") != std::string::npos ? std::format("{} turned", R.m_Names[b]) : C;
+                    xeditor::LogConsole(std::format("Pose: {} ({})", m_PT.m_Note, C.substr(0, 160)), xeditor::log_source::User);
+                }
+            }
+        }
+
+        // the console's gizmo: the bone turned by Turn (degrees about the model's x, y, z, applied to its current world rotation) at a time, as keys
+        std::string PoseRotate(const std::string& Bone, const xmath::fvec3& TurnDeg, double Seconds) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "PoseRotate: " + Err;
+            const auto& R = m_PT.m_Rig;
+            const int b = R.Find(Bone);
+            if (b < 0 || R.m_Par[b] < 0) return std::format("PoseRotate: no bone '{}' that can turn", Bone);
+            xanimation::pose Base; if (!PoseAt(Seconds, Base, Err)) return "PoseRotate: " + Err;
+            xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(Base);
+            constexpr float D = 3.14159265f / 180.0f;
+            const auto Turn = (xanimation::details::AxisAngle(xmath::fvec3(0, 0, 1), TurnDeg.m_Z * D) * xanimation::details::AxisAngle(xmath::fvec3(0, 1, 0), TurnDeg.m_Y * D) * xanimation::details::AxisAngle(xmath::fvec3(1, 0, 0), TurnDeg.m_X * D)).NormalizeCopy();
+            auto P = Base;
+            P.m_Rotation[b] = (FK.WorldRotation(R.m_Par[b]).ConjugateCopy() * Turn * FK.WorldRotation(b)).NormalizeCopy();
+            return "PoseRotate: " + PoseCommit(P, Seconds, std::format("Pose rotate {}", R.m_Names[b]));
         }
 
         // the Pose tool's bar over the viewport
@@ -3590,7 +3734,9 @@ namespace xanim_package_editor
             for (int b : R.Effectors())
             {
                 ImVec2 S(-1, -1); for (const auto& [h, P] : m_PT.m_Screen) if (h == b) S = P;
-                T += std::format("handle {} ({}): screen {:.0f} {:.0f}{}{}\n", R.Name(b), R.m_Names[b], S.x, S.y, Pins.count(b) ? " pinned" : "", m_PT.m_Pins.count(b) ? " (by the user)" : "");
+                ImVec2 Pc(-1, -1); for (const auto& [h, Box] : m_PT.m_PinBoxes) if (h == b) Pc = ImVec2((Box.first.x + Box.second.x) * 0.5f, (Box.first.y + Box.second.y) * 0.5f);
+                const auto& A = R.m_AttachM[b];
+                T += std::format("handle {} ({}): screen {:.0f} {:.0f}; pin icon {:.0f} {:.0f}; attach {:.3f} {:.3f} {:.3f} ({}){}{}\n", R.Name(b), R.m_Names[b], S.x, S.y, Pc.x, Pc.y, A.m_X, A.m_Y, A.m_Z, A.Length() > 0 ? (b == R.m_LF || b == R.m_RF ? "sole" : "palm") : "the joint", Pins.count(b) ? " pinned" : "", m_PT.m_Pins.count(b) ? " (by the user)" : m_PT.m_Unpinned.count(b) ? " (contact pin off)" : "");
             }
             T += "contacts: " + m_PT.m_ContactText + "\n";
             if (m_PT.m_FKBone >= 0) T += std::format("FK bone: {}; tip screen {:.0f} {:.0f}\n", R.m_Names[m_PT.m_FKBone], m_PT.m_TipScreen.x, m_PT.m_TipScreen.y);
@@ -4238,6 +4384,13 @@ namespace xanim_package_editor
             return S.BakeToPose(iL, E);
         }
         case kind::kimodo_take_check: return S.KimodoTakeCheck();
+        case kind::pose_rotate:
+        {
+            std::string Bn, Tn, Tm; xmath::fvec3 Td(0, 0, 0); double T = S.m_TimeSeconds;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Bn) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Tn) || std::sscanf(Tn.c_str(), "%f %f %f", &Td.m_X, &Td.m_Y, &Td.m_Z) != 3) return "PoseRotate: -Bone name -Turn \"x y z\"";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hC, Tm) && (std::from_chars(Tm.data(), Tm.data() + Tm.size(), T).ec != std::errc() || T < 0)) return "PoseRotate: -Time is seconds";
+            return S.PoseRotate(Bn, Td, T);
+        }
         case kind::kimodo_takes_to_layers:
         {
             std::string L; int iL = -1;
