@@ -3158,7 +3158,9 @@ namespace xanim_package_editor
                             DP[f] = (EP[f] - EP[a] * (1.0f - u) - EP[c] * u) * (b == iHips ? Env : 0.0f);
                         }
                     }
-                    for (int pass = 0; pass < 3; ++pass)
+                    // the hips much smoother (~0.13 s): Kimodo's hip path jitters more than the clip's momentum allows; the limbs keep its detail
+                    const int nPass = b == iHips ? 40 : 3;
+                    for (int pass = 0; pass < nPass; ++pass)
                     {
                         auto D2 = D, DP2 = DP;
                         for (int f = A + 1; f < B; ++f)
@@ -3177,6 +3179,67 @@ namespace xanim_package_editor
                     }
                 }
             }
+            // Balance (big edits): on quasi-static frames whose centre of mass falls outside the planted feet, the hips move horizontally to
+            // bring it over them (aiming 15 % past the nearest edge); the shift smoothed in time and zero at every anchor - the key (its lean
+            // is the user's intent), the user's keys, the clip's anchors and the edges. A few passes: the legs' IK takes part of the shift.
+            int nBalanced = 0; float MaxShift = 0;
+            if (iHips >= 0 && Parents[iHips] >= 0)
+            {
+                const auto Rig = xanimation::MakeHumanoidRealismRig(xanimation::skeleton_view{ Parents }, Views, Rest);
+                std::vector<std::uint8_t> IsAnchor(W, 0); for (int f : Anchors) IsAnchor[f] = 1;
+                // the centre of mass of a pose (model space) and how far it falls outside the planted feet at frame f (0 inside)
+                auto ComOf = [&](const std::vector<xmath::fvec3>& Pp) { xmath::fvec3 C(0, 0, 0); float M = 0; for (int b = 0; b < nB; ++b) if (Rig.m_Mass[b] > 0) { C = C + (Rig.m_MassTip[b] >= 0 ? (Pp[b] + Pp[Rig.m_MassTip[b]]) * 0.5f : Pp[b]) * Rig.m_Mass[b]; M += Rig.m_Mass[b]; } return M > 0 ? C * (1.0f / M) : C; };
+                auto Outside = [&](int f, const std::vector<xmath::fvec3>& Pp, const xmath::fvec3& C, std::array<float, 2>* pNr)
+                {
+                    std::vector<std::array<float, 2>> Pts;
+                    for (int s = 0; s < 2; ++s) if (InContact[s][f]) { Pts.push_back({ FootPos[s][f].m_X, FootPos[s][f].m_Z }); if (Rig.m_Toes[s] >= 0) Pts.push_back({ Pp[Rig.m_Toes[s]].m_X, Pp[Rig.m_Toes[s]].m_Z }); }
+                    return Pts.empty() ? 0.0f : xanimation::details::OutsideHull(Pts, { C.m_X, C.m_Z }, pNr);
+                };
+                // the clip's own imbalance at each frame (a walk leans out of its support by itself: only what the edit adds is corrected)
+                std::vector<float> ClipOut(W, 0.0f);
+                if (Own.size() == Accepted.size())
+                    for (int f = A; f <= B; ++f) { const auto Po = SamplePose(Own, FPS, nF, nB, Key + double(f - K) / 30.0); std::vector<xmath::fvec3> Pp; World(Po.data(), Pp); ClipOut[f] = Outside(f, Pp, ComOf(Pp), nullptr); }
+                if (int(Rig.m_Mass.size()) == nB)
+                    for (int it = 0; it < 3; ++it)
+                    {
+                        std::vector<std::vector<xmath::fvec3>> Pw(W); std::vector<std::vector<xmath::fquat>> Rw(W); std::vector<xmath::fvec3> Com(W, xmath::fvec3(0, 0, 0));
+                        for (int f = 0; f < W; ++f) { World(&Ref[std::size_t(f) * nB], Pw[f], &Rw[f]); Com[f] = ComOf(Pw[f]); }
+                        std::vector<xmath::fvec3> S(W, xmath::fvec3(0, 0, 0));
+                        int nOut = 0;
+                        for (int f = std::max(A, 1); f <= std::min(B, W - 2); ++f)
+                        {
+                            if (IsAnchor[f]) continue;
+                            const auto Ac = (Com[f + 1] - Com[f] * 2.0f + Com[f - 1]) * (900.0f / HipH);
+                            if (std::hypot(Ac.m_X, Ac.m_Z) > 0.5f) continue;                       // not quasi-static (the realism measure's rule)
+                            std::array<float, 2> Nr{};
+                            const float Out = Outside(f, Pw[f], Com[f], &Nr), Excess = Out - ClipOut[f] - 0.02f * HipH;
+                            if (Excess <= 0) continue;                                           // no worse than the clip there
+                            const auto Dir = xmath::fvec3(Nr[0] - Com[f].m_X, 0, Nr[1] - Com[f].m_Z) * (1.0f / std::max(1e-6f, Out));
+                            S[f] = Dir * (Excess * 1.15f);
+                            ++nOut;
+                        }
+                        if (!nOut) break;
+                        nBalanced = std::max(nBalanced, nOut);
+                        for (int pass = 0; pass < 40; ++pass)               // smooth (~0.13 s, like the hips' path), the anchors held at zero
+                        {
+                            auto S2 = S;
+                            for (int f = A + 1; f < B; ++f) if (!IsAnchor[f]) S2[f] = (S[f - 1] + S[f] * 2.0f + S[f + 1]) * 0.25f;
+                            S = S2;
+                        }
+                        for (int f = A + 1; f < B; ++f)
+                        {
+                            if (IsAnchor[f] || S[f].LengthSq() < 1e-12f) continue;
+                            MaxShift = std::max(MaxShift, S[f].Length());
+                            // world -> the hips' local units: its parent's rotation, and the scale between its local offset and its world offset
+                            auto& H = Ref[std::size_t(f) * nB + iHips];
+                            const int p = Parents[iHips];
+                            const float Lw = (Pw[f][iHips] - Pw[f][p]).Length(), Ll = H.m_Position.Length();
+                            const float Sc = (Lw > 1e-6f && Ll > 1e-6f) ? Lw / Ll : 1.0f;
+                            H.m_Position = H.m_Position + Rw[f][p].ConjugateCopy() * (S[f] * (1.0f / Sc));
+                        }
+                    }
+            }
+
             float PinMax = 0; int nKeys = 0, nFrames = 0;
             for (int f = A; f <= B; f += Step)
             {
@@ -3220,8 +3283,8 @@ namespace xanim_package_editor
             }
             const float SkateAfter = 0.5f * (Skate(AfterFeet[0], nullptr) + Skate(AfterFeet[1], nullptr));
             Report = std::format("refine scope -{:.2f} .. +{:.2f} s ({} frames as {} Kimodo window(s) of up to {} frames{}, 25 steps, {} anchors): {} frames keyed ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm); "
-                                 "skate in contact {:.4f} -> {:.4f} hip heights/s; the key kept within {:.4f} deg; time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms"
-                , double(K - A) / 30.0, double(B - K) / 30.0, W, Chunks.size(), MaxW, Chunks.size() > 1 ? ", stitched" : "", Anchors.size(), nFrames, nKeys, nFootFrames, PinMax * 100.0f, SkateBefore, SkateAfter, KeyMiss, ms(t0, t1), ms(t1, t2), ms(t2, t3));
+                                 "skate in contact {:.4f} -> {:.4f} hip heights/s; the key kept within {:.4f} deg; balance: the hips shifted on {} still frames (max {:.1f} cm); time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms"
+                , double(K - A) / 30.0, double(B - K) / 30.0, W, Chunks.size(), MaxW, Chunks.size() > 1 ? ", stitched" : "", Anchors.size(), nFrames, nKeys, nFootFrames, PinMax * 100.0f, SkateBefore, SkateAfter, KeyMiss, nBalanced, MaxShift * 100.0f, ms(t0, t1), ms(t1, t2), ms(t2, t3));
             return true;
         }
 
