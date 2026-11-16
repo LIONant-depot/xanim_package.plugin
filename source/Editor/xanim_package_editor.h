@@ -54,7 +54,8 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent };
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest };
 
         session&    m_Session;
         kind        m_Kind;
@@ -124,6 +125,31 @@ namespace xanim_package_editor
                 m_hA = m_Parser.addOption("Layer",  "The layer's index in the selected clip", true, 1);
                 m_hB = m_Parser.addOption("Parent", "The folder's or group's index; -1 = the top level", true, 1);
                 break;
+            case kind::pose_tool:
+                m_hA = m_Parser.addOption("On",   "1: the Pose tool on (handles in the viewport), 0: off", false, 1);
+                m_hB = m_Parser.addOption("Bone", "Select a bone for FK (its tip handle turns it)", false, 1);
+                break;
+            case kind::pose_drag:
+                m_hA = m_Parser.addOption("Effector", "LeftHand, RightHand, LeftFoot, RightFoot, Head, Hips or a bone name", true, 1);
+                m_hB = m_Parser.addOption("Move",     "\"dx dy dz\" centimetres in the model frame", true, 1);
+                m_hC = m_Parser.addOption("Pins",     "auto (default: the feet in contact at that time + the pins set), none, or handle names", false, 1);
+                m_hD = m_Parser.addOption("Only",     "1: FK - only this bone turns (its tip goes toward the move)", false, 1);
+                m_hE = m_Parser.addOption("Time",     "Seconds (default: the playhead)", false, 1);
+                m_hF = m_Parser.addOption("Commit",   "0: preview only (nothing written); default 1: keys on the top Pose layer, one undo step", false, 1);
+                break;
+            case kind::pose_pin:
+                m_hA = m_Parser.addOption("Handle", "A handle to pin or unpin (toggle)", false, 1);
+                m_hB = m_Parser.addOption("Preset", "Feet, Hands, Both, None, or Auto (feet in contact pinned automatically on/off: \"Auto 1|0\")", false, 1);
+                break;
+            case kind::pose_mirror: case kind::pose_copy: case kind::pose_paste:
+                m_hA = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
+                break;
+            case kind::pose_suggest:
+                m_hA = m_Parser.addOption("Seeds",  "\"1 2 3\": one candidate each (default)", false, 1);
+                m_hB = m_Parser.addOption("Prompt", "What the pose is, in words", false, 1);
+                m_hC = m_Parser.addOption("Accept", "A candidate's index: written as keys (one undo step, with Refine Motion)", false, 1);
+                m_hD = m_Parser.addOption("Show",   "A candidate's index to preview (Tab in the viewport), or -1: none (Esc)", false, 1);
+                break;
             default: break;
             }
         }
@@ -164,6 +190,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
+        playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
 
         // Layers (the layered edit mode): the compiler's layer-sources cache, the selected clip's live composition (same function as the compile)
         std::vector<xanim_package_layers::source_frames> m_LayerSources;
@@ -291,6 +318,13 @@ namespace xanim_package_editor
             , m_SuggestPoseAccept(m_Undo, *this, playback_cmd::kind::suggest_pose_accept, "SuggestPoseAccept", "Writes a Suggest Pose candidate as keys on a Pose layer (the bones it changes). Usage: SuggestPoseAccept -Layer n [-Candidate i]")
             , m_LayerTimeline    (m_Undo, *this, playback_cmd::kind::layer_timeline,      "LayerTimeline",     "The layer timeline: its rows (top layer first, the clip at the bottom), their items, the revision, the playhead, solo, the selection and the layout. Usage: LayerTimeline [-Time s] [-Solo \"row 0|1\"] [-Fold row] [-Unfold row] [-Frame \"a b\"]")
             , m_LayerTimelineEdit(m_Undo, *this, playback_cmd::kind::layer_timeline_edit, "LayerTimelineEdit", "Edits the selected clip's layers as the timeline does (ONE undo step): a plan's text or row ops. Usage: LayerTimelineEdit -Ops \"rev N; seg ...; key ...\" | \"mute r 1; lock r 0; move r above; delete r i\"")
+            , m_PoseTool   (m_Undo, *this, playback_cmd::kind::pose_tool,   "PoseTool",   "The Pose tool (posing handles in the viewport): on/off, a bone selected for FK; reports the handles (screen positions), pins, the last drag and Suggest candidates. Usage: PoseTool [-On 1|0] [-Bone name]")
+            , m_PoseDrag   (m_Undo, *this, playback_cmd::kind::pose_drag,   "PoseDrag",   "Drags a posing handle: full-body IK (feet in contact pinned, the pins held, the skeleton's limits) from the pose at that time; the result is keys on the top Pose layer (made when missing), one undo step. Usage: PoseDrag -Effector LeftHand -Move \"dx dy dz\" [-Pins auto|none|names] [-Only 1] [-Time s] [-Commit 0]")
+            , m_PosePin    (m_Undo, *this, playback_cmd::kind::pose_pin,    "PosePin",    "Pins or unpins a posing handle, or a preset. Usage: PosePin -Handle LeftHand | -Preset Feet|Hands|Both|None|\"Auto 1|0\"")
+            , m_PoseMirror (m_Undo, *this, playback_cmd::kind::pose_mirror, "PoseMirror", "The pose at a time mirrored left/right, as keys (one undo step). Usage: PoseMirror [-Time s]")
+            , m_PoseCopy   (m_Undo, *this, playback_cmd::kind::pose_copy,   "PoseCopy",   "Copies the pose at a time (editor clipboard). Usage: PoseCopy [-Time s]")
+            , m_PosePaste  (m_Undo, *this, playback_cmd::kind::pose_paste,  "PosePaste",  "Pastes the copied pose at a time, as keys (one undo step). Usage: PosePaste [-Time s]")
+            , m_PoseSuggest(m_Undo, *this, playback_cmd::kind::pose_suggest,"PoseSuggest","Suggest Pose for the current handles (the pins and the last dragged handle held) at the playhead: candidates; -Show previews one; -Accept writes it (one step, Refine Motion). Usage: PoseSuggest [-Seeds \"1 2 3\"] [-Prompt text] | -Show i | -Accept i")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
@@ -2511,6 +2545,556 @@ namespace xanim_package_editor
                 , nKeys, iLayer, nSteps, HipsNote, Max, MaxBone, HipsMiss * 100.0f, AccB, AccA, AccD, AccDAt, fk) + Moved + RefineNote;
         }
 
+        //----------------------------------------------------------------------------------------
+        // Posing (posing v2 P1/P2): handles in the viewport at hands, feet, head and hips; a drag is full-body IK from the pose at the
+        // playhead (feet in contact pinned, the pins held, the skeleton's limits when it has them), released = keys on the top Pose layer
+        // (made when missing), ONE undo step (SuggestPoseAccept's key writer, no refine: the user's pose exactly; the layer's smooth curve and
+        // falloff blend it in). A bone's tip handle turns that bone alone (FK). S = Suggest Pose for the same handles; Tab / Enter / Esc.
+        //----------------------------------------------------------------------------------------
+        struct pose_rig
+        {
+            std::vector<std::int32_t>               m_Par;
+            std::vector<std::string>                m_Names;
+            xanimation::pose                        m_Rest;
+            int                                     m_LH = -1, m_RH = -1, m_LF = -1, m_RF = -1, m_Head = -1, m_Hips = -1;
+            std::vector<std::uint8_t>               m_Owned;        // the bones a drag may turn: all but the roots
+            std::vector<xanimation::joint_limit>    m_Lim;          // the skeleton's compiled limits (JointLimits On), else empty: free
+            std::vector<xanimation::two_bone_chain> m_Limbs;
+            int count() const noexcept { return int(m_Par.size()); }
+            int Find(std::string_view N) const noexcept
+            {
+                if (N == "LeftHand") return m_LH; if (N == "RightHand") return m_RH; if (N == "LeftFoot") return m_LF; if (N == "RightFoot") return m_RF;
+                if (N == "Head") return m_Head; if (N == "Hips") return m_Hips;
+                for (int b = 0; b < count(); ++b) if (m_Names[b] == N) return b;
+                return -1;
+            }
+            const char* Alias(int b) const noexcept
+            {
+                return b == m_LH ? "LeftHand" : b == m_RH ? "RightHand" : b == m_LF ? "LeftFoot" : b == m_RF ? "RightFoot" : b == m_Head ? "Head" : b == m_Hips ? "Hips" : nullptr;
+            }
+            std::string Name(int b) const { const char* a = Alias(b); return a ? a : (b >= 0 && b < count() ? m_Names[b] : std::string("?")); }
+            std::vector<int> Effectors() const { std::vector<int> E; for (int b : { m_LH, m_RH, m_LF, m_RF, m_Head, m_Hips }) if (b >= 0) E.push_back(b); return E; }
+        };
+        struct pose_tool
+        {
+            bool                                m_bOn = false;
+            pose_rig                            m_Rig; std::size_t m_RigKey = 0;
+            std::set<int>                       m_Pins;                 // handles pinned by the user
+            bool                                m_bAutoPins = true;     // the feet in contact at the playhead pinned too
+            int                                 m_Drag = -1;            // the handle being dragged
+            bool                                m_bFK = false;          // the drag turns that one bone (its tip handle)
+            int                                 m_FKBone = -1;          // the bone selected for FK
+            xanimation::pose                    m_Base;                 // the pose at the playhead when the drag began
+            std::set<int>                       m_DragPins;
+            double                              m_Time = 0;
+            xmath::fvec3                        m_Offset{ 0, 0, 0 };    // drawn - model (root motion shown)
+            xmath::fvec3                        m_Plane{ 0, 0, 0 }, m_Normal{ 0, 0, 1 }, m_Start{ 0, 0, 0 }, m_Target{ 0, 0, 0 };    // drawn space
+            xanimation::pose                    m_Preview; bool m_bPreview = false;
+            std::string                         m_Note;                 // the last drag: reached / missed by x cm: why
+            int                                 m_LastEff = -1;
+            std::vector<xmath::transform3>      m_Copy;
+            int                                 m_Cand = -1;            // the Suggest candidate previewed
+            char                                m_Prompt[128] = "";
+            int                                 m_Hover = -1; bool m_bHoverTip = false;
+            std::vector<std::pair<int, ImVec2>> m_Screen;               // the handles as drawn last frame (bone, screen)
+            ImVec2                              m_TipScreen{ -1, -1 };
+            std::string                         m_ContactText;          // the contacts found (feet), for the info
+        } m_PT;
+
+        bool PoseRig(std::string& Err) noexcept
+        {
+            auto* pDesc = Desc();
+            if (!pDesc) { Err = "nothing loaded"; return false; }
+            const auto& Man = pDesc->m_ResolvedSkeletonBones.m_Bones;
+            const int nB = int(Man.size());
+            if (nB == 0) { Err = "the skeleton's bones are not known yet (compile the package)"; return false; }
+            auto* pSk = m_SkeletonRef.empty() ? nullptr : xresource::g_Mgr.getResource(m_SkeletonRef);
+            const std::size_t Key = std::size_t(nB) * 1000003u + std::size_t(pSk ? pSk->m_nJoints : 0) + std::hash<std::string>{}(Man[0].m_Name);
+            if (m_PT.m_RigKey == Key && m_PT.m_Rig.count() == nB) return true;
+            pose_rig R;
+            R.m_Par.resize(nB); R.m_Names.resize(nB); R.m_Rest.resize(nB);
+            for (int b = 0; b < nB; ++b)
+            {
+                R.m_Par[b] = Man[b].m_iParent; R.m_Names[b] = Man[b].m_Name;
+                R.m_Rest.m_Position[b] = Man[b].m_RestPosition; R.m_Rest.m_Scale[b] = Man[b].m_RestScale;
+                R.m_Rest.m_Rotation[b] = xmath::fquat(Man[b].m_RestRotX, Man[b].m_RestRotY, Man[b].m_RestRotZ, Man[b].m_RestRotW).NormalizeSafeCopy();
+            }
+            std::vector<std::string_view> Views(R.m_Names.begin(), R.m_Names.end());
+            const auto Slots = xanimation::details::BuildSlots(xanimation::skeleton_view{ R.m_Par }, Views, R.m_Rest);
+            auto Slot = [&](xanimation::bone_slot S, xanimation::bone_side D) { const auto It = Slots.m_Bones.find({ S, D }); return It == Slots.m_Bones.end() ? -1 : It->second[0]; };
+            using xanimation::bone_slot; using xanimation::bone_side;
+            R.m_LH = Slot(bone_slot::HAND, bone_side::LEFT); R.m_RH = Slot(bone_slot::HAND, bone_side::RIGHT);
+            R.m_LF = Slot(bone_slot::FOOT, bone_side::LEFT); R.m_RF = Slot(bone_slot::FOOT, bone_side::RIGHT);
+            R.m_Head = Slot(bone_slot::HEAD, bone_side::NONE); R.m_Hips = Slot(bone_slot::HIPS, bone_side::NONE);
+            R.m_Owned.assign(nB, 0);
+            for (int b = 0; b < nB; ++b) R.m_Owned[b] = R.m_Par[b] >= 0;
+            if (pSk && pSk->m_nJoints == nB && pSk->m_nBones == nB)
+            {
+                R.m_Lim.resize(nB);
+                for (int b = 0; b < nB; ++b) R.m_Lim[b] = xskeleton_joints::FromRuntime(pSk->m_pJoints[b], pSk->m_pBoneRests[b].m_RestPose.m_Rotation.NormalizeSafeCopy());
+            }
+            for (int E : { R.m_LH, R.m_RH, R.m_LF, R.m_RF }) if (E >= 0) if (const int p = R.m_Par[E]; p >= 0 && R.m_Par[p] >= 0) R.m_Limbs.push_back({ R.m_Par[p], p, E });
+            m_PT.m_Rig = std::move(R); m_PT.m_RigKey = Key;
+            return true;
+        }
+
+        bool PoseAt(double Seconds, xanimation::pose& P, std::string& Err) noexcept
+        {
+            const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0;
+            if (!SuggestClipFrames(pF, FPS, nF, Err)) return false;
+            const int nB = m_PT.m_Rig.count();
+            if (nB == 0 || int(pF->size()) != nF * nB) { Err = "the clip and the skeleton disagree on the bones (compile the package)"; return false; }
+            const auto S = SamplePose(*pF, FPS, nF, nB, Seconds);
+            P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, S[b]);
+            return true;
+        }
+
+        // the feet in contact at a time (the clip as composed: low and slow, FindContacts in hip heights)
+        std::set<int> PoseContactsAt(double Seconds) noexcept
+        {
+            std::set<int> Out;
+            const auto& R = m_PT.m_Rig;
+            const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0; std::string Err;
+            if (R.m_LF < 0 || R.m_RF < 0 || R.m_Hips < 0 || !SuggestClipFrames(pF, FPS, nF, Err) || int(pF->size()) != nF * R.count()) return Out;
+            const int nB = R.count();
+            std::vector<xmath::fvec3> Feet[2]; float HipH = 0;
+            xanimation::pose P; P.resize(nB); std::vector<xmath::fquat> Rw; std::vector<xmath::fvec3> Pw;
+            for (int f = 0; f < nF; ++f)
+            {
+                for (int b = 0; b < nB; ++b) P.set(b, (*pF)[std::size_t(f) * nB + b]);
+                xanimation::details::WorldRP(xanimation::skeleton_view{ R.m_Par }, P, Rw, Pw);
+                Feet[0].push_back(Pw[R.m_LF]); Feet[1].push_back(Pw[R.m_RF]);
+                if (f == 0) HipH = std::max(1e-3f, Pw[R.m_Hips].m_Y - std::min(Pw[R.m_LF].m_Y, Pw[R.m_RF].m_Y));
+            }
+            const int fk = std::clamp(int(std::lround(Seconds * FPS)), 0, std::max(0, nF - 1));
+            m_PT.m_ContactText.clear();
+            for (int s = 0; s < 2; ++s)
+            {
+                for (auto& v : Feet[s]) v = v * (1.0f / HipH);
+                for (const auto& C : xanimation::FindContacts(Feet[s], float(FPS)))
+                {
+                    m_PT.m_ContactText += std::format("{}{}:{}..{}", m_PT.m_ContactText.empty() ? "" : " ", s == 0 ? "L" : "R", C.m_First, C.m_Last);
+                    // a foot just lifting or about to land is still the support: contacts widened by 0.1 s (the detector's low-and-slow
+                    // thresholds miss the weight transfer between two contacts)
+                    const int Wd = std::max(1, int(std::lround(0.1 * FPS)));
+                    if (fk >= C.m_First - Wd && fk <= C.m_Last + Wd) Out.insert(s == 0 ? R.m_LF : R.m_RF);
+                }
+            }
+            m_PT.m_ContactText += std::format(" (frame {} of {}, hip height {:.3f})", fk, nF, HipH);
+            return Out;
+        }
+
+        std::set<int> PoseEffectivePins(double Seconds) noexcept
+        {
+            auto P = m_PT.m_Pins;
+            if (m_PT.m_bAutoPins) for (int b : PoseContactsAt(Seconds)) P.insert(b);
+            return P;
+        }
+
+        static std::string PoseReason(std::uint8_t r) noexcept
+        {
+            using namespace xanimation;
+            if (r & ik_reason::CONFLICT) return "pins in conflict";
+            if (r & ik_reason::LIMIT)    return "a joint limit";
+            if (r & ik_reason::REACH)    return "beyond reach";
+            if (r & ik_reason::LOCKED)   return "a bone that may not move";
+            if (r & ik_reason::BUDGET)   return "the solver ran out of iterations";
+            return "missed";
+        }
+
+        // One solve from a baseline: the handle at TargetModel (model frame), the pins held where the baseline has them. Pure: same inputs,
+        // same pose (a drag solves from its start pose each frame, so the mouse's event rate does not matter).
+        bool PoseSolve(const xanimation::pose& Base, int Eff, const xmath::fvec3& TargetModel, bool bFK, const std::set<int>& Pins, xanimation::pose& Out, std::string& Note, float* pPinErrCm = nullptr) noexcept
+        {
+            const auto& R = m_PT.m_Rig;
+            const int nB = R.count();
+            xanimation::body_ik S; S.Setup(R.m_Par, R.m_Lim, {}, R.m_Limbs);
+            S.ComputeWorld(Base);
+            std::vector<xanimation::ik_task> Tasks;
+            std::vector<std::uint8_t> W = R.m_Owned;
+            xanimation::body_ik_settings Set;
+            if (bFK)
+            {   // the bone alone turns; its tip (first child) goes toward the target
+                int Tip = -1; for (int c = Eff + 1; c < nB; ++c) if (R.m_Par[c] == Eff) { Tip = c; break; }
+                if (Tip < 0) { Note = "this bone has no tip to drag"; Out = Base; return false; }
+                W.assign(nB, 0); W[Eff] = 1;
+                xanimation::ik_task T; T.m_Bone = Tip; T.m_bPosition = true; T.m_Position = TargetModel; Tasks.push_back(T);
+            }
+            else
+            {
+                xanimation::ik_task T; T.m_Bone = Eff; T.m_bPosition = true; T.m_Position = TargetModel; Tasks.push_back(T);
+                Set.m_TranslateBone = R.m_Hips;
+                for (int b : Pins)
+                {
+                    if (b == Eff || b < 0 || b >= nB) continue;
+                    xanimation::ik_task Pn; Pn.m_Bone = b; Pn.m_bPosition = true; Pn.m_Position = S.WorldPosition(b);
+                    Pn.m_bOrientation = true; Pn.m_Orientation = S.WorldRotation(b); Pn.m_bHard = true; Tasks.push_back(Pn);
+                }
+            }
+            std::vector<xanimation::ik_task_report> Rep(Tasks.size());
+            S.Solve(Base, W, Tasks, Rep, Out, Set);
+            // why: the root never moves (only the hips do), so "locked" alone means the body was held by the pins or simply ran out of reach
+            std::uint8_t Why = Rep[0].m_Reasons;
+            if (!bFK && (Why & ~xanimation::ik_reason::BUDGET) == xanimation::ik_reason::LOCKED) Why = 0;
+            const std::string Reason = Why ? PoseReason(Why) : (!bFK && Tasks.size() > 1 ? "the pinned handles hold the body (unpin one to reach further)" : "beyond reach");
+            Note = Rep[0].m_Status == xanimation::ik_status::REACHED ? "reached" : std::format("missed by {:.1f} cm: {}", Rep[0].m_PosMiss * 100.0f, Reason);
+            if (pPinErrCm) { *pPinErrCm = 0; for (std::size_t t = 1; t < Rep.size(); ++t) *pPinErrCm = std::max(*pPinErrCm, Rep[t].m_PosMiss * 100.0f); }
+            return true;
+        }
+
+        // the top layer of the selected clip as a Pose layer (one is added when it is not): where posing writes
+        int PoseLayer(std::string& Err) noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) { Err = "select a clip first"; return -1; }
+            const int n = int(pOv->m_Layers.size());
+            if (n > 0 && pOv->m_Layers[n - 1].m_Kind == xanim_package_desc::layer_kind::POSE && !pOv->m_Layers[n - 1].m_bLock) return n - 1;
+            const auto R = LayerAdd({}, {}, "Pose", true);
+            if (!R.starts_with("LayerAdd: pose layer")) { Err = R; return -1; }
+            return int(SelectedOv()->m_Layers.size()) - 1;
+        }
+
+        // A pose (every bone's local) at a time as keys on the top Pose layer: the bones it changes, the hips' shift too. ONE undo step.
+        std::string PoseCommit(const xanimation::pose& P, double Seconds, const std::string& Label) noexcept
+        {
+            const auto& R = m_PT.m_Rig;
+            const int nB = R.count();
+            if (P.count() != nB) return "the pose does not fit the skeleton";
+            std::string Out;
+            const auto E = AsOneStep(Label, [&]() -> std::string
+            {
+                std::string Err;
+                const int iL = PoseLayer(Err);
+                if (iL < 0) return Err;
+                xanimation::pose Base; if (!PoseAt(Seconds, Base, Err)) return Err;
+                m_Suggest = {};
+                m_Suggest.m_Owned = R.m_Owned; m_Suggest.m_Time = Seconds; m_Suggest.m_Sig = SuggestSignature(); m_Suggest.m_iHips = R.m_Hips;
+                m_Suggest.m_Original.resize(nB); for (int b = 0; b < nB; ++b) m_Suggest.m_Original[b] = Base.get(b);
+                suggest_candidate C; C.m_Pose.resize(nB); for (int b = 0; b < nB; ++b) C.m_Pose[b] = P.get(b);
+                m_Suggest.m_Candidates.push_back(std::move(C));
+                Out = SuggestPoseAccept(iL, 0, false);
+                m_Suggest = {};
+                return Out.find(" keys on layer ") != std::string::npos ? std::string{} : Out;
+            });
+            if (!E.empty()) return E;
+            return Out;
+        }
+
+        std::string PoseDrag(const std::string& Effector, const xmath::fvec3& MoveCm, const std::string& PinArg, bool bFK, double Seconds, bool bCommit) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "PoseDrag: " + Err;
+            const auto& R = m_PT.m_Rig;
+            const int Eff = R.Find(Effector);
+            if (Eff < 0) return std::format("PoseDrag: no handle or bone '{}'", Effector);
+            xanimation::pose Base;
+            if (!PoseAt(Seconds, Base, Err)) return "PoseDrag: " + Err;
+            std::set<int> Pins;
+            if (PinArg.empty() || PinArg == "auto") Pins = PoseEffectivePins(Seconds);
+            else if (PinArg != "none") { std::istringstream In(PinArg); std::string N; while (In >> N) { const int b = R.Find(N); if (b < 0) return std::format("PoseDrag: no handle '{}' to pin", N); Pins.insert(b); } }
+            xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(Base);
+            int Moved = Eff;
+            if (bFK) for (int c = Eff + 1; c < R.count(); ++c) if (R.m_Par[c] == Eff) { Moved = c; break; }
+            const auto Target = FK.WorldPosition(Moved) + MoveCm * 0.01f;
+            xanimation::pose Out; std::string Note; float PinErr = 0;
+            if (!PoseSolve(Base, Eff, Target, bFK, Pins, Out, Note, &PinErr)) return "PoseDrag: " + Note;
+            m_PT.m_Note = Note; m_PT.m_LastEff = Eff;
+            std::string PinText; for (int b : Pins) if (b != Eff) PinText += (PinText.empty() ? "" : " ") + R.Name(b);
+            const auto Head = std::format("PoseDrag: {} {} at {:.3f} s: {}; pins [{}] held within {:.3f} cm", bFK ? "FK" : "IK", R.Name(Eff), Seconds, Note, PinText, PinErr);
+            if (!bCommit) { m_PT.m_Preview = Out; m_PT.m_bPreview = true; return Head + " (preview only)"; }
+            m_PT.m_bPreview = false;
+            const auto C = PoseCommit(Out, Seconds, std::format("Pose {} {}", bFK ? "turn" : "drag", R.Name(Eff)));
+            return Head + "\n" + C;
+        }
+
+        // The pose at a time mirrored across the character's middle plane: each bone takes its mirror bone's turn from rest, reflected
+        std::string PoseMirror(double Seconds) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "PoseMirror: " + Err;
+            const auto& R = m_PT.m_Rig;
+            const int nB = R.count();
+            xanimation::pose P; if (!PoseAt(Seconds, P, Err)) return "PoseMirror: " + Err;
+            std::vector<std::string_view> Views(R.m_Names.begin(), R.m_Names.end());
+            const xanimation::skeleton_view SV{ R.m_Par };
+            const float Fd = xanimation::MeasureFacingDeg(SV, Views, R.m_Rest) * 3.14159265f / 180.0f;
+            const xmath::fvec3 N(std::cos(Fd), 0, -std::sin(Fd));          // the lateral axis: the plane's normal
+            auto F = [&](const xmath::fvec3& v) { return v - N * (2.0f * v.Dot(N)); };
+            auto FQ = [&](const xmath::fquat& q) { const auto v = F(xmath::fvec3(q.m_X, q.m_Y, q.m_Z)); return xmath::fquat(-v.m_X, -v.m_Y, -v.m_Z, q.m_W); };
+            std::vector<xmath::fquat> Wr, WrRest; std::vector<xmath::fvec3> Wp, WpRest, Sc, ScRest;
+            xanimation::details::WorldRPS(SV, P, Wr, Wp, Sc);
+            xanimation::details::WorldRPS(SV, R.m_Rest, WrRest, WpRest, ScRest);
+            std::vector<xmath::fquat> Mw(nB); std::vector<xmath::fvec3> Mp(nB);
+            const xmath::fvec3 Mid = R.m_Hips >= 0 ? WpRest[R.m_Hips] : xmath::fvec3(0, 0, 0);
+            for (int b = 0; b < nB; ++b)
+            {
+                int m = xanimation::FindMirrorBone(Views, b); if (m < 0) m = b;
+                const auto D = (Wr[m] * WrRest[m].ConjugateCopy()).NormalizeCopy();         // the mirror bone's world turn from rest
+                Mw[b] = (FQ(D) * WrRest[b]).NormalizeCopy();
+                Mp[b] = F(Wp[m] - Mid) + Mid;
+            }
+            xanimation::pose O = P;
+            for (int b = 0; b < nB; ++b)
+            {
+                const int p = R.m_Par[b];
+                if (p < 0) continue;
+                O.m_Rotation[b] = (Mw[p].ConjugateCopy() * Mw[b]).NormalizeCopy();
+                if (b == R.m_Hips) { const auto L = Mw[p].ConjugateCopy() * (Mp[b] - Mp[p]); O.m_Position[b] = xmath::fvec3(L.m_X / Sc[p].m_X, L.m_Y / Sc[p].m_Y, L.m_Z / Sc[p].m_Z); }
+            }
+            return "PoseMirror: " + PoseCommit(O, Seconds, "Pose mirror");
+        }
+
+        // Suggest Pose for the current handles: the pins and the last dragged handle held where they are now
+        std::string PoseSuggest(const std::string& Seeds, const std::string& Prompt) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "PoseSuggest: " + Err;
+            const auto& R = m_PT.m_Rig;
+            const double t = m_TimeSeconds;
+            auto Pins = PoseEffectivePins(t);
+            if (m_PT.m_LastEff >= 0) Pins.insert(m_PT.m_LastEff);
+            std::string Names; for (int b : Pins) Names += (Names.empty() ? "" : " ") + R.m_Names[b];
+            const auto Text = SuggestPose(t, "", Names.empty() ? "none" : Names, Seeds.empty() ? "1 2 3" : Seeds, Prompt);
+            m_PT.m_Cand = m_Suggest.m_Candidates.empty() ? -1 : 0;
+            return "PoseSuggest: " + Text;
+        }
+        std::string PoseSuggestAccept(int i) noexcept
+        {
+            if (i < 0 || i >= int(m_Suggest.m_Candidates.size())) return "PoseSuggest: no such candidate (PoseSuggest first)";
+            std::string Out;
+            const auto E = AsOneStep("Suggest Pose", [&]() -> std::string
+            {
+                std::string Err;
+                const bool bFresh = m_Suggest.m_Sig == SuggestSignature();
+                const int iL = PoseLayer(Err);
+                if (iL < 0) return Err;
+                if (bFresh) m_Suggest.m_Sig = SuggestSignature();     // an empty Pose layer just added changes nothing in the pose
+                Out = SuggestPoseAccept(iL, i, true);
+                return Out.find(" keys on layer ") != std::string::npos ? std::string{} : Out;
+            });
+            m_PT.m_Cand = -1;
+            return E.empty() ? "PoseSuggest: " + Out : "PoseSuggest: " + E;
+        }
+
+        // the bones as drawn, from a local pose (the editor's own FK: scales included) shifted by the drawn offset
+        void PoseToBones(const xanimation::pose& P, const xmath::fvec3& Off) noexcept
+        {
+            const int nB = P.count();
+            if (int(m_PoseBones.size()) != nB) return;
+            std::vector<xmath::fmat4> W(nB);
+            for (int i = 0; i < nB; ++i)
+            {
+                const auto L = P.get(i).toMatrix();
+                W[i] = m_PT.m_Rig.m_Par[i] < 0 ? L : W[m_PT.m_Rig.m_Par[i]] * L;
+                m_PoseBones[i].m_Position = W[i].ExtractPosition() + Off;
+                m_PoseBones[i].m_Right = W[i].Right(); m_PoseBones[i].m_Up = W[i].Up();
+            }
+        }
+
+        // before the viewport renders: the drag (target from the mouse on the plane through the handle) and the previewed pose
+        void PoseBeforeRender() noexcept
+        {
+            m_Viewport.m_bGizmoHot = m_Viewport.m_bGizmoDrag = false;
+            std::string Err;
+            if (!m_PT.m_bOn || !PoseRig(Err) || int(m_PoseBones.size()) != m_PT.m_Rig.count()) return;
+            const ImVec2 Mouse = ImGui::GetIO().MousePos;
+            // hover: the nearest handle drawn last frame within 10 px
+            m_PT.m_Hover = -1; m_PT.m_bHoverTip = false;
+            float Best = 10.0f * 10.0f;
+            for (const auto& [b, S] : m_PT.m_Screen) { const float d = (S.x - Mouse.x) * (S.x - Mouse.x) + (S.y - Mouse.y) * (S.y - Mouse.y); if (d < Best) { Best = d; m_PT.m_Hover = b; } }
+            if (m_PT.m_TipScreen.x >= 0) { const float d = (m_PT.m_TipScreen.x - Mouse.x) * (m_PT.m_TipScreen.x - Mouse.x) + (m_PT.m_TipScreen.y - Mouse.y) * (m_PT.m_TipScreen.y - Mouse.y); if (d < Best) { m_PT.m_Hover = m_PT.m_FKBone; m_PT.m_bHoverTip = true; } }
+            if (m_PT.m_Drag >= 0)
+            {
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { m_PT.m_Drag = -1; m_PT.m_bPreview = false; m_PT.m_Note = "cancelled"; }
+                else
+                {
+                    const auto Eye = m_Viewport.m_Scene.m_View.getPosition();
+                    const auto Ray = m_Viewport.m_Scene.m_View.RayFromScreen(Mouse.x, Mouse.y);
+                    const float Den = Ray.Dot(m_PT.m_Normal);
+                    if (std::abs(Den) > 1e-6f) m_PT.m_Target = Eye + Ray * ((m_PT.m_Plane - Eye).Dot(m_PT.m_Normal) / Den);
+                    std::string Note;
+                    PoseSolve(m_PT.m_Base, m_PT.m_Drag, m_PT.m_Target - m_PT.m_Offset, m_PT.m_bFK, m_PT.m_DragPins, m_PT.m_Preview, Note);
+                    m_PT.m_Note = Note; m_PT.m_bPreview = true;
+                    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                    {   // released: the keys, one undo step
+                        const int Eff = m_PT.m_Drag; m_PT.m_Drag = -1;
+                        const auto P = m_PT.m_Preview; m_PT.m_bPreview = false;
+                        if ((m_PT.m_Target - m_PT.m_Start).Length() > 1e-5f)
+                        {
+                            m_PT.m_LastEff = Eff;
+                            const auto R = PoseCommit(P, m_PT.m_Time, std::format("Pose {} {}", m_PT.m_bFK ? "turn" : "drag", m_PT.m_Rig.Name(Eff)));
+                            if (R.find(" keys on layer ") == std::string::npos) m_PT.m_Note = R;
+                            xeditor::LogConsole(std::format("Pose: {} ({})", m_PT.m_Note, R.substr(0, 160)), xeditor::log_source::User);
+                        }
+                    }
+                }
+                m_Viewport.m_bGizmoHot = m_Viewport.m_bGizmoDrag = m_PT.m_Drag >= 0;
+            }
+            else if (m_PT.m_Hover >= 0) m_Viewport.m_bGizmoHot = true;
+            // the previewed pose: a drag, or a Suggest candidate
+            if (m_PT.m_bPreview) PoseToBones(m_PT.m_Preview, m_PT.m_Offset);
+            else if (m_PT.m_Cand >= 0 && m_PT.m_Cand < int(m_Suggest.m_Candidates.size()))
+            {
+                xanimation::pose C; C.resize(m_PT.m_Rig.count());
+                for (int b = 0; b < C.count(); ++b) C.set(b, m_Suggest.m_Candidates[m_PT.m_Cand].m_Pose[b]);
+                xanimation::pose Now; std::string E2; xmath::fvec3 Off(0, 0, 0);
+                if (PoseAt(m_TimeSeconds, Now, E2)) { xanimation::body_ik FK; FK.Setup(m_PT.m_Rig.m_Par); FK.ComputeWorld(Now); Off = m_PoseBones[0].m_Position - FK.WorldPosition(0); }
+                PoseToBones(C, Off);
+            }
+        }
+
+        // after the viewport renders: the handles, the ghost, the clicks and keys
+        void PoseAfterRender(const xskeleton_editor::viewport_item& Item) noexcept
+        {
+            m_PT.m_Screen.clear(); m_PT.m_TipScreen = ImVec2(-1, -1);
+            std::string Err;
+            if (!m_PT.m_bOn || !PoseRig(Err) || int(m_PoseBones.size()) != m_PT.m_Rig.count()) return;
+            const auto& R = m_PT.m_Rig;
+            auto* DL = ImGui::GetWindowDrawList();
+            const auto Pins = m_PT.m_Drag >= 0 ? m_PT.m_DragPins : PoseEffectivePins(m_TimeSeconds);
+            for (int b : R.Effectors())
+            {
+                ImVec2 S; if (!m_Viewport.Project(m_PoseBones[b].m_Position, S)) continue;
+                m_PT.m_Screen.push_back({ b, S });
+                const bool bPin = Pins.count(b) > 0, bHot = m_PT.m_Hover == b && !m_PT.m_bHoverTip, bDrag = m_PT.m_Drag == b && !m_PT.m_bFK;
+                const ImU32 Col = bDrag ? IM_COL32(255, 200, 60, 255) : bHot ? IM_COL32(255, 235, 120, 255) : bPin ? IM_COL32(230, 70, 70, 255) : IM_COL32(255, 150, 40, 255);
+                if (bPin) { DL->AddRectFilled(ImVec2(S.x - 6, S.y - 6), ImVec2(S.x + 6, S.y + 6), Col); DL->AddRect(ImVec2(S.x - 6, S.y - 6), ImVec2(S.x + 6, S.y + 6), IM_COL32(20, 20, 20, 255)); }
+                else    { DL->AddCircleFilled(S, 7.0f, Col); DL->AddCircle(S, 7.0f, IM_COL32(20, 20, 20, 255)); }
+                if (bHot) DL->AddText(ImVec2(S.x + 10, S.y - 8), IM_COL32(255, 255, 255, 255), std::format("{}{}", R.Name(b), bPin ? " (pinned: right-click unpins)" : " (drag; right-click pins)").c_str());
+            }
+            if (m_PT.m_FKBone >= 0 && m_PT.m_FKBone < R.count())
+            {   // the selected bone's tip: dragging it turns that bone alone
+                int Tip = -1; for (int c = m_PT.m_FKBone + 1; c < R.count(); ++c) if (R.m_Par[c] == m_PT.m_FKBone) { Tip = c; break; }
+                ImVec2 S;
+                if (Tip >= 0 && m_Viewport.Project(m_PoseBones[Tip].m_Position, S))
+                {
+                    m_PT.m_TipScreen = S;
+                    const bool bHot = m_PT.m_bHoverTip || (m_PT.m_Drag == m_PT.m_FKBone && m_PT.m_bFK);
+                    DL->AddQuadFilled(ImVec2(S.x, S.y - 7), ImVec2(S.x + 7, S.y), ImVec2(S.x, S.y + 7), ImVec2(S.x - 7, S.y), bHot ? IM_COL32(120, 220, 255, 255) : IM_COL32(60, 170, 255, 255));
+                    if (bHot) DL->AddText(ImVec2(S.x + 10, S.y - 8), IM_COL32(255, 255, 255, 255), std::format("{}: turn (FK)", R.m_Names[m_PT.m_FKBone]).c_str());
+                }
+            }
+            // the ghost: where the handle was asked to go, the line to where it got, why it stopped
+            if (m_PT.m_Drag >= 0)
+            {
+                ImVec2 T, A;
+                const int Got = m_PT.m_bFK ? [&] { for (int c = m_PT.m_Drag + 1; c < R.count(); ++c) if (R.m_Par[c] == m_PT.m_Drag) return c; return m_PT.m_Drag; }() : m_PT.m_Drag;
+                if (m_Viewport.Project(m_PT.m_Target, T) && m_Viewport.Project(m_PoseBones[Got].m_Position, A))
+                {
+                    const bool bMiss = m_PT.m_Note != "reached";
+                    DL->AddCircle(T, 9.0f, bMiss ? IM_COL32(255, 80, 80, 230) : IM_COL32(255, 255, 255, 160), 0, 2.0f);
+                    if (bMiss) DL->AddLine(T, A, IM_COL32(255, 80, 80, 200), 2.0f);
+                    DL->AddText(ImVec2(T.x + 12, T.y + 4), bMiss ? IM_COL32(255, 120, 120, 255) : IM_COL32(220, 255, 220, 255), m_PT.m_Note.c_str());
+                }
+            }
+            if (m_PT.m_Cand >= 0 && m_PT.m_Cand < int(m_Suggest.m_Candidates.size()))
+            {
+                ImVec2 S; if (R.m_Head >= 0 && m_Viewport.Project(m_PoseBones[R.m_Head].m_Position, S))
+                    DL->AddText(ImVec2(S.x + 14, S.y - 24), IM_COL32(120, 220, 255, 255), std::format("Suggestion {}/{} (seed {}): Tab next, Enter accept, Esc keep yours", m_PT.m_Cand + 1, m_Suggest.m_Candidates.size(), m_Suggest.m_Candidates[m_PT.m_Cand].m_Seed).c_str());
+            }
+
+            // mouse: a handle wins over a bone pick; right-click pins; a click on a bone selects it for FK
+            if (m_Viewport.Over() && m_PT.m_Drag < 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Middle))
+            {
+                const ImVec2 Mouse = ImGui::GetIO().MousePos;
+                if (m_PT.m_Hover >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                {
+                    std::string E2;
+                    if (PoseAt(m_TimeSeconds, m_PT.m_Base, E2))
+                    {
+                        m_PT.m_bFK = m_PT.m_bHoverTip; m_PT.m_Drag = m_PT.m_Hover; m_PT.m_Time = m_TimeSeconds; m_PT.m_Cand = -1;
+                        m_PT.m_DragPins = PoseEffectivePins(m_TimeSeconds);
+                        xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(m_PT.m_Base);
+                        int Grab = m_PT.m_Drag;
+                        if (m_PT.m_bFK) for (int c = Grab + 1; c < R.count(); ++c) if (R.m_Par[c] == m_PT.m_Drag) { Grab = c; break; }
+                        m_PT.m_Offset = m_PoseBones[Grab].m_Position - FK.WorldPosition(Grab);
+                        m_PT.m_Plane = m_PT.m_Start = m_PT.m_Target = m_PoseBones[Grab].m_Position;
+                        m_PT.m_Normal = m_Viewport.m_Scene.m_View.RayFromScreen(Mouse.x, Mouse.y).NormalizeSafeCopy();
+                    }
+                    else m_PT.m_Note = E2;
+                }
+                else if (m_PT.m_Hover >= 0 && !m_PT.m_bHoverTip && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+                {
+                    if (m_PT.m_Pins.count(m_PT.m_Hover)) m_PT.m_Pins.erase(m_PT.m_Hover); else m_PT.m_Pins.insert(m_PT.m_Hover);
+                }
+                else if (!m_bMaskEdit && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                {
+                    int iBone = -1; float T = 0;
+                    m_PT.m_FKBone = m_Viewport.PickBone(Item, Mouse, iBone, T) ? iBone : -1;
+                }
+            }
+            // keys over the viewport: S suggests, Tab cycles, Enter accepts, Esc keeps the user's pose
+            if (m_Viewport.Over() && !ImGui::GetIO().WantTextInput && m_PT.m_Drag < 0)
+            {
+                if (ImGui::IsKeyPressed(ImGuiKey_S, false) && !ImGui::GetIO().KeyCtrl) xeditor::LogConsole(PoseSuggest("", m_PT.m_Prompt).substr(0, 300), xeditor::log_source::User);
+                if (m_PT.m_Cand >= 0)
+                {
+                    if (ImGui::IsKeyPressed(ImGuiKey_Tab, false) && !m_Suggest.m_Candidates.empty()) m_PT.m_Cand = (m_PT.m_Cand + 1) % int(m_Suggest.m_Candidates.size());
+                    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) xeditor::LogConsole(PoseSuggestAccept(m_PT.m_Cand).substr(0, 300), xeditor::log_source::User);
+                    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) m_PT.m_Cand = -1;
+                }
+            }
+        }
+
+        // the Pose tool's bar over the viewport
+        void PoseToolbar() noexcept
+        {
+            if (ImGui::Checkbox("Pose", &m_PT.m_bOn) && m_PT.m_bOn) PoseFrame();
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("Posing handles: drag a hand, foot, head or the hips (full-body IK, feet in contact held); right-click a handle pins it;\nclick a bone, then drag its tip to turn it alone. Releasing writes keys on the top Pose layer (one undo step).\nS: Suggest Pose (Tab: next, Enter: accept, Esc: keep yours).");
+            if (!m_PT.m_bOn) return;
+            auto Preset = [&](const char* L, std::initializer_list<int> B) { ImGui::SameLine(); if (ImGui::SmallButton(L)) { m_PT.m_Pins.clear(); for (int b : B) if (b >= 0) m_PT.m_Pins.insert(b); } };
+            std::string Err; PoseRig(Err);
+            const auto& R = m_PT.m_Rig;
+            ImGui::SameLine(); ImGui::TextDisabled("Pins:");
+            Preset("Feet", { R.m_LF, R.m_RF }); Preset("Hands", { R.m_LH, R.m_RH }); Preset("Both", { R.m_LF, R.m_RF, R.m_LH, R.m_RH }); Preset("None", {});
+            ImGui::SameLine(); ImGui::Checkbox("Auto feet", &m_PT.m_bAutoPins);
+            ImGui::SameLine(); if (ImGui::SmallButton("Mirror")) xeditor::LogConsole(PoseMirror(m_TimeSeconds).substr(0, 300), xeditor::log_source::User);
+            ImGui::SameLine(); if (ImGui::SmallButton("Copy")) { xanimation::pose P; if (PoseAt(m_TimeSeconds, P, Err)) { m_PT.m_Copy.resize(P.count()); for (int b = 0; b < P.count(); ++b) m_PT.m_Copy[b] = P.get(b); } }
+            ImGui::SameLine(); ImGui::BeginDisabled(m_PT.m_Copy.empty()); if (ImGui::SmallButton("Paste")) xeditor::LogConsole(PosePasteAt(m_TimeSeconds).substr(0, 300), xeditor::log_source::User); ImGui::EndDisabled();
+            ImGui::SameLine(); if (ImGui::SmallButton("Suggest (S)")) xeditor::LogConsole(PoseSuggest("", m_PT.m_Prompt).substr(0, 300), xeditor::log_source::User);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(160); ImGui::InputTextWithHint("##poseprompt", "what the pose is (optional)", m_PT.m_Prompt, sizeof(m_PT.m_Prompt));
+            if (!m_PT.m_Note.empty()) { ImGui::SameLine(); ImGui::TextColored(m_PT.m_Note == "reached" ? ImVec4(0.6f, 1, 0.6f, 1) : ImVec4(1, 0.6f, 0.5f, 1), "%s", m_PT.m_Note.c_str()); }
+        }
+
+        // the camera on the character where it is now (a walk leaves the frame the clip opened with)
+        void PoseFrame() noexcept
+        {
+            if (m_PoseBones.empty()) return;
+            xmath::fvec3 Mn = m_PoseBones[0].m_Position, Mx = Mn;
+            for (const auto& B : m_PoseBones) { Mn = Mn.Min(B.m_Position); Mx = Mx.Max(B.m_Position); }
+            m_Viewport.m_Scene.m_Center = (Mn + Mx) * 0.5f;
+            m_Viewport.m_Scene.m_Radius = std::max(0.25f, (Mx - Mn).Length() * 0.6f);
+            m_Viewport.m_Scene.m_bReframe = true;
+        }
+
+        std::string PosePasteAt(double Seconds) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "PosePaste: " + Err;
+            if (int(m_PT.m_Copy.size()) != m_PT.m_Rig.count()) return "PosePaste: nothing copied (PoseCopy first)";
+            xanimation::pose P; P.resize(m_PT.m_Rig.count());
+            for (int b = 0; b < P.count(); ++b) P.set(b, m_PT.m_Copy[b]);
+            return "PosePaste: " + PoseCommit(P, Seconds, "Pose paste");
+        }
+
+        std::string PoseToolInfo() noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "PoseTool: " + Err;
+            const auto& R = m_PT.m_Rig;
+            const auto Pins = PoseEffectivePins(m_TimeSeconds);
+            std::string T = std::format("PoseTool: {}; time {:.3f} s; limits {}; auto feet {}\n", m_PT.m_bOn ? "on" : "off", m_TimeSeconds, R.m_Lim.empty() ? "none (the skeleton's limits are off)" : "the skeleton's", m_PT.m_bAutoPins ? "on" : "off");
+            for (int b : R.Effectors())
+            {
+                ImVec2 S(-1, -1); for (const auto& [h, P] : m_PT.m_Screen) if (h == b) S = P;
+                T += std::format("handle {} ({}): screen {:.0f} {:.0f}{}{}\n", R.Name(b), R.m_Names[b], S.x, S.y, Pins.count(b) ? " pinned" : "", m_PT.m_Pins.count(b) ? " (by the user)" : "");
+            }
+            T += "contacts: " + m_PT.m_ContactText + "\n";
+            if (m_PT.m_FKBone >= 0) T += std::format("FK bone: {}; tip screen {:.0f} {:.0f}\n", R.m_Names[m_PT.m_FKBone], m_PT.m_TipScreen.x, m_PT.m_TipScreen.y);
+            T += std::format("drag: {}; last: {}; candidates {} (showing {})", m_PT.m_Drag >= 0 ? R.Name(m_PT.m_Drag) : "none", m_PT.m_Note.empty() ? "(none)" : m_PT.m_Note, m_Suggest.m_Candidates.size(), m_PT.m_Cand);
+            return T;
+        }
+
         static std::string SafeFileName(std::string N) noexcept
         {
             for (auto& c : N) if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') c = '_';
@@ -2894,10 +3478,15 @@ namespace xanim_package_editor
             if (!pSkeleton) return;
 
             // Play / pause is the AnimPackage/Preview/PlayPause action (P; Space belongs to the drawer).
+            PoseToolbar();
             EvaluatePose(*pSkeleton);
             UpdateMaskShown();
-            const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSkeleton, .m_Bones = m_PoseBones, .m_pSelected = m_MaskShown.empty() ? nullptr : &m_MaskShown };
+            PoseBeforeRender();
+            std::set<int> PoseSel; if (m_PT.m_bOn && m_PT.m_FKBone >= 0) PoseSel.insert(m_PT.m_FKBone);
+            const std::set<int>* pSel = !m_MaskShown.empty() ? &m_MaskShown : PoseSel.empty() ? nullptr : &PoseSel;
+            const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSkeleton, .m_Bones = m_PoseBones, .m_pSelected = pSel };
             m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
+            PoseAfterRender(Item);
 
             // mask editing: a click on a bone adds it (with its branch; Shift: alone) to the selected layer's mask, or removes it
             if (m_bMaskEdit && m_Viewport.Over() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
@@ -3107,6 +3696,65 @@ namespace xanim_package_editor
             return S.SuggestPoseAccept(iL, iC, bRefine);
         }
         case kind::layers_info: return S.LayersInfo();
+        case kind::pose_tool:
+        {
+            std::string On, Bone;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hA, On)) { S.m_PT.m_bOn = On == "1" || On == "true"; if (S.m_PT.m_bOn) S.PoseFrame(); }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Bone)) { std::string E; if (!S.PoseRig(E)) return "PoseTool: " + E; S.m_PT.m_FKBone = S.m_PT.m_Rig.Find(Bone); if (S.m_PT.m_FKBone < 0) return std::format("PoseTool: no bone '{}'", Bone); }
+            return S.PoseToolInfo();
+        }
+        case kind::pose_drag:
+        {
+            std::string Eff, Mv, Pins, Only, Time, Commit; xmath::fvec3 M(0, 0, 0);
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Eff) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Mv) || std::sscanf(Mv.c_str(), "%f %f %f", &M.m_X, &M.m_Y, &M.m_Z) != 3) return "PoseDrag: -Effector name -Move \"dx dy dz\" (cm)";
+            xeditor::cmd_util::GetArg(m_Parser, m_hC, Pins); xeditor::cmd_util::GetArg(m_Parser, m_hD, Only); xeditor::cmd_util::GetArg(m_Parser, m_hF, Commit);
+            double T = S.m_TimeSeconds;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hE, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "PoseDrag: -Time is seconds";
+            return S.PoseDrag(Eff, M, Pins, Only == "1" || Only == "true", T, !(Commit == "0" || Commit == "false"));
+        }
+        case kind::pose_pin:
+        {
+            std::string H, P, E;
+            if (!S.PoseRig(E)) return "PosePin: " + E;
+            auto& R = S.m_PT.m_Rig;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, P))
+            {
+                auto Set = [&](std::initializer_list<int> B) { S.m_PT.m_Pins.clear(); for (int b : B) if (b >= 0) S.m_PT.m_Pins.insert(b); };
+                if (P == "Feet") Set({ R.m_LF, R.m_RF }); else if (P == "Hands") Set({ R.m_LH, R.m_RH }); else if (P == "Both") Set({ R.m_LF, R.m_RF, R.m_LH, R.m_RH }); else if (P == "None") Set({});
+                else if (P == "Auto 1" || P == "Auto 0") S.m_PT.m_bAutoPins = P == "Auto 1";
+                else return "PosePin: -Preset Feet|Hands|Both|None|\"Auto 1|0\"";
+            }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hA, H))
+            {
+                const int b = R.Find(H);
+                if (b < 0) return std::format("PosePin: no handle '{}'", H);
+                if (S.m_PT.m_Pins.count(b)) S.m_PT.m_Pins.erase(b); else S.m_PT.m_Pins.insert(b);
+            }
+            return S.PoseToolInfo();
+        }
+        case kind::pose_mirror: case kind::pose_copy: case kind::pose_paste:
+        {
+            std::string Time; double T = S.m_TimeSeconds;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hA, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "Pose: -Time is seconds";
+            if (m_Kind == kind::pose_mirror) return S.PoseMirror(T);
+            if (m_Kind == kind::pose_paste) return S.PosePasteAt(T);
+            std::string E; xanimation::pose P;
+            if (!S.PoseRig(E) || !S.PoseAt(T, P, E)) return "PoseCopy: " + E;
+            S.m_PT.m_Copy.resize(P.count()); for (int b = 0; b < P.count(); ++b) S.m_PT.m_Copy[b] = P.get(b);
+            return std::format("PoseCopy: the pose at {:.3f} s ({} bones)", T, P.count());
+        }
+        case kind::pose_suggest:
+        {
+            std::string Seeds, Prompt, Acc, Show; int i = 0;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hC, Acc)) { if (std::from_chars(Acc.data(), Acc.data() + Acc.size(), i).ec != std::errc()) return "PoseSuggest: -Accept is an index"; return S.PoseSuggestAccept(i); }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Show))
+            {
+                if (std::from_chars(Show.data(), Show.data() + Show.size(), i).ec != std::errc() || i >= int(S.m_Suggest.m_Candidates.size())) return "PoseSuggest: -Show is a candidate index or -1";
+                S.m_PT.m_Cand = i; return std::format("PoseSuggest: showing {}", i);
+            }
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Seeds); xeditor::cmd_util::GetArg(m_Parser, m_hB, Prompt);
+            return S.PoseSuggest(Seeds, Prompt);
+        }
         case kind::layer_timeline_edit:
         {
             if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, A)) return "LayerTimelineEdit: -Ops is required";
