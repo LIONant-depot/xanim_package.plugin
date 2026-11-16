@@ -110,6 +110,7 @@ namespace xanim_package_layers
             std::vector<xanimation::weight_key>     m_Keys;
             xanimation::layer_sample                m_Reference;
             std::vector<xanimation::pose_track>     m_Tracks;               // Pose layers
+            std::vector<xanimation::ik_track>       m_Ik;                   // Pose layers: IK keys, solved per frame after the layer's own keys
             std::uint8_t                            m_Channels = 0;
             std::size_t                             m_Written = 0, m_WrittenOutside = 0;
         };
@@ -164,15 +165,28 @@ namespace xanim_package_layers
                     if (b < 0) { Report.m_Warnings.push_back(std::format("layer '{}': key bone '{}' is not in the skeleton (ignored)", L.m_Name, K.m_Bone)); continue; }
                     auto It = std::find_if(P.m_Tracks.begin(), P.m_Tracks.end(), [b](const auto& T) { return T.m_Bone == b; });
                     if (It == P.m_Tracks.end()) { P.m_Tracks.push_back({ .m_Bone = b }); It = std::prev(P.m_Tracks.end()); }
-                    It->m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Value = xmath::fquat(K.m_X, K.m_Y, K.m_Z, K.m_W).NormalizeCopy(), .m_bOffset = K.m_bOffset, .m_bStep = K.m_bStep
+                    It->m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Value = xmath::fquat(K.m_X, K.m_Y, K.m_Z, K.m_W).NormalizeCopy(), .m_bOffset = K.m_bOffset, .m_bStep = K.m_bStep, .m_bLinear = K.m_bLinear
                                          , .m_bPosition = K.m_bPosition, .m_Position = xmath::fvec3(K.m_PX, K.m_PY, K.m_PZ) });
                 }
                 for (auto& T : P.m_Tracks) xanimation::SortTrack(T);
+                for (const auto& K : L.m_IkKeys)
+                {
+                    int b = -1;
+                    for (int s = 0; s < nSkel; ++s) if (Bones[s].m_Name == K.m_Effector) { b = s; break; }
+                    if (b < 0) { Report.m_Warnings.push_back(std::format("layer '{}': IK key effector '{}' is not in the skeleton (ignored)", L.m_Name, K.m_Effector)); continue; }
+                    auto It = std::find_if(P.m_Ik.begin(), P.m_Ik.end(), [b](const auto& T) { return T.m_Bone == b; });
+                    if (It == P.m_Ik.end()) { P.m_Ik.push_back({ .m_Bone = b, .m_Attach = xmath::fvec3(K.m_AX, K.m_AY, K.m_AZ) }); It = std::prev(P.m_Ik.end()); }
+                    It->m_Keys.push_back({ .m_Tick = K.m_Tick, .m_Position = xmath::fvec3(K.m_PX, K.m_PY, K.m_PZ), .m_bRotation = K.m_bRotation
+                                         , .m_Rotation = xmath::fquat(K.m_X, K.m_Y, K.m_Z, K.m_W).NormalizeSafeCopy(), .m_bPinned = K.m_bPinned, .m_bStep = K.m_bStep, .m_bLinear = K.m_bLinear });
+                }
+                for (auto& T : P.m_Ik) xanimation::SortIkTrack(T);
                 P.m_Mask = L.m_Mask.empty() ? std::vector<float>(nSkel, 1.0f) : LayerMask(L, Manifest, &Report.m_Warnings);
                 if (L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE) P.m_Reference = xanimation::IdentityReference(nSkel);
                 P.m_Channels = xanimation::CHANNEL_ROTATION;
                 std::vector<float> Written(nSkel, 0.0f);         // the write set: keyed bones in the mask
                 for (const auto& T : P.m_Tracks) Written[T.m_Bone] = P.m_Mask[T.m_Bone];
+                for (const auto& T : P.m_Ik)          // the IK's chains: the effector and the two bones above it (the root: itself)
+                    for (int a = T.m_Bone, k = 0; a >= 0 && k < 3; a = Parents[a], ++k) Written[a] = 1.0f;
                 for (int s = 0; s < nSkel; ++s) Union[s] = std::max(Union[s], Written[s]);
             }
             else
@@ -277,6 +291,22 @@ namespace xanim_package_layers
                 xanimation::ApplyLayer(Pose, Sample, A, &Written);
                 for (int s = 0; s < nSkel; ++s)
                     if (Written[s]) { ++P.m_Written; if (P.m_Mask[s] <= 0.0f) ++P.m_WrittenOutside; Out[static_cast<std::size_t>(f) * nSkel + s] = Pose.get(s); }
+            }
+            // IK keys: the layer's effector targets solved on every frame of the finished layer (baked: no runtime IK)
+            if (bPose && !P.m_Ik.empty())
+            {
+                thread_local xanimation::body_ik Solver;
+                std::vector<xanimation::two_bone_chain> Limbs;
+                for (const auto& T : P.m_Ik) { const int p = Parents[T.m_Bone], g = p >= 0 ? Parents[p] : -1; if (g >= 0) Limbs.push_back({ g, p, T.m_Bone }); }
+                Solver.Setup(Parents, {}, {}, Limbs);     // ponytail: no joint limits here (the compose has the manifest, not the skeleton's limits)
+                std::vector<std::uint8_t> W; std::vector<xanimation::ik_task> Tasks; std::vector<xanimation::ik_task_report> Rep;
+                xanimation::pose Solved;
+                for (int f = 0; f < nFrames; ++f)
+                {
+                    for (int s = 0; s < nSkel; ++s) Pose.set(s, Out[static_cast<std::size_t>(f) * nSkel + s]);
+                    if (!xanimation::SolveIkFrame(Solver, Parents, P.m_Ik, ToTick(double(f) / FPS), P.m_pDesc->m_bSmooth, Sampling.m_Falloff, Pose, W, Tasks, Rep, Solved)) continue;
+                    for (int s = 0; s < nSkel; ++s) if (W[s]) { ++P.m_Written; Out[static_cast<std::size_t>(f) * nSkel + s] = Solved.get(s); }
+                }
             }
         };
         std::function<void(std::uint64_t, std::vector<xmath::transform3>&)> Eval = [&](std::uint64_t ParentId, std::vector<xmath::transform3>& Out)

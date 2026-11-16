@@ -30,12 +30,14 @@ namespace xanim_package_desc
     // Where an import source's animations come from (Tomas 2026-11-15). Each entry of the package's input list says which:
     //   an animation ASSET (an fbx or any file the importer reads) made on THIS package's skeleton, or on ANOTHER skeleton (then a Retarget resource moves it);
     //   another animation PACKAGE (its descriptor lists the animations, its compiled clips are the data) on this package's skeleton, or on another (a Retarget again).
-    enum class import_kind : std::uint8_t { SAME_SKELETON_ASSET, DIFFERENT_SKELETON_ASSET, SAME_SKELETON_PACKAGE, DIFFERENT_SKELETON_PACKAGE };
+    // NEW_ANIMATION (keyframe batch, 2026-11-16): no file - the skeleton's rest pose held for Seconds at FPS, named by Path: a clip made from nothing, keyed with Pose layers
+    enum class import_kind : std::uint8_t { SAME_SKELETON_ASSET, DIFFERENT_SKELETON_ASSET, SAME_SKELETON_PACKAGE, DIFFERENT_SKELETON_PACKAGE, NEW_ANIMATION };
     static constexpr auto import_kind_v = std::array
     { xproperty::settings::enum_item("Same skeleton: animation asset",         import_kind::SAME_SKELETON_ASSET)
     , xproperty::settings::enum_item("Different skeleton: animation asset",    import_kind::DIFFERENT_SKELETON_ASSET)
     , xproperty::settings::enum_item("Same skeleton: animation package",       import_kind::SAME_SKELETON_PACKAGE)
     , xproperty::settings::enum_item("Different skeleton: animation package",  import_kind::DIFFERENT_SKELETON_PACKAGE)
+    , xproperty::settings::enum_item("New animation (rest pose)",              import_kind::NEW_ANIMATION)
     };
 
     //----------------------------------------------------------------------------------------------
@@ -81,6 +83,7 @@ namespace xanim_package_desc
         bool            m_bStep   = false;
         bool            m_bPosition = false;                    // a position key too (the hips' shift, or any bone): local, absolute or with Offset the offset
         float           m_PX = 0, m_PY = 0, m_PZ = 0;
+        bool            m_bLinear = false;                      // the interval to the next key is linear even in a smooth layer
 
         XPROPERTY_DEF
         ( "PoseKey", layer_pose_key
@@ -96,9 +99,39 @@ namespace xanim_package_desc
         , obj_member<"PX",     &layer_pose_key::m_PX >
         , obj_member<"PY",     &layer_pose_key::m_PY >
         , obj_member<"PZ",     &layer_pose_key::m_PZ >
+        , obj_member<"Linear", &layer_pose_key::m_bLinear, member_help<"The interval to the next key is linear (in a smooth layer)">>
         )
     };
     XPROPERTY_REG(layer_pose_key)
+
+    // An IK key (keyframe batch 2026-11-16): an effector's target (the handle: bone origin + Attach) in the skeleton's model space at a tick;
+    // optional rotation; Pinned holds it until the next key. The compose solves the body on every frame (body_ik) and bakes rotations.
+    struct layer_ik_key
+    {
+        std::int64_t    m_Tick      = 0;
+        std::string     m_Effector  = {};                       // the bone (hand, foot, head, hips)
+        float           m_PX = 0, m_PY = 0, m_PZ = 0;           // model-space target of the handle
+        bool            m_bRotation = false;
+        float           m_X = 0, m_Y = 0, m_Z = 0, m_W = 1;     // model rotation of the bone
+        bool            m_bPinned   = false;
+        bool            m_bStep     = false;
+        bool            m_bLinear   = false;
+        float           m_AX = 0, m_AY = 0, m_AZ = 0;           // the handle in the bone's frame (palm, sole)
+
+        XPROPERTY_DEF
+        ( "IkKey", layer_ik_key
+        , obj_member<"Tick",     &layer_ik_key::m_Tick >
+        , obj_member<"Effector", &layer_ik_key::m_Effector >
+        , obj_member<"PX", &layer_ik_key::m_PX >, obj_member<"PY", &layer_ik_key::m_PY >, obj_member<"PZ", &layer_ik_key::m_PZ >
+        , obj_member<"Rotated",  &layer_ik_key::m_bRotation >
+        , obj_member<"X", &layer_ik_key::m_X >, obj_member<"Y", &layer_ik_key::m_Y >, obj_member<"Z", &layer_ik_key::m_Z >, obj_member<"W", &layer_ik_key::m_W >
+        , obj_member<"Pinned",   &layer_ik_key::m_bPinned >
+        , obj_member<"Step",     &layer_ik_key::m_bStep >
+        , obj_member<"Linear",   &layer_ik_key::m_bLinear >
+        , obj_member<"AX", &layer_ik_key::m_AX >, obj_member<"AY", &layer_ik_key::m_AY >, obj_member<"AZ", &layer_ik_key::m_AZ >
+        )
+    };
+    XPROPERTY_REG(layer_ik_key)
 
     enum class layer_space : std::uint8_t { LOCAL, SKELETON_MODEL };
     static constexpr auto layer_space_v = std::array
@@ -194,6 +227,7 @@ namespace xanim_package_desc
         layer_space         m_Space       = layer_space::LOCAL;     // override rotations: per bone (Local) or relative to the skeleton (a masked arm keeps the layer's orientation)
         layer_kind          m_Kind        = layer_kind::CLIP;       // Clip: motion from SourceKey/SourceClip; Pose: the Keys below
         std::vector<layer_pose_key> m_Keys = {};                    // Pose layers: sparse keys (a track per bone); their mask, when empty, is the whole body
+        std::vector<layer_ik_key>   m_IkKeys = {};                  // Pose layers: IK keys (a track per effector), solved per frame after the layer's own keys
         bool                m_bSmooth     = false;      // Pose layers: a smooth curve through the keys (new pose layers: on; off = linear, as layers made before)
         float               m_Falloff     = 0.0f;       // Pose layers: seconds the layer eases in before its first key and out after its last (new pose layers: 0.5; 0 = ramp to the section ends)
         std::vector<layer_take> m_Takes   = {};         // Pose layers: the generated takes (Kimodo) some of the keys came from (provenance; nothing composes from it)
@@ -235,6 +269,7 @@ namespace xanim_package_desc
         , obj_member<"Space",         &clip_layer::m_Space, member_enum_span<layer_space_v> >
         , obj_member<"Kind",          &clip_layer::m_Kind, member_enum_span<layer_kind_v> >
         , obj_member<"Keys",          &clip_layer::m_Keys >
+        , obj_member<"IkKeys",        &clip_layer::m_IkKeys >
         , obj_member<"Smooth",        &clip_layer::m_bSmooth >
         , obj_member<"Falloff",       &clip_layer::m_Falloff >
         , obj_member<"Takes",         &clip_layer::m_Takes >
@@ -312,21 +347,28 @@ namespace xanim_package_desc
         xrsc::anim_package m_Package = {};      // the animation package (the two package kinds): its descriptor lists the animations, its compiled clips are the data
         xrsc::retarget     m_Retarget = {};     // the two DIFFERENT kinds: the Retarget from the skeleton the animations were made on to this package's skeleton
         std::vector<clip>  m_Clips   = {};      // every clip found in THIS source, curated
+        float              m_Seconds = 2.0f;    // NEW_ANIMATION: its length
+        int                m_FPS     = 30;      // NEW_ANIMATION: its frame rate
 
         // The kind as it counts: a source saved before kinds existed that names a Retarget is a different-skeleton asset
         import_kind kind(void) const noexcept { return (m_Kind == import_kind::SAME_SKELETON_ASSET && !m_Retarget.empty()) ? import_kind::DIFFERENT_SKELETON_ASSET : m_Kind; }
         bool bAsset  (void) const noexcept { return kind() == import_kind::SAME_SKELETON_ASSET || kind() == import_kind::DIFFERENT_SKELETON_ASSET; }
-        bool bPackage(void) const noexcept { return !bAsset(); }
+        bool bPackage(void) const noexcept { return kind() == import_kind::SAME_SKELETON_PACKAGE || kind() == import_kind::DIFFERENT_SKELETON_PACKAGE; }
+        bool bNew    (void) const noexcept { return kind() == import_kind::NEW_ANIMATION; }
         bool bDifferent(void) const noexcept { return kind() == import_kind::DIFFERENT_SKELETON_ASSET || kind() == import_kind::DIFFERENT_SKELETON_PACKAGE; }
 
         // What names this source in the details (the compiler's list of what each source holds): the file, or the package
-        std::wstring key(void) const { return bAsset() ? m_Path : std::format(L"package:{:X}", m_Package.m_Instance.m_Value); }
+        std::wstring key(void) const { return bAsset() ? m_Path : bNew() ? L"new:" + m_Path : std::format(L"package:{:X}", m_Package.m_Instance.m_Value); }
 
         XPROPERTY_DEF
         ( "ImportSource", import_source
         , obj_member<"Type", &import_source::m_Kind, member_enum_span<import_kind_v>, member_help<"Where this source's animations come from: an animation asset or another animation package, made on this package's skeleton or on another one (then a Retarget moves them)">>
         , obj_member<"Path", &import_source::m_Path, member_ui<std::wstring>::file_dialog<mesh_filter_v, true, 1>
-            , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bAsset(); return F; }> >
+            , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bAsset() && !O.bNew(); return F; }> >
+        , obj_member<"Seconds", &import_source::m_Seconds, member_help<"New animation: its length in seconds">
+            , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bNew(); return F; }> >
+        , obj_member<"FPS", &import_source::m_FPS, member_help<"New animation: its frame rate">
+            , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bNew(); return F; }> >
         , obj_member<"Package", &import_source::m_Package, member_help<"The animation package whose animations are brought in (its descriptor lists them)">
             , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bPackage(); return F; }> >
         , obj_member<"Retarget", &import_source::m_Retarget, member_help<"The Retarget resource that moves these animations from the skeleton they were made on (its Source) to this package's skeleton (its Destination)">
@@ -380,6 +422,7 @@ namespace xanim_package_desc
                 const auto& S = m_ImportSources[i];
                 if (S.bAsset() && S.m_Path.empty())           Errors.push_back(std::format("Import source {}: an animation asset kind needs its Path", i));
                 if (S.bPackage() && S.m_Package.empty())      Errors.push_back(std::format("Import source {}: an animation package kind needs its Package", i));
+                if (S.bNew() && (S.m_Path.empty() || !(S.m_Seconds > 0) || S.m_FPS < 1 || S.m_FPS > 240)) Errors.push_back(std::format("Import source {}: a new animation needs a name (Path), Seconds > 0 and FPS 1..240", i));
                 if (S.bDifferent() && S.m_Retarget.empty())   Errors.push_back(std::format("Import source {}: a different-skeleton kind needs its Retarget", i));
                 for (const auto& C : S.m_Clips)
                 {

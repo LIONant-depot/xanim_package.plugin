@@ -57,7 +57,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key };
 
         session&    m_Session;
         kind        m_Kind;
@@ -170,6 +170,28 @@ namespace xanim_package_editor
                 m_hA = m_Parser.addOption("Layer", "The Kimodo layer's index", true, 1);
                 m_hB = m_Parser.addOption("Every", "A key every N frames (default 1: every frame)", false, 1);
                 break;
+            case kind::new_clip:
+                m_hA = m_Parser.addOption("Name",     "The new animation's name", true, 1);
+                m_hB = m_Parser.addOption("Seconds",  "Its length (default 2)", false, 1);
+                m_hC = m_Parser.addOption("FPS",      "Its frame rate (default 30)", false, 1);
+                m_hD = m_Parser.addOption("FromPose", "rest (default) or playhead: start from the pose at the playhead (keys at 0)", false, 1);
+                break;
+            case kind::ik_key:
+                m_hA = m_Parser.addOption("Effector", "LeftHand, RightHand, LeftFoot, RightFoot, Head, Hips or a bone name", true, 1);
+                m_hB = m_Parser.addOption("Time",     "Seconds (default: the playhead)", false, 1);
+                m_hC = m_Parser.addOption("Pos",      "\"x y z\" model-space target of the handle (default: where it is now)", false, 1);
+                m_hD = m_Parser.addOption("Pin",      "1: pinned (held until the next key), 0: not (default: the handle's pin state)", false, 1);
+                m_hE = m_Parser.addOption("Rot",      "1: key its rotation too (default 0)", false, 1);
+                m_hF = m_Parser.addOption("Delete",   "1: delete the effector's IK key at that time", false, 1);
+                m_hG = m_Parser.addOption("Probe",    "1: only report where the handle is at that time (model space, the composed animation), no key", false, 1);
+                break;
+            case kind::key_selected:
+                m_hA = m_Parser.addOption("All",  "1: every bone the layer owns (Shift+K), else the selected bone or handle (K)", false, 1);
+                m_hB = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
+                break;
+            case kind::auto_key:
+                m_hA = m_Parser.addOption("On", "1: edits write keys (default), 0: edits are a pending pose that K keys", true, 1);
+                break;
             case kind::pose_rotate:
                 m_hA = m_Parser.addOption("Bone", "The bone (its name)", true, 1);
                 m_hB = m_Parser.addOption("Turn", "\"x y z\" degrees about the model's axes, applied to the bone's current world rotation", true, 1);
@@ -181,7 +203,7 @@ namespace xanim_package_editor
         }
         std::string Query() noexcept override;
 
-        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE, m_hF;
+        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE, m_hF, m_hG;
     };
 
     //--------------------------------------------------------------------------------------------
@@ -217,7 +239,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
-        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey;
         // the last accepted candidate (its frames on this skeleton): KimodoTakeCheck compares the compiled take with it
         std::uint64_t m_KAcceptedLayer = 0; std::vector<xmath::transform3> m_KAcceptedFrames; int m_KAcceptedW = 0;
 
@@ -361,6 +383,10 @@ namespace xanim_package_editor
             , m_BakeToPose           (m_Undo, *this, playback_cmd::kind::bake_to_pose,            "BakeToPose",           "Turns a Kimodo layer into an editable Pose layer (keys of what the clip plays over its span); the Kimodo layer goes off, its take is kept; one undo step. Usage: BakeToPose -Layer n [-Every 1]")
             , m_KimodoTakesToLayers  (m_Undo, *this, playback_cmd::kind::kimodo_takes_to_layers,  "KimodoTakesToLayers",  "A Pose layer's stored takes (from the refine) as Kimodo layers with their requests, off (idempotent). Usage: KimodoTakesToLayers -Layer n")
             , m_PoseRotate           (m_Undo, *this, playback_cmd::kind::pose_rotate,             "PoseRotate",           "Turns one bone (what the rotate gizmo does) and writes its key on the top Pose layer, one undo step. Usage: PoseRotate -Bone name -Turn \"x y z\" [-Time s]")
+            , m_NewClip              (m_Undo, *this, playback_cmd::kind::new_clip,                "NewClip",              "A new animation from nothing: the skeleton's rest pose (or the pose at the playhead) held for Seconds, with a Pose layer ready for keys; one undo step, then saved and compiled. Usage: NewClip -Name n [-Seconds 2] [-FPS 30] [-FromPose rest|playhead]")
+            , m_IkKeyCmd             (m_Undo, *this, playback_cmd::kind::ik_key,                  "IkKey",                "An IK key on the top Pose layer: an effector's target (the handle: palm, sole) at a time, pinned or not; the body is solved on every frame between keys. One undo step. Usage: IkKey -Effector LeftHand [-Time s] [-Pos \"x y z\"] [-Pin 1|0] [-Rot 1] [-Delete 1]")
+            , m_KeySelected          (m_Undo, *this, playback_cmd::kind::key_selected,            "KeySelected",          "K: keys the selected bone (or the last dragged handle as an IK key, or the pending pose when auto-key is off) at the playhead; -All 1 (Shift+K): every bone the layer owns. One undo step. Usage: KeySelected [-All 1] [-Time s]")
+            , m_AutoKey              (m_Undo, *this, playback_cmd::kind::auto_key,                "AutoKey",              "Auto-key on (edits write keys) or off (an edit is a pending pose, shown, that K keys). Usage: AutoKey -On 1|0")
             , m_KimodoTakeCheck      (m_Undo, *this, playback_cmd::kind::kimodo_take_check,       "KimodoTakeCheck",      "The compiled take of the last accepted Kimodo candidate against the candidate itself (every frame, every bone). Usage: KimodoTakeCheck")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
@@ -540,7 +566,7 @@ namespace xanim_package_editor
         // folding, solo and selection never touch the descriptor.
         //----------------------------------------------------------------------------------------
         static constexpr std::uint64_t tl_base_row_v = 0xB000000000000001ull;
-        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4, tl_folder = 5, tl_group = 6, tl_weight = 7 };     // tl_weight: a layer's weight curve lane
+        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4, tl_folder = 5, tl_group = 6, tl_weight = 7, tl_ik = 8 };     // tl_ik: an effector's IK keys (keyframe batch)     // tl_weight: a layer's weight curve lane
 
         // contract v3: a layer's effective parent (its folder or group in this clip; 0 = the top level). A parent that names nothing, or
         // loops, is the top level - the same rule as the composition (xanim_package_layers::Compose)
@@ -565,7 +591,7 @@ namespace xanim_package_editor
             }
             return false;
         }
-        struct tl_row { int m_iLayer = -1; std::string m_Bone; bool m_bMerged = false; bool m_bWeight = false; };    // merged: Clip/Kimodo layers sharing a Row (T4b); m_iLayer = the top one, the items name their layer
+        struct tl_row { int m_iLayer = -1; std::string m_Bone; bool m_bMerged = false; bool m_bWeight = false; bool m_bIk = false; };    // m_bIk: m_Bone is the effector of an IK row    // merged: Clip/Kimodo layers sharing a Row (T4b); m_iLayer = the top one, the items name their layer
         static std::uint64_t TLMergedRow(std::uint64_t Parent, std::uint64_t Row) noexcept { return ((Row * 0x9E3779B97F4A7C15ull) ^ Parent) & 0x3FFFFFFFFFFFFFFFull | 0x8000000000000000ull; }
         // the layers of a timeline row: one, or every member of a merged row
         std::vector<int> TLMembers(std::uint64_t RowId) noexcept
@@ -631,8 +657,10 @@ namespace xanim_package_editor
                     R.m_Color = bPose ? IM_COL32(210, 150, 70, 255) : bFolder ? IM_COL32(150, 150, 110, 255) : bGroup ? IM_COL32(140, 110, 190, 255) : L.m_Kind == kind::KIMODO ? IM_COL32(70, 170, 160, 255) : IM_COL32(86, 132, 210, 255);
                     std::vector<std::string> Bones;
                     if (bPose) { for (const auto& K : L.m_Keys) if (std::find(Bones.begin(), Bones.end(), K.m_Bone) == Bones.end()) Bones.push_back(K.m_Bone); std::sort(Bones.begin(), Bones.end()); }
+                    std::vector<std::string> Effs;
+                    if (bPose) { for (const auto& K : L.m_IkKeys) if (std::find(Effs.begin(), Effs.end(), K.m_Effector) == Effs.end()) Effs.push_back(K.m_Effector); std::sort(Effs.begin(), Effs.end()); }
                     const bool bContainer = bFolder || bGroup;
-                    bool bKids = !Bones.empty();
+                    bool bKids = !Bones.empty() || !Effs.empty();
                     if (bContainer) for (int j = 0; j < int(pOv->m_Layers.size()) && !bKids; ++j) bKids = j != i && TLParentOf(*pOv, j) == L.m_Id && L.m_Id;
                     R.m_bHasChildren = bKids;
                     const bool bLane = !bContainer && !bMerged;          // a layer's weight curve lane (its first child row)
@@ -651,6 +679,12 @@ namespace xanim_package_editor
                         xeditor::timeline::row_desc C; C.m_Id = TLBoneRow(R.m_Id, B); C.m_Type = tl_bone; C.m_Depth = Depth + 1; C.m_Name = B;
                         C.m_bMute = R.m_bMute; C.m_bLock = R.m_bLock; C.m_Color = IM_COL32(190, 140, 80, 255); C.m_bToggles = false;    // its layer's
                         Out.push_back(C); m_TLRows[C.m_Id] = { i, B };
+                    }
+                    for (const auto& E : Effs)      // IK keys: one row per effector, its pinned spans drawn as bars
+                    {
+                        xeditor::timeline::row_desc C; C.m_Id = TLBoneRow(R.m_Id, "#ik:" + E); C.m_Type = tl_ik; C.m_Depth = Depth + 1; C.m_Name = "IK " + E;
+                        C.m_bMute = R.m_bMute; C.m_bLock = R.m_bLock; C.m_Color = IM_COL32(110, 190, 230, 255); C.m_bToggles = false;
+                        Out.push_back(C); m_TLRows[C.m_Id] = { i, E, false, false, true };
                     }
                 }
             };
@@ -693,6 +727,11 @@ namespace xanim_package_editor
                             if (L.m_TrimOut >= 0)
                                 if (auto Err = Set(iL, "TrimOut", std::to_string(O.m_Seg.m_Offset + (O.m_Seg.m_End - O.m_Seg.m_Start)), std::to_string(L.m_TrimOut)); !Err.empty()) return Err;
                         }
+                        else if (pR->m_bIk)               // an IK key: its time (its target is kept)
+                        {
+                            const int k = int(O.m_Ref.m_Item) - 1;
+                            if (auto Err = Set(iL, std::format("IkKeys[G:{}]/Tick", k).c_str(), std::to_string(O.m_Seg.m_Start), std::to_string(L.m_IkKeys[k].m_Tick)); !Err.empty()) return Err;
+                        }
                         else if (pR->m_bWeight)           // a weight key: its time and its value (0..1)
                         {
                             const int k = int(O.m_Ref.m_Item) - 1;
@@ -711,7 +750,7 @@ namespace xanim_package_editor
             }
             // row ops
             std::vector<std::string> Parts; { std::size_t a = 0; while (a <= Ops.size()) { auto b = Ops.find(';', a); if (b == std::string::npos) b = Ops.size(); Parts.push_back(Ops.substr(a, b - a)); a = b + 1; } }
-            std::map<int, std::vector<int>> Deletes, WDeletes;  // layer -> key indices (pose keys, weight keys)
+            std::map<int, std::vector<int>> Deletes, WDeletes, IDeletes;  // layer -> key indices (pose keys, weight keys, IK keys)
             std::vector<std::function<std::string()>> Steps;
             for (const auto& Part : Parts)
             {
@@ -781,6 +820,28 @@ namespace xanim_package_editor
                     if (Kids.size() < 2) return "the folder needs two clip or Kimodo layers";
                     if (auto E = xanim_package_desc::RowOverlapError(After, TLClipTicks()); !E.empty()) return E;
                     for (int m : Kids) if (pOv->m_Layers[m].m_Row != FL.m_Id) Steps.push_back([=, this] { return Set(m, "Row", std::to_string(FL.m_Id), std::to_string(SelectedOv()->m_Layers[m].m_Row)); });
+                }
+                else if (Op == "delete" && n == 3 && pR->m_bIk)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    if (X < 1 || X > L.m_IkKeys.size()) return std::format("no IK key {} on layer '{}'", X, L.m_Name);
+                    IDeletes[iL].push_back(int(X) - 1);
+                }
+                else if (Op == "interp" && n >= 3)    // "interp row item smooth|linear|step": the interval from that key to the next (pose or IK key)
+                {
+                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
+                    char M[16] = {};
+                    if (std::sscanf(Part.c_str(), " %*s %*llu %*llu %15s", M) != 1) return "interp row item smooth|linear|step";
+                    const std::string Mode(M);
+                    if (Mode != "smooth" && Mode != "linear" && Mode != "step") return "interp row item smooth|linear|step";
+                    const bool bStep = Mode == "step", bLin = Mode == "linear";
+                    const char* pList = pR->m_bIk ? "IkKeys" : "Keys";
+                    const std::size_t nK = pR->m_bIk ? L.m_IkKeys.size() : L.m_Keys.size();
+                    if (pR->m_bWeight || (pR->m_Bone.empty() && !pR->m_bIk) || X < 1 || X > nK) return std::format("no key {} on row {}", X, R);
+                    const int k = int(X) - 1;
+                    const bool bS0 = pR->m_bIk ? L.m_IkKeys[k].m_bStep : L.m_Keys[k].m_bStep, bL0 = pR->m_bIk ? L.m_IkKeys[k].m_bLinear : L.m_Keys[k].m_bLinear;
+                    Steps.push_back([=, this] { return Set(iL, std::format("{}[G:{}]/Step", pList, k), bStep ? "true" : "false", bS0 ? "true" : "false"); });
+                    Steps.push_back([=, this] { return Set(iL, std::format("{}[G:{}]/Linear", pList, k), bLin ? "true" : "false", bL0 ? "true" : "false"); });
                 }
                 else if (Op == "delete" && n == 3 && pR->m_bWeight)
                 {
@@ -873,6 +934,11 @@ namespace xanim_package_editor
                 std::sort(Ks.rbegin(), Ks.rend()); Ks.erase(std::unique(Ks.begin(), Ks.end()), Ks.end());
                 for (int k : Ks) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "Keys")), k)); });
             }
+            for (auto& [iL, Ks] : IDeletes)
+            {
+                std::sort(Ks.rbegin(), Ks.rend()); Ks.erase(std::unique(Ks.begin(), Ks.end()), Ks.end());
+                for (int k : Ks) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "IkKeys")), k)); });
+            }
             for (auto& [iL, Ks] : WDeletes)
             {
                 std::sort(Ks.rbegin(), Ks.rend()); Ks.erase(std::unique(Ks.begin(), Ks.end()), Ks.end());
@@ -902,6 +968,16 @@ namespace xanim_package_editor
                     if (O.m_Seg.m_Start < 0) return "a layer cannot start before the clip";
                     if (O.m_Seg.m_End <= O.m_Seg.m_Start) return "a layer needs a length";
                     if (O.m_Seg.m_Offset < 0) return "the layer's source starts at 0";
+                }
+                else if (It->second.m_bIk)
+                {
+                    const int k = int(O.m_Ref.m_Item) - 1;
+                    if (k < 0 || k >= int(L.m_IkKeys.size())) return std::format("no IK key {} on layer '{}'", O.m_Ref.m_Item, L.m_Name);
+                    if (O.m_Seg.m_Start < 0) return "a key cannot be before the clip";
+                    for (int j = 0; j < int(L.m_IkKeys.size()); ++j)
+                        if (j != k && L.m_IkKeys[j].m_Effector == L.m_IkKeys[k].m_Effector && L.m_IkKeys[j].m_Tick == O.m_Seg.m_Start
+                            && std::none_of(Ops.begin(), Ops.end(), [&](const xeditor::timeline::text_op& o) { return o.m_Ref.m_Row == O.m_Ref.m_Row && int(o.m_Ref.m_Item) - 1 == j; }))
+                            return std::format("the IK key of {} would land on another at the same time", L.m_IkKeys[k].m_Effector);
                 }
                 else if (It->second.m_bWeight)
                 {
@@ -1051,6 +1127,18 @@ namespace xanim_package_editor
                     }
                     return;
                 }
+                if (R.m_Type == tl_ik)                 // an effector's IK keys (P = pinned: held until the next key)
+                {
+                    for (int k = 0; k < int(L.m_IkKeys.size()); ++k)
+                    {
+                        const auto& K = L.m_IkKeys[k];
+                        if (K.m_Effector != It->second.m_Bone || (Q.m_bAggregate && (K.m_Tick < Q.m_T0 || K.m_Tick > Q.m_T1))) continue;
+                        tl::item I; I.m_Ref = { R.m_Id, std::uint64_t(k + 1) }; I.m_Kind = tl::item_kind::key; I.m_Seg = { K.m_Tick, K.m_Tick }; I.m_Caps = tl::caps::move | tl::caps::del;
+                        I.m_Label = std::format("IK {}{}{}{}", K.m_Effector, K.m_bPinned ? " (pinned)" : "", K.m_bStep ? " (step)" : "", K.m_bLinear ? " (linear)" : "");
+                        Out.push_back(std::move(I));
+                    }
+                    return;
+                }
                 // a bone of a pose layer: its keys
                 for (int k = 0; k < int(L.m_Keys.size()); ++k)
                 {
@@ -1095,6 +1183,22 @@ namespace xanim_package_editor
                     if (!L.m_WeightKeys.empty()) return;
                     const float y0 = A.m_Min.y + 3, y1 = A.m_Max.y - 3, y = y1 - std::clamp(L.m_Weight, 0.0f, 1.0f) * (y1 - y0);
                     for (float x = A.m_Min.x; x < A.m_Max.x; x += 10) D.AddLine({ x, y }, { std::min(x + 5, A.m_Max.x), y }, IM_COL32(120, 200, 150, 160), 1.5f);
+                    return;
+                }
+                if (R.m_Type == tl_ik)                 // pinned spans: a bar from a pinned key to the next key (or the clip's end)
+                {
+                    auto* pOi = m_S.SelectedOv(); const auto Ii = m_S.m_TLRows.find(R.m_Id);
+                    if (!pOi || Ii == m_S.m_TLRows.end()) return;
+                    std::vector<const xanim_package_desc::layer_ik_key*> Ks;
+                    for (const auto& K : pOi->m_Layers[Ii->second.m_iLayer].m_IkKeys) if (K.m_Effector == Ii->second.m_Bone) Ks.push_back(&K);
+                    std::sort(Ks.begin(), Ks.end(), [](auto* a, auto* b) { return a->m_Tick < b->m_Tick; });
+                    const float y0 = A.m_Min.y + 6, y1 = A.m_Max.y - 6;
+                    for (std::size_t k = 0; k < Ks.size(); ++k)
+                        if (Ks[k]->m_bPinned)
+                        {
+                            const auto t1 = k + 1 < Ks.size() ? Ks[k + 1]->m_Tick : m_S.TLClipTicks();
+                            D.AddRectFilled({ A.X(Ks[k]->m_Tick), y0 }, { A.X(t1), y1 }, IM_COL32(110, 190, 230, 90), 3.0f);
+                        }
                     return;
                 }
                 if (R.m_Type != tl_pose && R.m_Type != tl_bone) return;
@@ -1219,7 +1323,7 @@ namespace xanim_package_editor
         {
             namespace tl = xeditor::timeline;
             static_assert(tl_tps_v == tl::animation_ticks_per_second_v);
-            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType }, { tl_folder, &m_TLRowType }, { tl_group, &m_TLRowType }, { tl_weight, &m_TLRowType } };
+            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType }, { tl_folder, &m_TLRowType }, { tl_group, &m_TLRowType }, { tl_weight, &m_TLRowType }, { tl_ik, &m_TLRowType } };
             tl_document Doc(*this);
             m_iMaskHover = m_iMaskHoverNext; m_iMaskHoverNext = -1;          // last frame's hovered mask chip (the viewport draws before this panel)
             m_TLHeaderBoxes.clear();
@@ -1227,7 +1331,26 @@ namespace xanim_package_editor
             if (auto* pC = SelectedClip(); pC && !m_TLView.m_bFramed) { m_TLView.m_View.m_RateNum = std::max(1, int(pC->m_FPS)); m_TLView.m_View.m_RateDen = 1; }
             m_TLTransport.m_Time = tl::tick(std::llround(double(m_TimeSeconds) * tl_tps_v));
             m_TLTransport.m_bPlaying = m_bPlaying;
-            tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height });
+            // the interval from each selected key (pose or IK) to the next: smooth (the layer's curve), linear or step
+            {
+                std::string Sel; int nSel = 0;
+                for (const auto& r : m_TLView.m_Selection) if (const auto It = m_TLRows.find(r.m_Row); It != m_TLRows.end() && (It->second.m_bIk || (!It->second.m_Bone.empty() && !It->second.m_bWeight))) { Sel += std::format("{} {};", r.m_Row, r.m_Item); ++nSel; }
+                ImGui::BeginDisabled(nSel == 0);
+                ImGui::TextUnformatted("Interval:");
+                for (const char* M : { "smooth", "linear", "step" })
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(M))
+                    {
+                        std::string Ops; std::size_t a = 0;
+                        while (a < Sel.size()) { const auto b = Sel.find(';', a); Ops += std::format("interp {} {}; ", Sel.substr(a, b - a), M); a = b + 1; }
+                        m_TLView.m_Reply = TLRun(Ops);
+                    }
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The selected keys' interval to the next key: smooth (the layer's curve), linear or step (hold)");
+            }
+            tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height - ImGui::GetFrameHeightWithSpacing() });
         }
 
         // LayerTimeline: view state changes (never the descriptor) and the timeline as text (tests read it)
@@ -3542,6 +3665,8 @@ namespace xanim_package_editor
             std::vector<std::pair<int, std::pair<ImVec2, ImVec2>>> m_PinBoxes;   // the pin icons as drawn last frame (handle, box)
             int                                 m_PinHover = -1;
             std::map<int, xmath::fvec3>         m_HandleAt;             // the handles as drawn (drawn space: palm, sole, else the joint)
+            bool                                m_bAutoKey = true;      // edits write keys; off: an edit is a pending pose (shown) that K keys
+            xanimation::pose                    m_PendingPose; bool m_bPending = false; double m_PendingTime = 0;
             bool                                m_bGizmo = true;        // the selected bone's rotate gizmo
             bool                                m_bGizmoUsing = false, m_bGizmoCancelled = false;
             xanimation::pose                    m_GizmoBase; double m_GizmoTime = 0;
@@ -3615,6 +3740,7 @@ namespace xanim_package_editor
 
         bool PoseAt(double Seconds, xanimation::pose& P, std::string& Err) noexcept
         {
+            if (m_PT.m_bPending && std::abs(Seconds - m_PT.m_PendingTime) < 1e-4) { P = m_PT.m_PendingPose; return true; }     // auto-key off: edits build on the pending pose
             const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0;
             if (!SuggestClipFrames(pF, FPS, nF, Err)) return false;
             const int nB = m_PT.m_Rig.count();
@@ -3761,6 +3887,185 @@ namespace xanim_package_editor
             return Out;
         }
 
+        //----------------------------------------------------------------------------------------
+        // Keyframe batch (2026-11-16): a new animation from nothing, IK keys, K / Shift+K, auto-key
+        //----------------------------------------------------------------------------------------
+
+        // An absolute key straight into a layer (no stack below needed: an Override layer's key IS the local rotation; the hips also positioned)
+        void SetAbsoluteKey(int iL, const std::string& Bone, std::int64_t Tick, const xmath::fquat& Q, const xmath::fvec3* pPos) noexcept
+        {
+            const auto& L = SelectedOv()->m_Layers[iL];
+            const int k = int(L.m_Keys.size());
+            SetLayer(iL, "Keys[]", std::to_string(k + 1), std::to_string(k));
+            auto Fd = [&](const char* p) { return std::format("Keys[G:{}]/{}", k, p); };
+            SetLayer(iL, Fd("Tick").c_str(), std::to_string(Tick), "0"); SetLayer(iL, Fd("Bone").c_str(), Bone, "");
+            SetLayer(iL, Fd("X").c_str(), F(Q.m_X), "0"); SetLayer(iL, Fd("Y").c_str(), F(Q.m_Y), "0"); SetLayer(iL, Fd("Z").c_str(), F(Q.m_Z), "0"); SetLayer(iL, Fd("W").c_str(), F(Q.m_W), "1");
+            if (pPos) { SetLayer(iL, Fd("Positioned").c_str(), "true", "false"); SetLayer(iL, Fd("PX").c_str(), F(pPos->m_X), "0"); SetLayer(iL, Fd("PY").c_str(), F(pPos->m_Y), "0"); SetLayer(iL, Fd("PZ").c_str(), F(pPos->m_Z), "0"); }
+        }
+
+        // A clip made from nothing: an import source of the "New animation" kind (the skeleton's rest pose held for its length), its clip, and an
+        // Override Pose layer (no falloff: keys hold) ready for keys; from the playhead: that pose keyed at 0 on every bone. One undo step, then
+        // saved and compiled (the layers need the new clip's source frames).
+        std::string NewClip(std::string Name, double Seconds, int FPS, bool bFromPlayhead) noexcept
+        {
+            auto* pDesc = Desc();
+            if (!pDesc) return "NewClip: nothing loaded";
+            Name = SafeFileName(Name);
+            for (const auto& S : pDesc->m_ImportSources) for (const auto& C : S.m_Clips) if (C.m_Name == Name || C.m_OriginalName == Name) return std::format("NewClip: a clip '{}' exists", Name);
+            std::string Err;
+            if (!PoseRig(Err)) return "NewClip: " + Err;
+            const auto& R = m_PT.m_Rig;
+            xanimation::pose Start;
+            if (bFromPlayhead && !PoseAt(m_TimeSeconds, Start, Err)) return "NewClip: the pose at the playhead: " + Err;
+            const int OldS = m_iSelectedSource, OldC = m_iSelectedDescriptorClip;
+            const int n = int(pDesc->m_ImportSources.size());
+            const auto Base = std::format("AnimPackage/ImportSources[G:{}]/", n);
+            auto E = AsOneStep(std::format("New animation '{}'", Name), [&]() -> std::string
+            {
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote("AnimPackage/ImportSources[]"), xeditor::Quote(std::to_string(n + 1)), xeditor::Quote(std::to_string(n))));
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Type"), xeditor::Quote("New animation (rest pose)")));
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Path"), xeditor::Quote(Name)));
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Seconds"), xeditor::Quote(F(Seconds))));
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "FPS"), xeditor::Quote(std::to_string(FPS))));
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[]"), xeditor::Quote("1")));
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[G:0]/OriginalName"), xeditor::Quote(Name)));
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[G:0]/Name"), xeditor::Quote(Name)));
+                if (Desc()->m_ImportSources.size() != std::size_t(n + 1) || Desc()->m_ImportSources[n].m_Clips.empty()) return "the new source could not be added";
+                m_iSelectedSource = n; m_iSelectedDescriptorClip = 0;
+                const auto A = LayerAdd({}, {}, "Keys", true);
+                if (!A.starts_with("LayerAdd: pose layer")) return A;
+                SetLayer(0, "Mode", "Override", "Additive");          // keys are the pose itself
+                SetLayer(0, "Falloff", "0", "0.5");                     // and hold before the first / after the last
+                if (bFromPlayhead)
+                    for (int b = 0; b < R.count(); ++b)
+                    {
+                        if (!R.m_Owned[b] && b != R.m_Hips) continue;
+                        const auto P = Start.m_Position[b];
+                        SetAbsoluteKey(0, R.m_Names[b], 0, Start.m_Rotation[b], b == R.m_Hips ? &P : nullptr);
+                    }
+                return {};
+            });
+            if (!E.empty()) { m_iSelectedSource = OldS; m_iSelectedDescriptorClip = OldC; return "NewClip: " + E; }
+            (void)m_Undo.Query("Save");
+            (void)m_Undo.Query("Compile");
+            return std::format("NewClip: '{}' ({} s at {} fps, from the {}) is import source {} with a Pose layer (Override, keys hold); saved, compiling", Name, Seconds, FPS, bFromPlayhead ? "pose at the playhead" : "rest pose", n);
+        }
+
+        // An effector's IK key on the top Pose layer at a time: the handle's target (default: where it is now), its rotation (Rot), pinned or not
+        // (default: the handle's pin state in the Pose tool). Replaces a key of that effector at that tick. One undo step.
+        std::string IkKey(const std::string& Effector, double Seconds, const xmath::fvec3* pPos, int PinState, bool bRot, bool bDelete) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "IkKey: " + Err;
+            const auto& R = m_PT.m_Rig;
+            const int b = R.Find(Effector);
+            if (b < 0) return std::format("IkKey: no handle or bone '{}'", Effector);
+            xanimation::pose Cur; if (!PoseAt(Seconds, Cur, Err)) return "IkKey: " + Err;
+            xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(Cur);
+            const auto Pos = pPos ? *pPos : HandleModel(FK, b);
+            const bool bPin = PinState < 0 ? (m_PT.m_Pins.count(b) > 0) : PinState == 1;
+            const auto Rot = FK.WorldRotation(b);
+            const auto Tick = xanim_package_layers::ToTick(Seconds);
+            std::string Out;
+            const auto E = AsOneStep(std::format("IK key {}", R.Name(b)), [&]() -> std::string
+            {
+                const int iL = PoseLayer(Err);
+                if (iL < 0) return Err;
+                const auto& L = SelectedOv()->m_Layers[iL];
+                int k = -1;
+                for (int i = 0; i < int(L.m_IkKeys.size()); ++i) if (L.m_IkKeys[i].m_Effector == R.m_Names[b] && L.m_IkKeys[i].m_Tick == Tick) { k = i; break; }
+                if (bDelete)
+                {
+                    if (k < 0) return std::format("no IK key of {} at {:.3f} s", R.Name(b), Seconds);
+                    xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "IkKeys")), k));
+                    Out = std::format("IkKey: {}'s key at {:.3f} s deleted", R.Name(b), Seconds); return {};
+                }
+                const bool bNew = k < 0;
+                if (bNew) { k = int(L.m_IkKeys.size()); SetLayer(iL, "IkKeys[]", std::to_string(k + 1), std::to_string(k)); }
+                const auto Old = bNew ? xanim_package_desc::layer_ik_key{} : SelectedOv()->m_Layers[iL].m_IkKeys[k];
+                auto Fd = [&](const char* p) { return std::format("IkKeys[G:{}]/{}", k, p); };
+                if (bNew) { SetLayer(iL, Fd("Tick").c_str(), std::to_string(Tick), "0"); SetLayer(iL, Fd("Effector").c_str(), R.m_Names[b], ""); }
+                SetLayer(iL, Fd("PX").c_str(), F(Pos.m_X), F(Old.m_PX)); SetLayer(iL, Fd("PY").c_str(), F(Pos.m_Y), F(Old.m_PY)); SetLayer(iL, Fd("PZ").c_str(), F(Pos.m_Z), F(Old.m_PZ));
+                if (bRot != Old.m_bRotation) SetLayer(iL, Fd("Rotated").c_str(), bRot ? "true" : "false", Old.m_bRotation ? "true" : "false");
+                if (bRot) { SetLayer(iL, Fd("X").c_str(), F(Rot.m_X), F(Old.m_X)); SetLayer(iL, Fd("Y").c_str(), F(Rot.m_Y), F(Old.m_Y)); SetLayer(iL, Fd("Z").c_str(), F(Rot.m_Z), F(Old.m_Z)); SetLayer(iL, Fd("W").c_str(), F(Rot.m_W), F(Old.m_W)); }
+                if (bPin != Old.m_bPinned) SetLayer(iL, Fd("Pinned").c_str(), bPin ? "true" : "false", Old.m_bPinned ? "true" : "false");
+                const auto& At = R.m_AttachB[b];
+                if (At.m_X != Old.m_AX) SetLayer(iL, Fd("AX").c_str(), F(At.m_X), F(Old.m_AX));
+                if (At.m_Y != Old.m_AY) SetLayer(iL, Fd("AY").c_str(), F(At.m_Y), F(Old.m_AY));
+                if (At.m_Z != Old.m_AZ) SetLayer(iL, Fd("AZ").c_str(), F(At.m_Z), F(Old.m_AZ));
+                Out = std::format("IkKey: layer {} key {} {} {} at {:.3f} s: {:.4f} {:.4f} {:.4f}{}{}", iL, k, bNew ? "added" : "replaced", R.Name(b), Seconds, Pos.m_X, Pos.m_Y, Pos.m_Z, bPin ? " pinned" : "", bRot ? " +rotation" : "");
+                return {};
+            });
+            return E.empty() ? Out : "IkKey: " + E;
+        }
+
+        // where a handle is at a time in the composed animation (model space; the gates measure IK keys with it)
+        std::string HandleProbe(const std::string& Effector, double Seconds) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "IkKey: " + Err;
+            const int b = m_PT.m_Rig.Find(Effector);
+            if (b < 0) return std::format("IkKey: no handle or bone '{}'", Effector);
+            xanimation::pose Cur; if (!PoseAt(Seconds, Cur, Err)) return "IkKey: " + Err;
+            xanimation::body_ik FK; FK.Setup(m_PT.m_Rig.m_Par); FK.ComputeWorld(Cur);
+            const auto P = HandleModel(FK, b), H = FK.WorldPosition(m_PT.m_Rig.m_Hips >= 0 ? m_PT.m_Rig.m_Hips : 0);
+            return std::format("IkKey probe {} at {:.4f} s: {:.5f} {:.5f} {:.5f}; hips {:.5f} {:.5f} {:.5f}", m_PT.m_Rig.Name(b), Seconds, P.m_X, P.m_Y, P.m_Z, H.m_X, H.m_Y, H.m_Z);
+        }
+
+        // K: the pending pose (auto-key off), else the selected bone (FK), else the last dragged handle as an IK key. Shift+K: every bone the
+        // top Pose layer already keys (none yet: every bone a drag may turn). The keys hold the pose shown now. One undo step.
+        // auto-key off: the edit is kept as a pending pose, shown, until K keys it (or another edit replaces it)
+        std::string PosePend(const xanimation::pose& P, double Seconds) noexcept
+        {
+            m_TimeSeconds = float(Seconds);                                     // the playhead goes where the pending pose is (it is dropped when the playhead leaves)
+            m_PT.m_PendingPose = P; m_PT.m_bPending = true; m_PT.m_PendingTime = m_TimeSeconds;
+            m_PT.m_Preview = P; m_PT.m_bPreview = true;
+            return "pending: not keyed (auto-key is off): K keys it";
+        }
+
+        std::string KeySelected(double Seconds, bool bAll) noexcept
+        {
+            std::string Err;
+            if (!PoseRig(Err)) return "KeySelected: " + Err;
+            const auto& R = m_PT.m_Rig;
+            if (!bAll && m_PT.m_bPending && std::abs(m_PT.m_PendingTime - Seconds) < 1e-4)
+            {
+                const auto P = m_PT.m_PendingPose; m_PT.m_bPending = false; m_PT.m_bPreview = false;
+                return "KeySelected: the pending pose: " + PoseCommit(P, Seconds, "Key pending pose");
+            }
+            if (!bAll && m_PT.m_FKBone < 0)
+            {
+                if (m_PT.m_LastEff >= 0) return "KeySelected: " + IkKey(R.m_Names[m_PT.m_LastEff], Seconds, nullptr, -1, false, false);
+                return "KeySelected: select a bone (click it) or drag a handle first; Shift+K keys every bone";
+            }
+            xanimation::pose Cur; if (!PoseAt(Seconds, Cur, Err)) return "KeySelected: " + Err;
+            std::vector<int> Bones;
+            int nKeys = 0;
+            const auto E = AsOneStep(bAll ? "Key all" : "Key selected", [&]() -> std::string
+            {
+                const int iL = PoseLayer(Err);
+                if (iL < 0) return Err;
+                if (bAll)
+                {
+                    for (const auto& K : SelectedOv()->m_Layers[iL].m_Keys) { const int b = R.Find(K.m_Bone); if (b >= 0 && std::find(Bones.begin(), Bones.end(), b) == Bones.end()) Bones.push_back(b); }
+                    if (Bones.empty()) for (int b = 0; b < R.count(); ++b) if (R.m_Owned[b] || b == R.m_Hips) Bones.push_back(b);
+                }
+                else Bones.push_back(m_PT.m_FKBone);
+                for (int b : Bones)
+                {
+                    xmath::fquat B; xmath::fvec3 BP;
+                    if (!TransformBelow(iL, b, Seconds, B, BP, Err)) return Err;
+                    const auto Turn = (Cur.m_Rotation[b] * B.ConjugateCopy()).NormalizeCopy();
+                    const auto Move = Cur.m_Position[b] - BP;
+                    const auto Rk = PoseKey(iL, R.m_Names[b], Seconds, Turn, false, b == R.m_Hips ? &Move : nullptr);
+                    if (!Rk.starts_with("PoseKey: layer")) return Rk;
+                    ++nKeys;
+                }
+                return {};
+            });
+            return E.empty() ? std::format("KeySelected: {} key(s) at {:.3f} s ({})", nKeys, Seconds, bAll ? "every bone the layer owns" : R.m_Names[m_PT.m_FKBone]) : "KeySelected: " + E;
+        }
+
         std::string PoseDrag(const std::string& Effector, const xmath::fvec3& MoveCm, const std::string& PinArg, bool bFK, double Seconds, bool bCommit) noexcept
         {
             std::string Err;
@@ -3784,6 +4089,7 @@ namespace xanim_package_editor
             const auto Head = std::format("PoseDrag: {} {} at {:.3f} s: {}; pins [{}] held within {:.3f} cm", bFK ? "FK" : "IK", R.Name(Eff), Seconds, Note, PinText, PinErr);
             if (!bCommit) { m_PT.m_Preview = Out; m_PT.m_bPreview = true; return Head + " (preview only)"; }
             m_PT.m_bPreview = false;
+            if (!m_PT.m_bAutoKey) return Head + "\n" + PosePend(Out, Seconds);         // auto-key off: pending until K
             const auto C = PoseCommit(Out, Seconds, std::format("Pose {} {}", bFK ? "turn" : "drag", R.Name(Eff)));
             return Head + "\n" + C;
         }
@@ -3903,7 +4209,7 @@ namespace xanim_package_editor
                         if ((m_PT.m_Target - m_PT.m_Start).Length() > 1e-5f)
                         {
                             m_PT.m_LastEff = Eff;
-                            const auto R = PoseCommit(P, m_PT.m_Time, std::format("Pose {} {}", m_PT.m_bFK ? "turn" : "drag", m_PT.m_Rig.Name(Eff)));
+                            const auto R = m_PT.m_bAutoKey ? PoseCommit(P, m_PT.m_Time, std::format("Pose {} {}", m_PT.m_bFK ? "turn" : "drag", m_PT.m_Rig.Name(Eff))) : PosePend(P, m_PT.m_Time);
                             if (R.find(" keys on layer ") == std::string::npos) m_PT.m_Note = R;
                             xeditor::LogConsole(std::format("Pose: {} ({})", m_PT.m_Note, R.substr(0, 160)), xeditor::log_source::User);
                         }
@@ -3914,6 +4220,7 @@ namespace xanim_package_editor
             else if (m_PT.m_Hover >= 0 || m_PT.m_PinHover >= 0) m_Viewport.m_bGizmoHot = true;
             if (m_PT.m_bGizmo && m_PT.m_FKBone >= 0 && (ImGuizmo::IsOver() || ImGuizmo::IsUsing() || m_PT.m_bGizmoUsing)) { m_Viewport.m_bGizmoHot = true; if (ImGuizmo::IsUsing()) m_Viewport.m_bGizmoDrag = true; }
             // the previewed pose: a drag, or a Suggest candidate
+            if (m_PT.m_bPending && std::abs(double(m_TimeSeconds) - m_PT.m_PendingTime) > 1e-6) { m_PT.m_bPending = false; if (m_PT.m_Drag < 0 && !m_PT.m_bGizmoUsing) m_PT.m_bPreview = false; m_PT.m_Note = "the pending pose was not keyed (the playhead moved)"; }
             if (m_PT.m_bPreview) PoseToBones(m_PT.m_Preview, m_PT.m_Offset);
             else if (m_PT.m_Cand >= 0 && m_PT.m_Cand < int(m_Suggest.m_Candidates.size()))
             {
@@ -4031,6 +4338,7 @@ namespace xanim_package_editor
             if (m_Viewport.Over() && !ImGui::GetIO().WantTextInput && m_PT.m_Drag < 0)
             {
                 if (ImGui::IsKeyPressed(ImGuiKey_S, false) && !ImGui::GetIO().KeyCtrl) xeditor::LogConsole(PoseSuggest("", m_PT.m_Prompt).substr(0, 300), xeditor::log_source::User);
+                if (ImGui::IsKeyPressed(ImGuiKey_K, false) && !ImGui::GetIO().KeyCtrl) xeditor::LogConsole(KeySelected(m_TimeSeconds, ImGui::GetIO().KeyShift).substr(0, 300), xeditor::log_source::User);
                 if (m_PT.m_Cand >= 0)
                 {
                     if (ImGui::IsKeyPressed(ImGuiKey_Tab, false) && !m_Suggest.m_Candidates.empty()) m_PT.m_Cand = (m_PT.m_Cand + 1) % int(m_Suggest.m_Candidates.size());
@@ -4085,7 +4393,7 @@ namespace xanim_package_editor
                 if (m_PT.m_bPreview)
                 {
                     const auto P = m_PT.m_Preview; m_PT.m_bPreview = false;
-                    const auto C = PoseCommit(P, m_PT.m_GizmoTime, std::format("Pose rotate {}", R.m_Names[b]));
+                    const auto C = m_PT.m_bAutoKey ? PoseCommit(P, m_PT.m_GizmoTime, std::format("Pose rotate {}", R.m_Names[b])) : PosePend(P, m_PT.m_GizmoTime);
                     m_PT.m_Note = C.find(" keys on layer ") != std::string::npos ? std::format("{} turned", R.m_Names[b]) : C;
                     xeditor::LogConsole(std::format("Pose: {} ({})", m_PT.m_Note, C.substr(0, 160)), xeditor::log_source::User);
                 }
@@ -4121,6 +4429,14 @@ namespace xanim_package_editor
             ImGui::SameLine(); ImGui::TextDisabled("Pins:");
             Preset("Feet", { R.m_LF, R.m_RF }); Preset("Hands", { R.m_LH, R.m_RH }); Preset("Both", { R.m_LF, R.m_RF, R.m_LH, R.m_RH }); Preset("None", {});
             ImGui::SameLine(); ImGui::Checkbox("Auto feet", &m_PT.m_bAutoPins);
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, m_PT.m_bAutoKey ? IM_COL32(170, 40, 40, 255) : IM_COL32(70, 70, 70, 255));
+            if (ImGui::SmallButton(m_PT.m_bAutoKey ? "Auto-key" : "Auto-key off")) { m_PT.m_bAutoKey = !m_PT.m_bAutoKey; if (m_PT.m_bAutoKey) m_PT.m_bPending = false; }
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("Auto-key (red): every edit writes keys at the playhead.\nOff: an edit is a pending pose (shown) that K keys; moving the playhead drops it.\nK: key the selected bone (or the last dragged handle as an IK key); Shift+K: every bone the layer keys.");
+            ImGui::SameLine(); if (ImGui::SmallButton("Key (K)")) xeditor::LogConsole(KeySelected(m_TimeSeconds, false).substr(0, 300), xeditor::log_source::User);
+            ImGui::SameLine(); if (ImGui::SmallButton("Key IK")) { if (m_PT.m_LastEff >= 0) xeditor::LogConsole(IkKey(m_PT.m_Rig.m_Names[m_PT.m_LastEff], m_TimeSeconds, nullptr, -1, false, false).substr(0, 300), xeditor::log_source::User); else m_PT.m_Note = "drag a handle first: Key IK keys its target"; }
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("An IK key for the last dragged handle: its target (and pin) at the playhead; between IK keys the body is solved on every frame");
             ImGui::SameLine(); if (ImGui::SmallButton("Mirror")) xeditor::LogConsole(PoseMirror(m_TimeSeconds).substr(0, 300), xeditor::log_source::User);
             ImGui::SameLine(); if (ImGui::SmallButton("Copy")) { xanimation::pose P; if (PoseAt(m_TimeSeconds, P, Err)) { m_PT.m_Copy.resize(P.count()); for (int b = 0; b < P.count(); ++b) m_PT.m_Copy[b] = P.get(b); } }
             ImGui::SameLine(); ImGui::BeginDisabled(m_PT.m_Copy.empty()); if (ImGui::SmallButton("Paste")) xeditor::LogConsole(PosePasteAt(m_TimeSeconds).substr(0, 300), xeditor::log_source::User); ImGui::EndDisabled();
@@ -4844,6 +5160,42 @@ namespace xanim_package_editor
             double T = S.m_TimeSeconds;
             if (xeditor::cmd_util::GetArg(m_Parser, m_hE, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "PoseDrag: -Time is seconds";
             return S.PoseDrag(Eff, M, Pins, Only == "1" || Only == "true", T, !(Commit == "0" || Commit == "false"));
+        }
+        case kind::new_clip:
+        {
+            std::string Name, Sec, Fps, From; double Seconds = 2; int FPS = 30;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Name);
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Sec) && (std::from_chars(Sec.data(), Sec.data() + Sec.size(), Seconds).ec != std::errc() || !(Seconds > 0))) return "NewClip: -Seconds > 0";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hC, Fps) && (std::from_chars(Fps.data(), Fps.data() + Fps.size(), FPS).ec != std::errc() || FPS < 1 || FPS > 240)) return "NewClip: -FPS 1..240";
+            xeditor::cmd_util::GetArg(m_Parser, m_hD, From);
+            if (!From.empty() && From != "rest" && From != "playhead") return "NewClip: -FromPose rest|playhead";
+            return S.NewClip(Name, Seconds, FPS, From == "playhead");
+        }
+        case kind::ik_key:
+        {
+            std::string Eff, Time, Pos, Pin, Rot, Del; double T = S.m_TimeSeconds;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Eff);
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "IkKey: -Time is seconds";
+            xmath::fvec3 P; const bool bPos = xeditor::cmd_util::GetArg(m_Parser, m_hC, Pos);
+            if (bPos && std::sscanf(Pos.c_str(), "%f %f %f", &P.m_X, &P.m_Y, &P.m_Z) != 3) return "IkKey: -Pos \"x y z\"";
+            int PinState = -1; if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Pin)) PinState = (Pin == "1" || Pin == "true") ? 1 : 0;
+            xeditor::cmd_util::GetArg(m_Parser, m_hE, Rot); xeditor::cmd_util::GetArg(m_Parser, m_hF, Del);
+            if (std::string Probe; xeditor::cmd_util::GetArg(m_Parser, m_hG, Probe) && (Probe == "1" || Probe == "true")) return S.HandleProbe(Eff, T);
+            return S.IkKey(Eff, T, bPos ? &P : nullptr, PinState, Rot == "1" || Rot == "true", Del == "1" || Del == "true");
+        }
+        case kind::key_selected:
+        {
+            std::string All, Time; double T = S.m_TimeSeconds;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, All);
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "KeySelected: -Time is seconds";
+            return S.KeySelected(T, All == "1" || All == "true");
+        }
+        case kind::auto_key:
+        {
+            std::string On; xeditor::cmd_util::GetArg(m_Parser, m_hA, On);
+            S.m_PT.m_bAutoKey = On == "1" || On == "true";
+            if (S.m_PT.m_bAutoKey) S.m_PT.m_bPending = false;
+            return std::format("AutoKey: {}", S.m_PT.m_bAutoKey ? "on (edits write keys)" : "off (an edit is a pending pose; K keys it)");
         }
         case kind::pose_pin:
         {

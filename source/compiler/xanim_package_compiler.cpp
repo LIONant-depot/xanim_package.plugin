@@ -67,6 +67,26 @@ namespace xanim_package_compiler
                     if (auto Err = LoadPackageSource(Source); Err) return Err;
                     continue;
                 }
+                if (Source.bNew())      // a clip made from nothing: the skeleton's rest pose held for its length, already in skeleton space
+                {
+                    const auto& Bones = m_Descriptor.m_ResolvedSkeletonBones.m_Bones;
+                    if (Bones.empty()) return xerr::create_f<state, "A new animation needs the package's skeleton (compile the skeleton first)">();
+                    xraw3d::anim A;
+                    A.m_Name = xstrtool::To(Source.m_Path); A.m_FPS = Source.m_FPS;
+                    A.m_nFrames = std::max(2, static_cast<int>(std::lround(double(Source.m_Seconds) * Source.m_FPS)) + 1);
+                    A.m_Bone.resize(Bones.size());
+                    for (std::size_t b = 0; b < Bones.size(); ++b) { A.m_Bone[b] = {}; A.m_Bone[b].m_Name = Bones[b].m_Name; A.m_Bone[b].m_iParent = Bones[b].m_iParent; }
+                    A.m_KeyFrame.resize(static_cast<std::size_t>(A.m_nFrames) * Bones.size());
+                    for (int f = 0; f < A.m_nFrames; ++f)
+                        for (std::size_t b = 0; b < Bones.size(); ++b)
+                        {
+                            auto& K = A.m_KeyFrame[static_cast<std::size_t>(f) * Bones.size() + b];
+                            K.m_Position = Bones[b].m_RestPosition; K.m_Scale = Bones[b].m_RestScale;
+                            K.m_Rotation = xmath::fquat(Bones[b].m_RestRotX, Bones[b].m_RestRotY, Bones[b].m_RestRotZ, Bones[b].m_RestRotW).NormalizeSafeCopy();
+                        }
+                    m_RawClips.push_back(raw_clip{ .m_Anim = std::move(A), .m_SourceFile = Source.key(), .m_bInSkeletonSpace = true });
+                    continue;
+                }
                 xraw3d::assimp_v3::importer             Importer;
                 xraw3d::assimp_v3::importer::settings   Settings;
                 xraw3d::geom                             GeomScratch;
