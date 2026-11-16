@@ -186,6 +186,7 @@ namespace xanim_package_editor
                 m_hE = m_Parser.addOption("Rot",      "1: key its rotation too (default 0)", false, 1);
                 m_hF = m_Parser.addOption("Delete",   "1: delete the effector's IK key at that time", false, 1);
                 m_hG = m_Parser.addOption("Probe",    "1: only report where the handle is at that time (model space, the composed animation), no key", false, 1);
+                m_hH = m_Parser.addOption("Prop",     "A preview prop's name (the description's PreviewProps): the target is that prop's centre at that time (a foot on the ball)", false, 1);
                 break;
             case kind::key_selected:
                 m_hA = m_Parser.addOption("All",  "1: every bone the layer owns (Shift+K), else the selected bone or handle (K)", false, 1);
@@ -4244,6 +4245,24 @@ namespace xanim_package_editor
             return E.empty() ? Out : "IkKey: " + E;
         }
 
+        // where a preview prop's centre is at a time (model space, the composed animation: a prop a bone holds moves with it); IK keys aim at it
+        bool PropAt(const std::string& Name, double Seconds, xmath::fvec3& Out, std::string& Err) noexcept
+        {
+            auto* pDesc = Desc();
+            if (!pDesc) { Err = "no description"; return false; }
+            const xanim_package_desc::preview_prop* pP = nullptr;
+            for (const auto& P : pDesc->m_PreviewProps) if (P.m_Name == Name) { pP = &P; break; }
+            if (!pP) { Err = std::format("no preview prop '{}' (the description's PreviewProps)", Name); return false; }
+            if (pP->m_Bone.empty()) { Out = pP->m_Offset; return true; }
+            if (!PoseRig(Err)) return false;
+            const int b = m_PT.m_Rig.Find(pP->m_Bone);
+            if (b < 0) { Err = std::format("prop '{}': no bone '{}'", Name, pP->m_Bone); return false; }
+            xanimation::pose Cur; if (!PoseAt(Seconds, Cur, Err)) return false;
+            xanimation::body_ik FK; FK.Setup(m_PT.m_Rig.m_Par); FK.ComputeWorld(Cur);
+            Out = FK.WorldPosition(b) + FK.WorldRotation(b) * pP->m_Offset;
+            return true;
+        }
+
         // where a handle is at a time in the composed animation (model space; the gates measure IK keys with it)
         std::string HandleProbe(const std::string& Effector, double Seconds) noexcept
         {
@@ -5502,6 +5521,12 @@ namespace xanim_package_editor
             int PinState = -1; if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Pin)) PinState = (Pin == "1" || Pin == "true") ? 1 : 0;
             xeditor::cmd_util::GetArg(m_Parser, m_hE, Rot); xeditor::cmd_util::GetArg(m_Parser, m_hF, Del);
             if (std::string Probe; xeditor::cmd_util::GetArg(m_Parser, m_hG, Probe) && (Probe == "1" || Probe == "true")) return S.HandleProbe(Eff, T);
+            if (std::string Prop; xeditor::cmd_util::GetArg(m_Parser, m_hH, Prop))
+            {
+                if (bPos) return "IkKey: -Pos or -Prop, not both";
+                std::string E; if (!S.PropAt(Prop, T, P, E)) return "IkKey: " + E;
+                return S.IkKey(Eff, T, &P, PinState, Rot == "1" || Rot == "true", Del == "1" || Del == "true") + std::format(" (at prop '{}')", Prop);
+            }
             return S.IkKey(Eff, T, bPos ? &P : nullptr, PinState, Rot == "1" || Rot == "true", Del == "1" || Del == "true");
         }
         case kind::key_selected:
