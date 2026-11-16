@@ -55,7 +55,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check };
 
         session&    m_Session;
         kind        m_Kind;
@@ -150,6 +150,24 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Accept", "A candidate's index: written as keys (one undo step, with Refine Motion)", false, 1);
                 m_hD = m_Parser.addOption("Show",   "A candidate's index to preview (Tab in the viewport), or -1: none (Esc)", false, 1);
                 break;
+            case kind::kimodo_layer_add:
+                m_hA = m_Parser.addOption("Prompt",  "What the motion is, in words", true, 1);
+                m_hB = m_Parser.addOption("Seconds", "Its length (0.5 .. 10: one take; default 2)", false, 1);
+                m_hC = m_Parser.addOption("Start",   "Where it starts in the clip, seconds (default: the playhead)", false, 1);
+                m_hD = m_Parser.addOption("Seed",    "Seed (default 1)", false, 1);
+                m_hE = m_Parser.addOption("Name",    "The layer's name", false, 1);
+                break;
+            case kind::kimodo_regenerate:
+                m_hA = m_Parser.addOption("Layer", "The Kimodo layer's index in the selected clip", true, 1);
+                m_hB = m_Parser.addOption("Seeds", "\"1 2 3\": one candidate per seed (alternatives); default: the layer's seed", false, 1);
+                break;
+            case kind::kimodo_accept_candidate: m_hA = m_Parser.addOption("Candidate", "Which candidate (default 0)", false, 1); break;
+            case kind::kimodo_show:             m_hA = m_Parser.addOption("Candidate", "A candidate to preview at the playhead, -1: none", true, 1); break;
+            case kind::bake_to_pose:
+                m_hA = m_Parser.addOption("Layer", "The Kimodo layer's index", true, 1);
+                m_hB = m_Parser.addOption("Every", "A key every N frames (default 1: every frame)", false, 1);
+                break;
+            case kind::kimodo_takes_to_layers:  m_hA = m_Parser.addOption("Layer", "The Pose layer whose stored takes become Kimodo layers", true, 1); break;
             default: break;
             }
         }
@@ -191,6 +209,9 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck;
+        // the last accepted candidate (its frames on this skeleton): KimodoTakeCheck compares the compiled take with it
+        std::uint64_t m_KAcceptedLayer = 0; std::vector<xmath::transform3> m_KAcceptedFrames; int m_KAcceptedW = 0;
 
         // Layers (the layered edit mode): the compiler's layer-sources cache, the selected clip's live composition (same function as the compile)
         std::vector<xanim_package_layers::source_frames> m_LayerSources;
@@ -325,6 +346,13 @@ namespace xanim_package_editor
             , m_PoseCopy   (m_Undo, *this, playback_cmd::kind::pose_copy,   "PoseCopy",   "Copies the pose at a time (editor clipboard). Usage: PoseCopy [-Time s]")
             , m_PosePaste  (m_Undo, *this, playback_cmd::kind::pose_paste,  "PosePaste",  "Pastes the copied pose at a time, as keys (one undo step). Usage: PosePaste [-Time s]")
             , m_PoseSuggest(m_Undo, *this, playback_cmd::kind::pose_suggest,"PoseSuggest","Suggest Pose for the current handles (the pins and the last dragged handle held) at the playhead: candidates; -Show previews one; -Accept writes it (one step, Refine Motion). Usage: PoseSuggest [-Seeds \"1 2 3\"] [-Prompt text] | -Show i | -Accept i")
+            , m_KimodoLayerAdd       (m_Undo, *this, playback_cmd::kind::kimodo_layer_add,        "KimodoLayerAdd",       "Adds a Kimodo layer (a generated take as a layer: no take yet, it plays nothing until a candidate is accepted). Usage: KimodoLayerAdd -Prompt text [-Seconds 2] [-Start s] [-Seed 1] [-Name text]")
+            , m_KimodoRegenerate     (m_Undo, *this, playback_cmd::kind::kimodo_regenerate,       "KimodoRegenerate",     "Generates the Kimodo layer's take from its request and the stack below (stated constraints): CANDIDATES (nothing written); several seeds = alternatives. Usage: KimodoRegenerate -Layer n [-Seeds \"1 2 3\"]")
+            , m_KimodoAcceptCandidate(m_Undo, *this, playback_cmd::kind::kimodo_accept_candidate, "KimodoAcceptCandidate","Makes a candidate the layer's take (one undo step; the earlier take stays on disk), then saves and compiles. Usage: KimodoAcceptCandidate [-Candidate i]")
+            , m_KimodoShow           (m_Undo, *this, playback_cmd::kind::kimodo_show,             "KimodoShow",           "Previews a Kimodo candidate at the playhead (-1: none). Usage: KimodoShow -Candidate i")
+            , m_BakeToPose           (m_Undo, *this, playback_cmd::kind::bake_to_pose,            "BakeToPose",           "Turns a Kimodo layer into an editable Pose layer (keys of what the clip plays over its span); the Kimodo layer goes off, its take is kept; one undo step. Usage: BakeToPose -Layer n [-Every 1]")
+            , m_KimodoTakesToLayers  (m_Undo, *this, playback_cmd::kind::kimodo_takes_to_layers,  "KimodoTakesToLayers",  "A Pose layer's stored takes (from the refine) as Kimodo layers with their requests, off (idempotent). Usage: KimodoTakesToLayers -Layer n")
+            , m_KimodoTakeCheck      (m_Undo, *this, playback_cmd::kind::kimodo_take_check,       "KimodoTakeCheck",      "The compiled take of the last accepted Kimodo candidate against the candidate itself (every frame, every bone). Usage: KimodoTakeCheck")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
             // Reading the descriptor also cross-checks the skeleton's compiled bone list: not having it yet does not make the clips unusable
@@ -575,7 +603,7 @@ namespace xanim_package_editor
                     R.m_Depth = Depth;
                     R.m_Name = L.m_Name.empty() ? "(unnamed)" : L.m_Name;     // weight, mode and mask are the row's header widgets
                     R.m_bMute = !L.m_bEnabled || bMuteUp; R.m_bLock = L.m_bLock || bLockUp;
-                    R.m_Color = bPose ? IM_COL32(210, 150, 70, 255) : bFolder ? IM_COL32(150, 150, 110, 255) : bGroup ? IM_COL32(140, 110, 190, 255) : IM_COL32(86, 132, 210, 255);
+                    R.m_Color = bPose ? IM_COL32(210, 150, 70, 255) : bFolder ? IM_COL32(150, 150, 110, 255) : bGroup ? IM_COL32(140, 110, 190, 255) : L.m_Kind == kind::KIMODO ? IM_COL32(70, 170, 160, 255) : IM_COL32(86, 132, 210, 255);
                     std::vector<std::string> Bones;
                     if (bPose) { for (const auto& K : L.m_Keys) if (std::find(Bones.begin(), Bones.end(), K.m_Bone) == Bones.end()) Bones.push_back(K.m_Bone); std::sort(Bones.begin(), Bones.end()); }
                     const bool bContainer = bFolder || bGroup;
@@ -733,7 +761,7 @@ namespace xanim_package_editor
                 if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
                 if (O.m_Kind == 's')
                 {
-                    if (L.m_Kind != xanim_package_desc::layer_kind::CLIP) return "only clip layers have segments";
+                    if (L.m_Kind != xanim_package_desc::layer_kind::CLIP && L.m_Kind != xanim_package_desc::layer_kind::KIMODO) return "only clip and Kimodo layers have segments";
                     if (O.m_Seg.m_Start < 0) return "a layer cannot start before the clip";
                     if (O.m_Seg.m_End <= O.m_Seg.m_Start) return "a layer needs a length";
                     if (O.m_Seg.m_Offset < 0) return "the layer's source starts at 0";
@@ -827,7 +855,7 @@ namespace xanim_package_editor
                     // trim and slip map timeline ticks onto source ticks one to one: only at rate 1, forward (else the layer moves only)
                     const bool bPlain = L.m_Rate == 1.0 && !L.m_bReverse;
                     I.m_Caps = tl::caps::move | (bPlain ? (tl::caps::trim | tl::caps::slip) : 0u);
-                    I.m_Label = L.m_SourceClip.empty() ? L.m_Name : L.m_SourceClip;
+                    I.m_Label = L.m_Kind == xanim_package_desc::layer_kind::KIMODO ? m_S.KimodoLabel(L) : (L.m_SourceClip.empty() ? L.m_Name : L.m_SourceClip);
                     if (!Q.m_bAggregate || (I.m_Seg.m_End >= Q.m_T0 && I.m_Seg.m_Start <= Q.m_T1)) Out.push_back(std::move(I));
                     return;
                 }
@@ -858,6 +886,7 @@ namespace xanim_package_editor
             // a pose layer's falloff: shaded ramps before its first key and after its last
             void Overlay(const xeditor::timeline::row_desc& R, ImDrawList& D, const xeditor::timeline::draw_args& A) override
             {
+                if (R.m_Type == tl_clip) { m_S.KimodoOverlay(R, D, A); return; }
                 if (R.m_Type != tl_pose && R.m_Type != tl_bone) return;
                 auto* pOv = m_S.SelectedOv(); const auto It = m_S.m_TLRows.find(R.m_Id);
                 if (!pOv || It == m_S.m_TLRows.end()) return;
@@ -1312,6 +1341,7 @@ namespace xanim_package_editor
                 if (!L.m_SharedMask.empty()) T += std::format(" shared-mask '{}'", L.m_SharedMask);
                 T += "\n";
                 if (L.m_Kind == xanim_package_desc::layer_kind::POSE) T += std::format("    {} curve, falloff {:.2f} s\n", L.m_bSmooth ? "smooth" : "linear", L.m_Falloff);
+                if (L.m_Kind == xanim_package_desc::layer_kind::KIMODO) T += "    kimodo: " + KimodoLabel(L) + "\n";
                 if (L.m_Kind == xanim_package_desc::layer_kind::POSE)
                     for (const auto& K : L.m_Keys)
                     {
@@ -1397,6 +1427,27 @@ namespace xanim_package_editor
             ImGui::SameLine();
             if (ImGui::Button("+ Pose layer")) LayerAdd({}, {}, {}, true);
             if (ImGui::IsItemHovered()) xeditor::hint::Text("A layer of keyed poses (additive: each key turns the bone on top of the layers below).\nKeys: the PoseKey command (the gizmo comes next).");
+            ImGui::SameLine();
+            if (ImGui::Button("+ Kimodo layer")) xeditor::LogConsole(KimodoLayerAdd(m_K.m_Prompt, 2.0, m_TimeSeconds, 1, {}), xeditor::log_source::User);
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("A generated take as a layer: 2 s at the playhead, the prompt of the Kimodo tab.\nRegenerate makes candidates from the layers below; Accept makes one its take.");
+            // the selected Kimodo layer: its states and its actions
+            if (m_iLayer >= 0 && m_iLayer < int(pOv->m_Layers.size()) && pOv->m_Layers[m_iLayer].m_Kind == xanim_package_desc::layer_kind::KIMODO)
+            {
+                const auto& KL = pOv->m_Layers[m_iLayer];
+                ImGui::TextWrapped("Kimodo layer '%s': %s", KL.m_Name.c_str(), KimodoLabel(KL).c_str());
+                if (ImGui::Button("Regenerate")) xeditor::LogConsole(KimodoRegenerate(m_iLayer, {}).substr(0, 400), xeditor::log_source::User);
+                ImGui::SameLine();
+                if (ImGui::Button("Alternatives")) xeditor::LogConsole(KimodoRegenerate(m_iLayer, std::format("{} {} {}", KL.m_Seed, KL.m_Seed + 1, KL.m_Seed + 2)).substr(0, 400), xeditor::log_source::User);
+                if (m_KL.m_LayerId == KL.m_Id && m_KL.m_Job == "candidate")
+                    for (int c = 0; c < int(m_KL.m_Cands.size()); ++c)
+                    {
+                        ImGui::PushID(1000 + c);
+                        if (ImGui::RadioButton(std::format("seed {} (seam {:.1f} cm)", m_KL.m_Cands[c].m_Seed, m_KL.m_Cands[c].m_SeamCm).c_str(), m_KL.m_iShow == c)) m_KL.m_iShow = c;
+                        ImGui::SameLine(); if (ImGui::SmallButton("Accept")) xeditor::LogConsole(KimodoAcceptCandidate(c), xeditor::log_source::User);
+                        ImGui::PopID();
+                    }
+                if (!KL.m_SourceKey.empty()) { if (ImGui::Button("Bake to Pose layer")) xeditor::LogConsole(BakeToPose(m_iLayer, 1), xeditor::log_source::User); }
+            }
 
             constexpr ImGuiTableFlags TF = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit;
             const int n = int(pOv->m_Layers.size());
@@ -1804,6 +1855,458 @@ namespace xanim_package_editor
                 }
             xanimation::ToSkeletonSpace(Gen, nSrc, KS.m_iRoot, KS.m_Post, KS.m_Pre);
             return xanimation::BakeFrames(Ctx.m_Retargeter, xanimation::clip_view{ Gen, nSrc, B.m_nFrames, 30, false }, nB);
+        }
+
+        //----------------------------------------------------------------------------------------
+        // Kimodo layers (timeline T4): a layer whose motion is a generated take. Its accepted take is an import source (as KimodoAccept writes:
+        // the BVH in the Kimodo folder, retargeted by the compile; its clip entry Delete: a layer source, not an output clip) sampled exactly
+        // like a Clip layer; with none yet it contributes nothing. Its request (prompt, seed, steps, its span) makes the take; AcceptedSig =
+        // the request when the take was accepted (request relation: matches or changed). Generation makes CANDIDATES (session only) until
+        // KimodoAcceptCandidate. Three independent states: the accepted take, the request relation, the job.
+        // Constraints rule (stated in every request): full-body poses of the stack below the layer at the segment's first and last frame and
+        // at every Pose-layer key time inside it (at most 16), and the root path of the stack below over the whole segment.
+        //----------------------------------------------------------------------------------------
+        struct kimodo_layer_cand { int m_Seed = 1; std::wstring m_Bvh; std::vector<xmath::transform3> m_Frames; float m_SeamCm = 0; double m_Ms = 0; };
+        struct kimodo_layer_state
+        {
+            std::uint64_t                   m_LayerId = 0;
+            std::string                     m_Sig;              // the clip's layers when the candidates were made (stale after any layer edit)
+            std::string                     m_ReqSig;           // the layer's request then
+            kimodo_space                    m_KS;
+            std::int64_t                    m_Start = 0;        // the candidates' frame 0 (clip ticks)
+            int                             m_W = 0;            // frames (30 fps)
+            std::vector<kimodo_layer_cand>  m_Cands;
+            int                             m_iShow = -1;
+            std::string                     m_Job = "idle";     // idle, candidate, failed (generation runs blocking)
+            std::string                     m_LastError;
+        } m_KL;
+
+        static std::string KimodoReqSig(const xanim_package_desc::clip_layer& L)
+        {
+            return std::format("{}|{}|{}|{:.3f}|{}|{}", L.m_Prompt, L.m_Seed, L.m_Steps, L.m_Seconds, L.m_Start, L.m_End);
+        }
+        std::string KimodoStatus(const xanim_package_desc::clip_layer& L) noexcept
+        {
+            std::string S = L.m_SourceKey.empty() ? "no take" : FindLayerSource(L.m_SourceKey, L.m_SourceClip) ? "take " + std::filesystem::path(L.m_SourceKey).stem().string() : "take not compiled yet";
+            if (!L.m_SourceKey.empty()) S += KimodoReqSig(L) == L.m_AcceptedSig ? ", matches its request" : ", request changed";
+            if (L.m_Id && m_KL.m_LayerId == L.m_Id)
+            {
+                if (m_KL.m_Job == "candidate") S += std::format(", {} candidate(s){}", m_KL.m_Cands.size(), m_KL.m_Sig == LayersSigNow() ? "" : " (stale)");
+                if (m_KL.m_Job == "failed") S += ", generation failed: " + m_KL.m_LastError;
+            }
+            return S;
+        }
+        std::string KimodoLabel(const xanim_package_desc::clip_layer& L) noexcept
+        {
+            return std::format("\"{}\" - {}", L.m_Prompt.empty() ? "(no prompt)" : L.m_Prompt, KimodoStatus(L));
+        }
+        std::string LayersSigNow() noexcept { auto* pOv = SelectedOv(); return pOv ? std::format("{}:{}:{}", m_iSelectedSource, m_iSelectedDescriptorClip, LayerSignature(*pOv)) : std::string{}; }
+
+        // a Kimodo row: hatched while it has no take or its request changed since the take; the candidates' span outlined
+        void KimodoOverlay(const xeditor::timeline::row_desc& R, ImDrawList& D, const xeditor::timeline::draw_args& A) noexcept
+        {
+            auto* pOv = SelectedOv(); const auto It = m_TLRows.find(R.m_Id);
+            if (!pOv || It == m_TLRows.end()) return;
+            const auto& L = pOv->m_Layers[It->second.m_iLayer];
+            if (L.m_Kind != xanim_package_desc::layer_kind::KIMODO) return;
+            const auto T0 = L.m_Start, T1 = L.m_End >= 0 ? L.m_End : TLClipTicks();
+            const float y0 = A.m_Min.y + 3, y1 = A.m_Max.y - 3, x0 = A.X(T0), x1 = A.X(T1);
+            if (L.m_SourceKey.empty() || KimodoReqSig(L) != L.m_AcceptedSig)
+            {
+                D.PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1), true);
+                for (float x = x0 - (y1 - y0); x < x1; x += 7) D.AddLine(ImVec2(x, y1), ImVec2(x + (y1 - y0), y0), IM_COL32(255, 255, 255, 60));
+                D.PopClipRect();
+            }
+            if (L.m_Id && m_KL.m_LayerId == L.m_Id && m_KL.m_Job == "candidate" && m_KL.m_W > 1)
+            {
+                const auto C1 = m_KL.m_Start + std::int64_t(std::llround(double(m_KL.m_W - 1) / 30.0 * 6000.0));
+                D.AddRect(ImVec2(A.X(m_KL.m_Start), y0 - 2), ImVec2(A.X(C1), y1 + 2), IM_COL32(120, 220, 255, 220), 2.0f, 0, 2.0f);
+            }
+        }
+
+        // the stack as layer iLayer sees it (inside a group: the group's own sub-stack), every frame of the clip
+        bool StackFramesFor(int iLayer, std::vector<xmath::transform3>& Out, int& FPS, int& nF, std::string& Error) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pS = SelectedSource(); auto* pDesc = Desc();
+            const auto* pBase = (pOv && pS) ? FindLayerSource(pS->key(), pOv->m_OriginalName) : nullptr;
+            if (!pBase) { Error = "this clip is not in the layer sources: compile the package"; return false; }
+            auto FindSrc = [this](const std::wstring& K, const std::string& C) { return FindLayerSource(K, C); };
+            std::vector<xmath::transform3> Full; xanim_package_layers::report R;
+            Out.clear();
+            // the layer itself must not count: compose with it disabled, ask for what it would see
+            xanim_package_desc::clip Tmp = *pOv;
+            Tmp.m_Layers[iLayer].m_SourceKey.clear();
+            if (!xanim_package_layers::Compose(*pBase, Tmp, pDesc->m_ResolvedSkeletonBones, FindSrc, Full, R, Error, &Tmp.m_Layers[iLayer], &Out)) return false;
+            if (Out.empty()) { xanim_package_desc::clip Below = *pOv; Below.m_Layers.resize(iLayer); if (!xanim_package_layers::Compose(*pBase, Below, pDesc->m_ResolvedSkeletonBones, FindSrc, Out, R, Error)) return false; }
+            FPS = std::max(1, pBase->m_FPS); nF = pBase->m_nFrames;
+            return true;
+        }
+
+        // an edit made straight on the descriptor, then recorded as ONE undo step (a snapshot edit); nothing changed: no step
+        std::string DirectOneStep(const std::string& Label, const std::function<std::string(desc&)>& Fn) noexcept
+        {
+            auto* pDesc = Desc();
+            if (!pDesc) return "nothing loaded";
+            xproperty::settings::context C;
+            auto Snap = [&] { return xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C); };
+            const auto Before = Snap();
+            if (auto Err = Fn(*pDesc); !Err.empty()) { xproperty::ui::undo::ApplySnapshotFromString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), Before, C); return Err; }
+            const auto After = Snap();
+            if (After == Before) return "no change";
+            xproperty::ui::undo::ApplySnapshotFromString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), Before, C);
+            return m_Undo.Execute(std::format("SnapshotEdit -Label {} -Before {} -After {}", xeditor::Quote(Label), xeditor::Quote(Before), xeditor::Quote(After)));
+        }
+        static std::uint64_t NextLayerId(const desc& D) noexcept
+        {
+            std::uint64_t Id = 1;
+            for (const auto& S : D.m_ImportSources) for (const auto& C : S.m_Clips) for (const auto& L : C.m_Layers) Id = std::max(Id, L.m_Id + 1);
+            return Id;
+        }
+
+        std::string KimodoLayerAdd(const std::string& Prompt, double Seconds, double StartS, int Seed, std::string Name) noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) return "KimodoLayerAdd: select a clip first (SelectClip)";
+            if (Seconds < 0.5 || Seconds > 10.0) return "KimodoLayerAdd: -Seconds is 0.5 .. 10 (one Kimodo take; a longer motion is several Kimodo layers, e.g. in a folder)";
+            const int n = int(pOv->m_Layers.size());
+            if (Name.empty()) Name = std::format("Kimodo {}", n);
+            const auto T0 = std::int64_t(std::llround(std::max(0.0, StartS) * 6000.0)), T1 = T0 + std::int64_t(std::llround(Seconds * 6000.0));
+            std::uint64_t Id = 0;
+            const auto E = DirectOneStep(std::format("Add Kimodo layer '{}'", Name), [&](desc& D) -> std::string
+            {
+                auto* pO = SelectedOv();
+                Id = NextLayerId(D);
+                auto& L = pO->m_Layers.emplace_back();
+                L.m_Id = Id; L.m_Name = Name; L.m_Kind = xanim_package_desc::layer_kind::KIMODO; L.m_Mode = xanim_package_desc::layer_mode::OVERRIDE;
+                L.m_Start = T0; L.m_End = T1; L.m_Prompt = Prompt; L.m_Seed = Seed; L.m_Seconds = float(Seconds); L.m_Steps = 25;
+                L.m_bRotation = true; L.m_bPosition = true;             // the take's hips height comes with it (the root still follows the stack below)
+                return {};
+            });
+            if (!E.empty()) return "KimodoLayerAdd: " + E;
+            m_iLayer = n;
+            return std::format("KimodoLayerAdd: layer {} '{}' (id {}), {:.2f} .. {:.2f} s, \"{}\"; no take yet: KimodoRegenerate -Layer {}", n, Name, Id, T0 / 6000.0, T1 / 6000.0, Prompt, n);
+        }
+
+        std::string KimodoRegenerate(int iLayer, const std::string& Seeds) noexcept
+        {
+            using clock = std::chrono::steady_clock;
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size()) || pOv->m_Layers[iLayer].m_Kind != xanim_package_desc::layer_kind::KIMODO) return "KimodoRegenerate: -Layer is not a Kimodo layer of the selected clip";
+            const auto L = pOv->m_Layers[iLayer];
+            if (auto* pWhy = KimodoWhyNot()) return std::string("KimodoRegenerate: ") + pWhy;
+            const auto Exe = kimodo::FindExe();
+            if (Exe.empty()) return "KimodoRegenerate: xkimodo.exe not found (build dependencies/xKimodo, or set XKIMODO_EXE)";
+            std::string Err;
+            auto* pCtx = KimodoRetargetCtx(Err);
+            if (!pCtx) return "KimodoRegenerate: " + Err;
+            std::vector<xmath::transform3> Below; int FPS = 30, nF = 0;
+            if (!StackFramesFor(iLayer, Below, FPS, nF, Err)) return "KimodoRegenerate: " + Err;
+            const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size());
+            if (nB == 0 || int(Below.size()) != nF * nB) return "KimodoRegenerate: the clip and the skeleton disagree (compile the package)";
+            const double T0 = L.m_Start / 6000.0, T1 = (L.m_End >= 0 ? L.m_End : TLClipTicks()) / 6000.0;
+            const int W = std::clamp(int(std::lround((T1 - T0) * 30.0)) + 1, 2, 301);
+            std::vector<xmath::transform3> Win(std::size_t(W) * nB);
+            for (int i = 0; i < W; ++i) { const auto P = SamplePose(Below, FPS, nF, nB, T0 + i / 30.0); std::copy(P.begin(), P.end(), Win.begin() + std::size_t(i) * nB); }
+            kimodo_space KS; std::vector<kimodo::soma_pose> SP;
+            if (!ToKimodo(*pCtx, Win, W, nB, KS, SP, Err)) return "KimodoRegenerate: " + Err;
+
+            // the constraints rule
+            std::vector<int> Full{ 0, W - 1 };
+            for (const auto& O : pOv->m_Layers)
+                if (O.m_Kind == xanim_package_desc::layer_kind::POSE && O.m_bEnabled)
+                    for (const auto& K : O.m_Keys)
+                    {
+                        const int f = int(std::lround((K.m_Tick / 6000.0 - T0) * 30.0));
+                        if (f > 0 && f < W - 1 && std::find(Full.begin(), Full.end(), f) == Full.end()) Full.push_back(f);
+                    }
+            std::sort(Full.begin(), Full.end());
+            if (Full.size() > 16) { std::vector<int> F; for (int i = 0; i < 16; ++i) F.push_back(Full[std::size_t(std::lround(i * (Full.size() - 1) / 15.0))]); Full = F; }
+            kimodo::constraint_set FB{ "fullbody", {}, {}, {} };
+            for (int f : Full) { FB.m_Frames.push_back(f); FB.m_Poses.push_back(SP[f]); FB.m_Smooth.push_back({ SP[f].m_Root[0], SP[f].m_Root[2] }); }
+            kimodo::constraint_set Path{ "root2d", {}, {}, {} };
+            for (int i = 0; i < W; ++i) { Path.m_Frames.push_back(i); Path.m_Smooth.push_back({ SP[i].m_Root[0], SP[i].m_Root[2] }); }
+            const std::vector<kimodo::constraint_set> Sets{ FB, Path };
+            static int s_Count = 0;
+            const auto Stem = std::format(L"{}\\kimlayer_{}_{}", m_Document.m_TempDir, GetCurrentProcessId(), ++s_Count);
+            std::filesystem::create_directories(m_Document.m_TempDir);
+            if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return "KimodoRegenerate: " + Err;
+
+            std::string Text = std::format("KimodoRegenerate: layer {} '{}', {:.2f} .. {:.2f} s ({} frames at 30 fps), \"{}\", {} steps\n", iLayer, L.m_Name, T0, T1, W, L.m_Prompt, L.m_Steps);
+            Text += std::format("  constraints: full-body poses of the stack below at frames {}; the root path of the stack below at all {} frames\n", [&] { std::string S; for (int f : Full) S += (S.empty() ? "" : " ") + std::to_string(f); return S; }(), W);
+            // the seam: the candidate's first and last frame against the stack below (positions, the editor's FK)
+            std::vector<std::int32_t> Parents(nB);
+            for (int b = 0; b < nB; ++b) Parents[b] = pDesc->m_ResolvedSkeletonBones.m_Bones[b].m_iParent;
+            xanimation::body_ik FK; FK.Setup(Parents);
+            auto Pos = [&](const std::vector<xmath::transform3>& F, int f) { xanimation::pose P; P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, F[std::size_t(f) * nB + b]); FK.ComputeWorld(P); std::vector<xmath::fvec3> V(nB); for (int b = 0; b < nB; ++b) V[b] = FK.WorldPosition(b); return V; };
+            const auto B0 = Pos(Win, 0), B1 = Pos(Win, W - 1);
+
+            m_KL = {};
+            m_KL.m_LayerId = L.m_Id; m_KL.m_Sig = LayersSigNow(); m_KL.m_ReqSig = KimodoReqSig(L); m_KL.m_KS = KS; m_KL.m_Start = L.m_Start; m_KL.m_W = W;
+            std::istringstream In(Seeds.empty() ? std::to_string(L.m_Seed) : Seeds); int Seed = 0;
+            while (In >> Seed)
+            {
+                const auto s0 = clock::now();
+                const auto Bvh = std::format(L"{}_s{}.bvh", Stem, Seed);
+                std::wstring P = xstrtool::To(L.m_Prompt.empty() ? std::string("A person.") : L.m_Prompt);
+                for (auto& c : P) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
+                const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --steps {} --seed {} --constraints \"{}.json\" --bvh \"{}\"", P, W, std::clamp(L.m_Steps, 1, 200), Seed, Stem, Bvh);
+                if (!kimodo::RunBlocking(Exe, Args, Stem + L".log", 600000, Err)) { m_KL.m_Job = "failed"; m_KL.m_LastError = Err; return Text + "KimodoRegenerate: " + Err; }
+                kimodo::bvh B;
+                if (!B.Load(Bvh, Err) || B.m_nFrames < W) { m_KL.m_Job = "failed"; m_KL.m_LastError = Err.empty() ? "too few frames" : Err; return Text + "KimodoRegenerate: the generated BVH: " + m_KL.m_LastError; }
+                kimodo_layer_cand C; C.m_Seed = Seed; C.m_Bvh = Bvh;
+                C.m_Frames = FromKimodo(*pCtx, B, KS, nB); C.m_Frames.resize(std::size_t(W) * nB);
+                const auto C0 = Pos(C.m_Frames, 0), C1 = Pos(C.m_Frames, W - 1);
+                for (int b = 0; b < nB; ++b) C.m_SeamCm = std::max({ C.m_SeamCm, (C0[b] - B0[b]).Length() * 100.0f, (C1[b] - B1[b]).Length() * 100.0f });
+                C.m_Ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
+                Text += std::format("  candidate {} (seed {}): {:.0f} ms; the seam (first/last frame vs the stack below) max {:.2f} cm\n", m_KL.m_Cands.size(), Seed, C.m_Ms, C.m_SeamCm);
+                m_KL.m_Cands.push_back(std::move(C));
+            }
+            m_KL.m_Job = m_KL.m_Cands.empty() ? "idle" : "candidate";
+            m_KL.m_iShow = m_KL.m_Cands.empty() ? -1 : 0;
+            Text += "  nothing is written yet: KimodoAcceptCandidate -Candidate i (one undo step; the current take is kept on disk)";
+            return Text;
+        }
+
+        // a generated window into the clip's space: the root's channels un-normalized (Kimodo starts at the origin facing +Z), the rest kept
+        static bool DenormalizeBvh(const std::wstring& Src, const std::wstring& Dst, const kimodo_space& KS, std::string& Err) noexcept
+        {
+            std::ifstream In{ std::filesystem::path(Src) };
+            if (!In) { Err = "cannot open the generated BVH"; return false; }
+            std::stringstream Head; std::string Line, RootChannels;
+            bool bRoot = false;
+            while (std::getline(In, Line))
+            {
+                Head << Line << '\n';
+                if (!bRoot && Line.find("CHANNELS") != std::string::npos) { RootChannels = Line; bRoot = true; }
+                if (Line.find("Frame Time") != std::string::npos) break;
+            }
+            std::istringstream CS(RootChannels); std::string Tok; int n = 0; CS >> Tok >> n;
+            std::string Order; int nPos = 0;
+            for (int i = 0; i < n; ++i) { CS >> Tok; if (Tok.find("position") != std::string::npos) ++nPos; else Order += char(std::toupper(Tok[0])); }
+            if (Order.size() != 3 || nPos != 3) { Err = "the root's channels are not 3 positions + 3 rotations"; return false; }
+            auto Ax = [](char A) { return A == 'X' ? 0 : A == 'Y' ? 1 : 2; };
+            const int i0 = Ax(Order[0]), i1 = Ax(Order[1]), i2 = Ax(Order[2]);
+            const float s = ((i1 - i0 + 3) % 3 == 1) ? 1.0f : -1.0f;                // cyclic order (XYZ, YZX, ZXY): +1
+            // the denormalizing turn as a matrix (about Y)
+            float Dm[9]; { const auto& q = KS.m_Denorm; const float x = q.m_X, y = q.m_Y, z = q.m_Z, w = q.m_W;
+                Dm[0] = 1 - 2 * (y * y + z * z); Dm[1] = 2 * (x * y - z * w); Dm[2] = 2 * (x * z + y * w);
+                Dm[3] = 2 * (x * y + z * w); Dm[4] = 1 - 2 * (x * x + z * z); Dm[5] = 2 * (y * z - x * w);
+                Dm[6] = 2 * (x * z - y * w); Dm[7] = 2 * (y * z + x * w); Dm[8] = 1 - 2 * (x * x + y * y); }
+            std::ofstream Out{ std::filesystem::path(Dst) };
+            if (!Out) { Err = "cannot write the take"; return false; }
+            Out << Head.str();
+            Out.setf(std::ios::fixed); Out.precision(6);
+            while (std::getline(In, Line))
+            {
+                if (Line.find_first_not_of(" \t\r") == std::string::npos) continue;
+                std::istringstream LS(Line); std::vector<std::string> V; while (LS >> Tok) V.push_back(Tok);
+                if (V.size() < 6) { Out << Line << '\n'; continue; }
+                const float p[3] = { std::stof(V[0]), std::stof(V[1]), std::stof(V[2]) };
+                float R[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+                for (int k = 0; k < 3; ++k) { float M[9]; kimodo::bvh::Axis(Order[k], std::stof(V[3 + k]), M); kimodo::bvh::Mul(R, M, R); }
+                float R2[9]; kimodo::bvh::Mul(Dm, R, R2);
+                const xmath::fvec3 P2 = KS.m_Denorm * xmath::fvec3(p[0], p[1], p[2]) + KS.m_Origin;
+                // R2 = R_a(A) R_b(B) R_c(C) in the root's channel order
+                auto M = [&](int r, int c) { return R2[r * 3 + c]; };
+                const float B = std::asin(std::clamp(s * M(i0, i2), -1.0f, 1.0f));
+                const float A = std::atan2(-s * M(i1, i2), M(i2, i2));
+                const float C = std::atan2(-s * M(i0, i1), M(i0, i0));
+                constexpr float D = 57.29577951f;
+                Out << P2.m_X << ' ' << P2.m_Y << ' ' << P2.m_Z << ' ' << A * D << ' ' << B * D << ' ' << C * D;
+                for (std::size_t k = 6; k < V.size(); ++k) Out << ' ' << V[k];
+                Out << '\n';
+            }
+            return bool(Out);
+        }
+
+        std::string KimodoAcceptCandidate(int iCand) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || !pDesc) return "KimodoAcceptCandidate: select a clip first";
+            if (m_KL.m_Job != "candidate" || iCand < 0 || iCand >= int(m_KL.m_Cands.size())) return "KimodoAcceptCandidate: no such candidate (KimodoRegenerate first)";
+            int iL = -1;
+            for (int i = 0; i < int(pOv->m_Layers.size()); ++i) if (pOv->m_Layers[i].m_Id == m_KL.m_LayerId) iL = i;
+            if (iL < 0) return "KimodoAcceptCandidate: the layer is gone";
+            if (m_KL.m_Sig != LayersSigNow()) return "KimodoAcceptCandidate: the candidate is stale (the clip's layers changed since): KimodoRegenerate again";
+            const auto& C = m_KL.m_Cands[iCand];
+            const auto& L = pOv->m_Layers[iL];
+            const std::wstring Folder = pDesc->m_Kimodo.m_Folder;
+            const auto Dir = ProjectPath() / Folder;
+            std::error_code Ec; std::filesystem::create_directories(Dir, Ec);
+            const auto Name = SafeFileName(kimodo::NameFromPrompt(L.m_Prompt.empty() ? std::string("take") : L.m_Prompt)) + "_take";
+            std::wstring File = xstrtool::To(Name) + L".bvh";
+            for (int i = 2; std::filesystem::exists(Dir / File); ++i) File = std::format(L"{}_{}.bvh", xstrtool::To(Name), i);
+            std::string Err;
+            if (!DenormalizeBvh(C.m_Bvh, (Dir / File).wstring(), m_KL.m_KS, Err)) return "KimodoAcceptCandidate: " + Err;
+            {
+                std::ofstream Info(Dir / (std::filesystem::path(File).stem().wstring() + L".kimodo.txt"));
+                Info << "generator: NVIDIA Kimodo (Kimodo-SOMA-RP-v1.2) through xkimodo\nfor: Kimodo layer '" << L.m_Name << "' of clip '" << pOv->m_Name << "'\nprompt: " << L.m_Prompt
+                     << "\nseed: " << C.m_Seed << "\nsteps: " << L.m_Steps << "\nframes: " << m_KL.m_W << " at 30 fps from clip tick " << m_KL.m_Start
+                     << "\nconstraints: full-body poses of the stack below at the segment's ends and Pose-layer key times inside, the root path of the stack below\n";
+            }
+            const auto Rel = Folder + L"\\" + File;
+            const auto Stem = xstrtool::To(std::filesystem::path(File).stem().wstring());
+            const auto ReqSig = m_KL.m_ReqSig;
+            const int Seed = C.m_Seed;
+            const auto E = DirectOneStep(std::format("Accept Kimodo take for '{}'", L.m_Name), [&](desc& D) -> std::string
+            {
+                auto& S = D.m_ImportSources.emplace_back();
+                S.m_Kind = xanim_package_desc::import_kind::DIFFERENT_SKELETON_ASSET; S.m_Path = Rel; S.m_Retarget = D.m_Kimodo.m_Retarget;
+                auto& Cl = S.m_Clips.emplace_back(); Cl.m_OriginalName = "Motion"; Cl.m_Name = Stem; Cl.m_bDelete = true;       // a layer's source, not an output clip
+                auto& LL = SelectedOv()->m_Layers[iL];
+                LL.m_SourceKey = Rel; LL.m_SourceClip = "Motion"; LL.m_TrimIn = 0; LL.m_TrimOut = -1; LL.m_Rate = 1.0; LL.m_bReverse = false;
+                LL.m_Seed = Seed; LL.m_AcceptedSig = KimodoReqSig(LL);
+                (void)ReqSig;
+                return {};
+            });
+            if (!E.empty()) return "KimodoAcceptCandidate: " + E;
+            m_KAcceptedLayer = m_KL.m_LayerId; m_KAcceptedFrames = m_KL.m_Cands[iCand].m_Frames; m_KAcceptedW = m_KL.m_W;
+            m_KL = {};
+            (void)m_Undo.Query("Save");
+            (void)m_Undo.Query("Compile");
+            return std::format("KimodoAcceptCandidate: candidate {} (seed {}) is the take of layer {} ({}); one undo step; the package is compiling (the earlier take stays on disk)", iCand, Seed, iL, xstrtool::To(Rel));
+        }
+
+        // A Kimodo layer as an editable Pose layer: absolute keys (every Every frames) of what the clip plays over the segment, placed right
+        // above it; the Kimodo layer is turned off (only one of the two plays) and the take is kept, with the provenance on the Pose layer
+        std::string BakeToPose(int iLayer, int Every) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size()) || pOv->m_Layers[iLayer].m_Kind != xanim_package_desc::layer_kind::KIMODO) return "BakeToPose: -Layer is not a Kimodo layer of the selected clip";
+            const auto L = pOv->m_Layers[iLayer];
+            if (L.m_SourceKey.empty() || !L.m_bEnabled) return "BakeToPose: the layer has no take playing (accept a candidate, turn it on)";
+            const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0; std::string Err;
+            if (!SuggestClipFrames(pF, FPS, nF, Err)) return "BakeToPose: " + Err;
+            const auto Played = *pF;
+            const auto& Man = pDesc->m_ResolvedSkeletonBones.m_Bones;
+            const int nB = int(Man.size());
+            std::vector<xmath::transform3> Below; int FPSb = 30, nFb = 0;
+            if (!StackFramesFor(iLayer, Below, FPSb, nFb, Err)) return "BakeToPose: " + Err;
+            const double T0 = L.m_Start / 6000.0, T1 = (L.m_End >= 0 ? L.m_End : TLClipTicks()) / 6000.0;
+            Every = std::max(1, Every);
+            std::vector<double> Times; for (double t = T0; t < T1 - 1e-6; t += Every / 30.0) Times.push_back(t); Times.push_back(T1);
+            // the bones the layer changes (anywhere in the span), the root bone excluded (it carries the clip's motion)
+            std::vector<char> Use(nB, 0);
+            int iHips = -1;
+            for (double t : Times)
+            {
+                const auto A = SamplePose(Played, FPS, nF, nB, t), B = SamplePose(Below, FPSb, nFb, nB, t);
+                for (int b = 0; b < nB; ++b) if (Man[b].m_iParent >= 0 && AngleDeg(A[b].m_Rotation, B[b].m_Rotation) > 0.05f) Use[b] = 1;
+            }
+            for (int b = 0; b < nB && iHips < 0; ++b) if (Man[b].m_iParent >= 0 && Man[Man[b].m_iParent].m_iParent < 0) iHips = b;
+            const auto Name = L.m_Name + " (baked)";
+            int nKeys = 0;
+            const auto E = DirectOneStep(std::format("Bake '{}' to a Pose layer", L.m_Name), [&](desc& D) -> std::string
+            {
+                auto* pO = SelectedOv();
+                xanim_package_desc::clip_layer P;
+                P.m_Id = NextLayerId(D); P.m_Name = Name; P.m_Kind = xanim_package_desc::layer_kind::POSE; P.m_Mode = xanim_package_desc::layer_mode::OVERRIDE;
+                P.m_bSmooth = true; P.m_Falloff = 0.0f; P.m_Parent = L.m_Parent; P.m_Start = L.m_Start; P.m_End = L.m_End;
+                P.m_Mask = L.m_Mask; P.m_SharedMask = L.m_SharedMask;
+                for (double t : Times)
+                {
+                    const auto A = SamplePose(Played, FPS, nF, nB, t);
+                    const auto Tick = std::int64_t(std::llround(t * 6000.0));
+                    for (int b = 0; b < nB; ++b)
+                    {
+                        if (!Use[b] && b != iHips) continue;
+                        xanim_package_desc::layer_pose_key K; K.m_Tick = Tick; K.m_Bone = Man[b].m_Name;
+                        const auto Q = A[b].m_Rotation.NormalizeCopy(); K.m_X = Q.m_X; K.m_Y = Q.m_Y; K.m_Z = Q.m_Z; K.m_W = Q.m_W;
+                        if (b == iHips) { K.m_bPosition = true; K.m_PX = A[b].m_Position.m_X; K.m_PY = A[b].m_Position.m_Y; K.m_PZ = A[b].m_Position.m_Z; }
+                        P.m_Keys.push_back(K); ++nKeys;
+                    }
+                }
+                xanim_package_desc::layer_take Tk; Tk.m_File = std::filesystem::path(L.m_SourceKey).stem().string(); Tk.m_Prompt = L.m_Prompt; Tk.m_Seed = L.m_Seed; Tk.m_Steps = L.m_Steps;
+                Tk.m_Start = L.m_Start; Tk.m_End = L.m_End; Tk.m_Offset = L.m_Start; Tk.m_Why = std::format("baked from Kimodo layer '{}' ({})", L.m_Name, xstrtool::To(L.m_SourceKey));
+                P.m_Takes.push_back(Tk);
+                pO->m_Layers[iLayer].m_bEnabled = false;
+                pO->m_Layers.insert(pO->m_Layers.begin() + iLayer + 1, std::move(P));
+                return {};
+            });
+            if (!E.empty()) return "BakeToPose: " + E;
+            // what the clip plays now against before (the keys reproduce it)
+            std::string Note;
+            if (SuggestClipFrames(pF, FPS, nF, Err))
+            {
+                float Max = 0; std::string MB;
+                for (double t = T0; t <= T1 + 1e-9; t += 1.0 / 30.0)
+                {
+                    const auto A = SamplePose(Played, FPS, nF, nB, t), B = SamplePose(*pF, FPS, nF, nB, t);
+                    for (int b = 0; b < nB; ++b) if (Use[b]) { const float a = AngleDeg(A[b].m_Rotation, B[b].m_Rotation); if (a > Max) { Max = a; MB = Man[b].m_Name; } }
+                }
+                Note = std::format("; the clip now against before, every frame of the span: max {:.4f} deg ({})", Max, MB);
+            }
+            return std::format("BakeToPose: {} keys on new Pose layer '{}' (layer {}), the Kimodo layer off, its take kept; one undo step{}", nKeys, Name, iLayer + 1, Note);
+        }
+
+        // The refine's stored takes (a Pose layer's Takes) as Kimodo layers: their request (prompt, seed, steps, span), off and with no take
+        // (their windows were made in Kimodo's own frame: KimodoRegenerate makes a take for the layer). Idempotent: a take already turned
+        // into a layer (by its name) is skipped. Never both playing: the new layers are off.
+        std::string KimodoTakesToLayers(int iLayer) noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv || iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "KimodoTakesToLayers: -Layer is not a layer of the selected clip";
+            const auto Takes = pOv->m_Layers[iLayer].m_Takes;
+            if (Takes.empty()) return "KimodoTakesToLayers: that layer has no stored takes";
+            int nNew = 0;
+            const auto E = DirectOneStep("Takes to Kimodo layers", [&](desc& D) -> std::string
+            {
+                auto* pO = SelectedOv();
+                for (const auto& T : Takes)
+                {
+                    const auto Name = "Take " + T.m_File;
+                    if (std::any_of(pO->m_Layers.begin(), pO->m_Layers.end(), [&](const auto& X) { return X.m_Name == Name; })) continue;
+                    auto& L = pO->m_Layers.emplace_back();
+                    L.m_Id = NextLayerId(D); L.m_Name = Name; L.m_Kind = xanim_package_desc::layer_kind::KIMODO; L.m_bEnabled = false;
+                    L.m_Prompt = T.m_Prompt; L.m_Seed = T.m_Seed; L.m_Steps = T.m_Steps; L.m_Start = T.m_Start; L.m_End = std::max(T.m_End, T.m_Start + 1);
+                    L.m_Seconds = float((L.m_End - L.m_Start) / 6000.0); L.m_bPosition = true;
+                    ++nNew;
+                }
+                return {};
+            });
+            if (!E.empty() && E != "no change") return "KimodoTakesToLayers: " + E;
+            return std::format("KimodoTakesToLayers: {} new Kimodo layer(s) (off, no take yet: KimodoRegenerate each); {} already there", nNew, int(Takes.size()) - nNew);
+        }
+
+        std::string KimodoTakeCheck() noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || !pDesc || m_KAcceptedFrames.empty()) return "KimodoTakeCheck: no accepted candidate this session";
+            const xanim_package_desc::clip_layer* pL = nullptr;
+            for (const auto& L : pOv->m_Layers) if (L.m_Id == m_KAcceptedLayer) pL = &L;
+            if (!pL || pL->m_SourceKey.empty()) return "KimodoTakeCheck: the layer or its take is gone";
+            const auto* pSrc = FindLayerSource(pL->m_SourceKey, pL->m_SourceClip);
+            if (!pSrc) return "KimodoTakeCheck: the take is not in the layer sources yet (compile)";
+            const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size());
+            const int n = std::min(m_KAcceptedW, pSrc->m_nFrames);
+            float Max = 0, Pos = 0; std::string MB;
+            for (int f = 0; f < n; ++f)
+                for (int b = 0; b < nB; ++b)
+                {
+                    const auto& A = m_KAcceptedFrames[std::size_t(f) * nB + b]; const auto& B = pSrc->m_Frames[std::size_t(f) * nB + b];
+                    const float a = AngleDeg(A.m_Rotation, B.m_Rotation);
+                    if (a > Max) { Max = a; MB = pDesc->m_ResolvedSkeletonBones.m_Bones[b].m_Name; }
+                    if (pDesc->m_ResolvedSkeletonBones.m_Bones[b].m_iParent >= 0) Pos = std::max(Pos, (A.m_Position - B.m_Position).Length());
+                }
+            return std::format("KimodoTakeCheck: {} frames (take {}, candidate {}): rotations max {:.4f} deg ({}), positions max {:.5f}", n, pSrc->m_nFrames, m_KAcceptedW, Max, MB, Pos);
+        }
+
+        // the shown candidate, drawn as the pose at the playhead when it is inside the candidate's span
+        void KimodoPreviewBones() noexcept
+        {
+            if (m_KL.m_Job != "candidate" || m_KL.m_iShow < 0 || m_KL.m_iShow >= int(m_KL.m_Cands.size())) return;
+            const int f = int(std::lround((m_TimeSeconds - m_KL.m_Start / 6000.0) * 30.0));
+            if (f < 0 || f >= m_KL.m_W) return;
+            std::string Err;
+            if (!PoseRig(Err) || int(m_PoseBones.size()) != m_PT.m_Rig.count()) return;
+            const int nB = m_PT.m_Rig.count();
+            const auto& Fr = m_KL.m_Cands[m_KL.m_iShow].m_Frames;
+            if (int(Fr.size()) < (f + 1) * nB) return;
+            xanimation::pose C; C.resize(nB);
+            for (int b = 0; b < nB; ++b) C.set(b, Fr[std::size_t(f) * nB + b]);
+            xanimation::pose Now; xmath::fvec3 Off(0, 0, 0);
+            if (PoseAt(m_TimeSeconds, Now, Err)) { xanimation::body_ik FK; FK.Setup(m_PT.m_Rig.m_Par); FK.ComputeWorld(Now); Off = m_PoseBones[0].m_Position - FK.WorldPosition(0); }
+            PoseToBones(C, Off);
         }
 
         std::string SuggestPose(double Seconds, const std::string& Move, const std::string& Pins, const std::string& Seeds, const std::string& Prompt) noexcept
@@ -3482,6 +3985,7 @@ namespace xanim_package_editor
             EvaluatePose(*pSkeleton);
             UpdateMaskShown();
             PoseBeforeRender();
+            KimodoPreviewBones();
             std::set<int> PoseSel; if (m_PT.m_bOn && m_PT.m_FKBone >= 0) PoseSel.insert(m_PT.m_FKBone);
             const std::set<int>* pSel = !m_MaskShown.empty() ? &m_MaskShown : PoseSel.empty() ? nullptr : &PoseSel;
             const xskeleton_editor::viewport_item Item{ .m_pSkeleton = pSkeleton, .m_Bones = m_PoseBones, .m_pSelected = pSel };
@@ -3696,6 +4200,50 @@ namespace xanim_package_editor
             return S.SuggestPoseAccept(iL, iC, bRefine);
         }
         case kind::layers_info: return S.LayersInfo();
+        case kind::kimodo_layer_add:
+        {
+            std::string Pr, Se, St, Sd, Nm; double Secs = 2.0, Start = S.m_TimeSeconds; int Seed = 1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Pr)) return "KimodoLayerAdd: -Prompt text";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Se) && std::from_chars(Se.data(), Se.data() + Se.size(), Secs).ec != std::errc()) return "KimodoLayerAdd: -Seconds is a number";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hC, St) && std::from_chars(St.data(), St.data() + St.size(), Start).ec != std::errc()) return "KimodoLayerAdd: -Start is seconds";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Sd) && std::from_chars(Sd.data(), Sd.data() + Sd.size(), Seed).ec != std::errc()) return "KimodoLayerAdd: -Seed is a number";
+            xeditor::cmd_util::GetArg(m_Parser, m_hE, Nm);
+            return S.KimodoLayerAdd(Pr, Secs, Start, Seed, Nm);
+        }
+        case kind::kimodo_regenerate:
+        {
+            std::string L, Sd; int iL = -1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "KimodoRegenerate: -Layer n";
+            xeditor::cmd_util::GetArg(m_Parser, m_hB, Sd);
+            return S.KimodoRegenerate(iL, Sd);
+        }
+        case kind::kimodo_accept_candidate:
+        {
+            std::string C; int i = 0;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hA, C) && std::from_chars(C.data(), C.data() + C.size(), i).ec != std::errc()) return "KimodoAcceptCandidate: -Candidate is an index";
+            return S.KimodoAcceptCandidate(i);
+        }
+        case kind::kimodo_show:
+        {
+            std::string C; int i = -1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, C) || std::from_chars(C.data(), C.data() + C.size(), i).ec != std::errc()) return "KimodoShow: -Candidate i";
+            if (i >= int(S.m_KL.m_Cands.size())) return "KimodoShow: no such candidate";
+            S.m_KL.m_iShow = i; return std::format("KimodoShow: {}", i < 0 ? "none" : std::format("candidate {}", i));
+        }
+        case kind::bake_to_pose:
+        {
+            std::string L, Ev; int iL = -1, E = 1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "BakeToPose: -Layer n";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Ev) && std::from_chars(Ev.data(), Ev.data() + Ev.size(), E).ec != std::errc()) return "BakeToPose: -Every n";
+            return S.BakeToPose(iL, E);
+        }
+        case kind::kimodo_take_check: return S.KimodoTakeCheck();
+        case kind::kimodo_takes_to_layers:
+        {
+            std::string L; int iL = -1;
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, L) || std::from_chars(L.data(), L.data() + L.size(), iL).ec != std::errc()) return "KimodoTakesToLayers: -Layer n";
+            return S.KimodoTakesToLayers(iL);
+        }
         case kind::pose_tool:
         {
             std::string On, Bone;

@@ -59,12 +59,13 @@ namespace xanim_package_desc
     , xproperty::settings::enum_item("From layer",    layer_root::FROM_LAYER)
     };
 
-    enum class layer_kind : std::uint8_t { CLIP, POSE, FOLDER, GROUP };      // FOLDER: pass-through organization; GROUP: isolated (contract v3)
+    enum class layer_kind : std::uint8_t { CLIP, POSE, FOLDER, GROUP, KIMODO };      // FOLDER: pass-through organization; GROUP: isolated (contract v3)
     static constexpr auto layer_kind_v = std::array
     { xproperty::settings::enum_item("Clip", layer_kind::CLIP)
     , xproperty::settings::enum_item("Pose", layer_kind::POSE)
     , xproperty::settings::enum_item("Folder", layer_kind::FOLDER)
     , xproperty::settings::enum_item("Group", layer_kind::GROUP)
+    , xproperty::settings::enum_item("Kimodo", layer_kind::KIMODO)     // a generated take (its accepted take = an import source, sampled like a Clip layer; none yet = nothing)
     };
 
     // A Pose layer's key: one bone's local rotation at a time. Absolute target by default (the pose to reach: in an Additive layer its offset is
@@ -196,6 +197,12 @@ namespace xanim_package_desc
         std::vector<layer_take> m_Takes   = {};         // Pose layers: the generated takes (Kimodo) some of the keys came from (provenance; nothing composes from it)
         std::uint64_t       m_Parent      = 0;          // the Id of the folder or group this layer is in; 0 = the top level (contract v3)
         std::string         m_SharedMask  = {};         // a skeleton mask group by name: replaces Mask; a name the skeleton lacks = the layer contributes nothing (an error)
+        // Kimodo layers (T4): the request that makes its take; the accepted take is SourceKey/SourceClip (an import source); AcceptedSig = the request hash when it was accepted (request relation: matches or changed)
+        std::string         m_Prompt      = {};
+        int                 m_Seed        = 1;
+        int                 m_Steps       = 25;
+        float               m_Seconds     = 2.0f;
+        std::string         m_AcceptedSig = {};
 
         XPROPERTY_DEF
         ( "Layer", clip_layer
@@ -228,6 +235,11 @@ namespace xanim_package_desc
         , obj_member<"Takes",         &clip_layer::m_Takes >
         , obj_member<"Parent",        &clip_layer::m_Parent >
         , obj_member<"SharedMask",    &clip_layer::m_SharedMask >
+        , obj_member<"Prompt",        &clip_layer::m_Prompt >
+        , obj_member<"Seed",          &clip_layer::m_Seed >
+        , obj_member<"Steps",         &clip_layer::m_Steps >
+        , obj_member<"Seconds",       &clip_layer::m_Seconds >
+        , obj_member<"AcceptedSig",   &clip_layer::m_AcceptedSig, member_flags<flags::SHOW_READONLY> >
         )
     };
     XPROPERTY_REG(clip_layer)
@@ -346,7 +358,7 @@ namespace xanim_package_desc
                     for (const auto& L : C.m_Layers)
                     {
                         const auto Where = std::format("Clip '{}', layer '{}'", C.m_Name, L.m_Name);
-                        if (L.m_Kind == layer_kind::CLIP)
+                        if (L.m_Kind == layer_kind::CLIP || (L.m_Kind == layer_kind::KIMODO && !L.m_SourceKey.empty()))
                         {
                             if (L.m_SourceKey.empty() || L.m_SourceClip.empty())   Errors.push_back(Where + ": no source clip (SourceKey and SourceClip)");
                             else if (findImportSource(L.m_SourceKey) == -1)        Errors.push_back(Where + ": its source is not one of this package's import sources");

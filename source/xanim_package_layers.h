@@ -140,6 +140,7 @@ namespace xanim_package_layers
         {
             const auto& L = LL[li];
             if (!In[li]) continue;
+            if (L.m_Kind == kind::KIMODO && L.m_SourceKey.empty()) continue;      // a Kimodo layer with no accepted take yet: nothing
             auto& P = Layers.emplace_back();
             PreparedParent.push_back(Parent[li]);
             P.m_pDesc = &L;
@@ -182,7 +183,8 @@ namespace xanim_package_layers
                 P.m_Time = { .m_Start = L.m_Start, .m_End = L.m_End >= 0 ? L.m_End : ClipEnd
                            , .m_TrimIn = L.m_TrimIn, .m_TrimOut = L.m_TrimOut >= 0 ? L.m_TrimOut : SourceEnd, .m_Rate = L.m_Rate, .m_bReverse = L.m_bReverse };
                 if (std::string Why; !xanimation::ValidateSection(P.m_Time, &Why)) { Error = std::format("layer '{}': {}", L.m_Name, Why); return false; }
-                P.m_Mask = LayerMask(L, Manifest, &Report.m_Warnings);
+                // a Kimodo layer's mask, when empty, is the whole body (its take is a whole-body motion); a Clip layer's empty mask is nothing
+                P.m_Mask = (L.m_Kind == kind::KIMODO && L.m_Mask.empty() && L.m_SharedMask.empty()) ? std::vector<float>(nSkel, 1.0f) : LayerMask(L, Manifest, &Report.m_Warnings);
                 for (int s = 0; s < nSkel; ++s) Union[s] = std::max(Union[s], P.m_Mask[s]);
                 P.m_Channels = (L.m_bRotation ? xanimation::CHANNEL_ROTATION : 0) | (L.m_bPosition ? xanimation::CHANNEL_POSITION : 0);
                 if (L.m_Mode == xanim_package_desc::layer_mode::ADDITIVE)
