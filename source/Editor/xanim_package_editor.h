@@ -57,7 +57,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps };
 
         session&    m_Session;
         kind        m_Kind;
@@ -198,12 +198,21 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
                 break;
             case kind::kimodo_takes_to_layers:  m_hA = m_Parser.addOption("Layer", "The Pose layer whose stored takes become Kimodo layers", true, 1); break;
-            default: break;
+            case kind::clip_event:
+                m_hA = m_Parser.addOption("Add",    "A new event's name (at -Time, default the playhead)", false, 1);
+                m_hB = m_Parser.addOption("Id",     "The event to change (its id, hex, as the list shows)", false, 1);
+                m_hC = m_Parser.addOption("Delete", "The event to delete (its id)", false, 1);
+                m_hD = m_Parser.addOption("Kind",   "Marker (default), Footstep, Contact (an interval) or Sync", false, 1);
+                m_hE = m_Parser.addOption("Time",   "Seconds: where it is (a contact: where it starts)", false, 1);
+                m_hF = m_Parser.addOption("End",    "Seconds: an interval's end (-1: a point)", false, 1);
+                m_hG = m_Parser.addOption("Bone",   "The bone it is about (a foot, a hand); with -Id, \"-\" clears it", false, 1);
+                m_hH = m_Parser.addOption("Name",   "With -Id: its new name", false, 1);
+                break;            default: break;
             }
         }
         std::string Query() noexcept override;
 
-        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE, m_hF, m_hG;
+        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE, m_hF, m_hG, m_hH;
     };
 
     //--------------------------------------------------------------------------------------------
@@ -239,7 +248,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
-        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps;
         // the last accepted candidate (its frames on this skeleton): KimodoTakeCheck compares the compiled take with it
         std::uint64_t m_KAcceptedLayer = 0; std::vector<xmath::transform3> m_KAcceptedFrames; int m_KAcceptedW = 0;
 
@@ -387,6 +396,8 @@ namespace xanim_package_editor
             , m_IkKeyCmd             (m_Undo, *this, playback_cmd::kind::ik_key,                  "IkKey",                "An IK key on the top Pose layer: an effector's target (the handle: palm, sole) at a time, pinned or not; the body is solved on every frame between keys. One undo step. Usage: IkKey -Effector LeftHand [-Time s] [-Pos \"x y z\"] [-Pin 1|0] [-Rot 1] [-Delete 1]")
             , m_KeySelected          (m_Undo, *this, playback_cmd::kind::key_selected,            "KeySelected",          "K: keys the selected bone (or the last dragged handle as an IK key, or the pending pose when auto-key is off) at the playhead; -All 1 (Shift+K): every bone the layer owns. One undo step. Usage: KeySelected [-All 1] [-Time s]")
             , m_AutoKey              (m_Undo, *this, playback_cmd::kind::auto_key,                "AutoKey",              "Auto-key on (edits write keys) or off (an edit is a pending pose, shown, that K keys). Usage: AutoKey -On 1|0")
+            , m_ClipEvent            (m_Undo, *this, playback_cmd::kind::clip_event,              "ClipEvent",            "The selected clip's events (T5: markers, footsteps, contacts, sync points; one undo step each). Usage: ClipEvent (list) | -Add name [-Kind k] [-Time s] [-End s] [-Bone b] | -Id id [-Time s] [-End s] [-Kind k] [-Name n] [-Bone b] | -Delete id")
+            , m_DetectFootsteps      (m_Undo, *this, playback_cmd::kind::detect_footsteps,        "DetectFootsteps",      "Finds each foot's support contacts in the clip as composed: a Footstep where it lands and a Contact bar over the support (replaces only what it detected before; one undo step). Usage: DetectFootsteps")
             , m_KimodoTakeCheck      (m_Undo, *this, playback_cmd::kind::kimodo_take_check,       "KimodoTakeCheck",      "The compiled take of the last accepted Kimodo candidate against the candidate itself (every frame, every bone). Usage: KimodoTakeCheck")
             , m_CameraCmds(m_Undo, m_Viewport.m_Scene.Camera())
         {
@@ -567,7 +578,8 @@ namespace xanim_package_editor
         // folding, solo and selection never touch the descriptor.
         //----------------------------------------------------------------------------------------
         static constexpr std::uint64_t tl_base_row_v = 0xB000000000000001ull;
-        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4, tl_folder = 5, tl_group = 6, tl_weight = 7, tl_ik = 8 };     // tl_ik: an effector's IK keys (keyframe batch)     // tl_weight: a layer's weight curve lane
+        static constexpr std::uint64_t tl_events_row_v = 0xB000000000000002ull;      // the clip's events (T5): markers, footsteps, contact bars
+        enum tl_type : std::uint64_t { tl_base = 1, tl_clip = 2, tl_pose = 3, tl_bone = 4, tl_folder = 5, tl_group = 6, tl_weight = 7, tl_ik = 8, tl_events = 9 };     // tl_ik: an effector's IK keys (keyframe batch)     // tl_weight: a layer's weight curve lane
 
         // contract v3: a layer's effective parent (its folder or group in this clip; 0 = the top level). A parent that names nothing, or
         // loops, is the top level - the same rule as the composition (xanim_package_layers::Compose)
@@ -630,6 +642,7 @@ namespace xanim_package_editor
             if (!pOv) return 0;
             std::string S = std::format("{}:{}:{}", m_iSelectedSource, m_iSelectedDescriptorClip, LayerSignature(*pOv));
             for (const auto& L : pOv->m_Layers) S += L.m_bLock ? 'L' : 'u';
+            for (const auto& E : pOv->m_Events) S += std::format("|{}:{}:{}", E.m_Id, E.m_Tick, E.m_EndTick);
             return std::hash<std::string>{}(S) | 1;
         }
 
@@ -690,6 +703,8 @@ namespace xanim_package_editor
                 }
             };
             Emit(0, 0, false, false);
+            xeditor::timeline::row_desc Ev; Ev.m_Id = tl_events_row_v; Ev.m_Type = tl_events; Ev.m_Name = std::format("Events ({})", pOv->m_Events.size()); Ev.m_Color = IM_COL32(220, 200, 90, 255); Ev.m_bToggles = false;
+            Out.push_back(Ev);
             xeditor::timeline::row_desc Base; Base.m_Id = tl_base_row_v; Base.m_Type = tl_base; Base.m_Name = std::format("Clip: {}", pOv->m_Name); Base.m_Color = IM_COL32(150, 150, 160, 255); Base.m_bToggles = false;
             Out.push_back(Base);
         }
@@ -715,6 +730,16 @@ namespace xanim_package_editor
                 {
                     for (const auto& O : P)
                     {
+                        if (O.m_Ref.m_Row == tl_events_row_v)
+                        {
+                            const int k = int(O.m_Ref.m_Item) - 1;
+                            const auto E = SelectedOv()->m_Events[k];
+                            const auto Pth = [&](const char* pF) { return std::format("{}[G:{}]/{}", EventsPath(), k, pF); };
+                            auto SetE = [&](const char* pF, std::int64_t V, std::int64_t B) { return V == B ? std::string{} : m_Undo.Execute(std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(Pth(pF)), V, B)); };
+                            if (auto Err = SetE("Tick", O.m_Seg.m_Start, E.m_Tick); !Err.empty()) return Err;
+                            if (E.m_EndTick >= 0) if (auto Err = SetE("EndTick", O.m_Kind == 's' ? O.m_Seg.m_End : O.m_Seg.m_Start + (E.m_EndTick - E.m_Tick), E.m_EndTick); !Err.empty()) return Err;
+                            continue;
+                        }
                         const auto* pR = RowOf(O.m_Ref.m_Row);
                         const int iL = pR->m_bMerged ? int(O.m_Ref.m_Item) - 1 : pR->m_iLayer;     // a merged row's segment names its layer
                         const auto L = pOv->m_Layers[iL];                   // a copy: the writes below change the descriptor
@@ -752,6 +777,7 @@ namespace xanim_package_editor
             // row ops
             std::vector<std::string> Parts; { std::size_t a = 0; while (a <= Ops.size()) { auto b = Ops.find(';', a); if (b == std::string::npos) b = Ops.size(); Parts.push_back(Ops.substr(a, b - a)); a = b + 1; } }
             std::map<int, std::vector<int>> Deletes, WDeletes, IDeletes;  // layer -> key indices (pose keys, weight keys, IK keys)
+            std::vector<int> EDeletes;                                    // events
             std::vector<std::function<std::string()>> Steps;
             for (const auto& Part : Parts)
             {
@@ -761,6 +787,12 @@ namespace xanim_package_editor
                 const double             F = std::strtod(A, nullptr);         // a weight
                 if (n <= 0) continue;
                 const std::string_view Op(W);
+                if (Op == "edelete")            // "edelete row item": an event (the events row)
+                {
+                    if (R < 1 || R > pOv->m_Events.size()) return std::format("no event {}", R);
+                    EDeletes.push_back(int(R) - 1);
+                    continue;
+                }
                 const auto* pR = RowOf(R);
                 if (!pR) return std::format("no layer row {}", R);
                 const int iL = pR->m_iLayer;
@@ -945,6 +977,8 @@ namespace xanim_package_editor
                 std::sort(Ks.rbegin(), Ks.rend()); Ks.erase(std::unique(Ks.begin(), Ks.end()), Ks.end());
                 for (int k : Ks) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "WeightKeys")), k)); });
             }
+            std::sort(EDeletes.rbegin(), EDeletes.rend()); EDeletes.erase(std::unique(EDeletes.begin(), EDeletes.end()), EDeletes.end());
+            for (int k : EDeletes) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(EventsPath()), k)); });
             if (Steps.empty()) return "no change";
             return AsOneStep("Timeline edit", [&]() -> std::string { for (auto& S : Steps) if (auto E = S(); !E.empty()) return E; return {}; });
         }
@@ -957,6 +991,14 @@ namespace xanim_package_editor
             if (Rev != TLRevision()) return "stale plan: the layers changed since it was made";
             for (const auto& O : Ops)
             {
+                if (O.m_Ref.m_Row == tl_events_row_v)
+                {
+                    const int k = int(O.m_Ref.m_Item) - 1;
+                    if (k < 0 || k >= int(pOv->m_Events.size())) return std::format("no event {}", O.m_Ref.m_Item);
+                    if (O.m_Seg.m_Start < 0) return "an event cannot be before the clip";
+                    if (O.m_Kind == 's' && O.m_Seg.m_End < O.m_Seg.m_Start) return "an interval needs a length";
+                    continue;
+                }
                 const auto It = m_TLRows.find(O.m_Ref.m_Row);
                 if (It == m_TLRows.end()) return std::format("row {} is not a layer (the clip row is read only)", O.m_Ref.m_Row);
                 const int iLv = It->second.m_bMerged ? int(O.m_Ref.m_Item) - 1 : It->second.m_iLayer;
@@ -1006,7 +1048,7 @@ namespace xanim_package_editor
             auto After = pOv->m_Layers;
             for (const auto& O : Ops)
             {
-                if (O.m_Kind != 's') continue;
+                if (O.m_Kind != 's' || O.m_Ref.m_Row == tl_events_row_v) continue;
                 const auto& R = m_TLRows[O.m_Ref.m_Row];
                 auto& L = After[R.m_bMerged ? int(O.m_Ref.m_Item) - 1 : R.m_iLayer];
                 L.m_Start = O.m_Seg.m_Start; L.m_End = O.m_Seg.m_End;
@@ -1045,7 +1087,14 @@ namespace xanim_package_editor
             }
             std::string   Commit(const xeditor::timeline::plan& P) override { return Run(xeditor::timeline::ToText(P)); }
             std::string   Delete(std::span<const xeditor::timeline::item_ref> R) override
-            { std::string Ops; for (auto& r : R) if (m_S.m_TLRows.count(r.m_Row) && !m_S.m_TLRows[r.m_Row].m_Bone.empty()) Ops += std::format("delete {} {}; ", r.m_Row, r.m_Item); return Ops.empty() ? std::string("only pose keys can be deleted here") : Run(Ops); }
+            {
+                std::string Ops;
+                for (auto& r : R)
+                    if (r.m_Row == tl_events_row_v) Ops += std::format("edelete {}; ", r.m_Item);
+                    else if (m_S.m_TLRows.count(r.m_Row) && !m_S.m_TLRows[r.m_Row].m_Bone.empty()) Ops += std::format("delete {} {}; ", r.m_Row, r.m_Item);
+                return Ops.empty() ? std::string("only keys and events can be deleted here") : Run(Ops);
+            }
+            std::string   AddMarker(xeditor::timeline::tick T) override { return m_S.m_Undo.Query(std::format("ClipEvent -Add Marker -Time {}", double(T) / double(tl_tps_v))); }
             std::string   SetRowFlag(std::uint64_t Row, xeditor::timeline::row_flag F, bool bOn) override { return m_S.m_TLRows.count(Row) ? Run(std::format("{} {} {}", F == xeditor::timeline::row_flag::mute ? "mute" : "lock", Row, int(bOn))) : std::string("the clip row has no flags"); }
             bool          CanMoveRow(std::uint64_t Row) override { return m_S.m_TLRows.count(Row) && m_S.m_TLRows[Row].m_Bone.empty() && !m_S.m_TLRows[Row].m_bWeight; }   // a row of segments moves as one unit
             std::string   MoveRow(std::uint64_t Row, std::uint64_t Above) override { return Run(std::format("move {} {}", Row, Above)); }
@@ -1080,6 +1129,22 @@ namespace xanim_package_editor
                 {
                     tl::item I; I.m_Ref = { R.m_Id, 1 }; I.m_Kind = tl::item_kind::segment; I.m_Seg = { 0, m_S.TLClipTicks() }; I.m_Caps = tl::caps::none; I.m_Label = pOv->m_OriginalName;
                     Out.push_back(std::move(I)); return;
+                }
+                if (R.m_Type == tl_events)
+                {
+                    for (int k = 0; k < int(pOv->m_Events.size()); ++k)
+                    {
+                        const auto& E = pOv->m_Events[k];
+                        const bool bSpan = E.m_EndTick >= E.m_Tick;
+                        tl::item I; I.m_Ref = { R.m_Id, std::uint64_t(k + 1) };
+                        I.m_Kind = bSpan ? tl::item_kind::segment : tl::item_kind::key;
+                        I.m_Seg = { E.m_Tick, bSpan ? std::max(E.m_EndTick, E.m_Tick + 1) : E.m_Tick };
+                        I.m_Caps = tl::caps::move | tl::caps::del | (bSpan ? tl::caps::trim : 0u);
+                        I.m_Label = std::format("{} ({}{})", E.m_Name, EventKindName(E.m_Kind), E.m_Bone.empty() ? "" : ", " + E.m_Bone);
+                        if (Q.m_bAggregate && (I.m_Seg.m_End < Q.m_T0 || I.m_Seg.m_Start > Q.m_T1)) continue;
+                        Out.push_back(std::move(I));
+                    }
+                    return;
                 }
                 const auto It = m_S.m_TLRows.find(R.m_Id);
                 if (It == m_S.m_TLRows.end()) return;
@@ -1219,10 +1284,22 @@ namespace xanim_package_editor
             // a layer row's header widgets: its weight (a slider: dragging previews, the release is ONE command), its mode, its mask chip
             static constexpr float weight_w_v = 70, mode_w_v = 40, mask_w_v = 58;
             // a group: weight and mask, no mode (over its own base override and additive are the same); a folder: only eye / solo / lock
-            float HeaderWidth(const xeditor::timeline::row_desc& R) override { return (R.m_Type == tl_clip || R.m_Type == tl_pose || R.m_Type == tl_group) ? weight_w_v + mode_w_v + mask_w_v + 8 : R.m_Type == tl_weight ? 110 : 0; }
+            float HeaderWidth(const xeditor::timeline::row_desc& R) override { return (R.m_Type == tl_clip || R.m_Type == tl_pose || R.m_Type == tl_group) ? weight_w_v + mode_w_v + mask_w_v + 8 : R.m_Type == tl_weight ? 110 : R.m_Type == tl_events ? 150 : 0; }
             void  Header(const xeditor::timeline::row_desc& R, xeditor::timeline::document&, const ImRect& Box) override
             {
                 auto* pOv = m_S.SelectedOv(); auto* pDesc = m_S.Desc(); const auto It = m_S.m_TLRows.find(R.m_Id);
+                if (pOv && R.m_Type == tl_events)       // + Marker at the playhead (M); Footsteps: detected from the feet's contacts
+                {
+                    ImGui::SetCursorScreenPos(Box.Min);
+                    ImGui::PushID("events_header");
+                    if (ImGui::SmallButton("+ Marker")) xeditor::LogConsole(m_S.m_Undo.Query("ClipEvent -Add Marker").substr(0, 300), xeditor::log_source::User);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("A marker at the playhead (M). Its kind, name and bone: the ClipEvent command or the descriptor");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Footsteps")) xeditor::LogConsole(m_S.m_Undo.Query("DetectFootsteps").substr(0, 300), xeditor::log_source::User);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Finds where each foot lands and how long it supports: Footstep events and Contact bars (replaces only the detected ones)");
+                    ImGui::PopID();
+                    return;
+                }
                 if (!pOv || !pDesc || It == m_S.m_TLRows.end()) return;
                 const int iL = It->second.m_iLayer;
                 auto& L = pOv->m_Layers[iL];
@@ -1324,7 +1401,7 @@ namespace xanim_package_editor
         {
             namespace tl = xeditor::timeline;
             static_assert(tl_tps_v == tl::animation_ticks_per_second_v);
-            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType }, { tl_folder, &m_TLRowType }, { tl_group, &m_TLRowType }, { tl_weight, &m_TLRowType }, { tl_ik, &m_TLRowType } };
+            const tl::registry Types = { { tl_base, &m_TLRowType }, { tl_clip, &m_TLRowType }, { tl_pose, &m_TLRowType }, { tl_bone, &m_TLRowType }, { tl_folder, &m_TLRowType }, { tl_group, &m_TLRowType }, { tl_weight, &m_TLRowType }, { tl_ik, &m_TLRowType }, { tl_events, &m_TLRowType } };
             tl_document Doc(*this);
             m_iMaskHover = m_iMaskHoverNext; m_iMaskHoverNext = -1;          // last frame's hovered mask chip (the viewport draws before this panel)
             m_TLHeaderBoxes.clear();
@@ -3751,15 +3828,15 @@ namespace xanim_package_editor
             return true;
         }
 
-        // the feet in contact at a time (the clip as composed: low and slow, FindContacts in hip heights)
-        std::set<int> PoseContactsAt(double Seconds) noexcept
+        // the feet's support contacts over the clip as composed (low and slow: FindContacts on positions in hip heights); [0] left, [1] right
+        bool FootContacts(std::vector<xanimation::contact_interval> (&Out)[2], int& FPS, int& nF, float& HipH) noexcept
         {
-            std::set<int> Out;
+            Out[0].clear(); Out[1].clear(); HipH = 0;
             const auto& R = m_PT.m_Rig;
-            const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0; std::string Err;
-            if (R.m_LF < 0 || R.m_RF < 0 || R.m_Hips < 0 || !SuggestClipFrames(pF, FPS, nF, Err) || int(pF->size()) != nF * R.count()) return Out;
+            const std::vector<xmath::transform3>* pF = nullptr; std::string Err; FPS = 30; nF = 0;
+            if (R.m_LF < 0 || R.m_RF < 0 || R.m_Hips < 0 || !SuggestClipFrames(pF, FPS, nF, Err) || int(pF->size()) != nF * R.count()) return false;
             const int nB = R.count();
-            std::vector<xmath::fvec3> Feet[2]; float HipH = 0;
+            std::vector<xmath::fvec3> Feet[2];
             xanimation::pose P; P.resize(nB); std::vector<xmath::fquat> Rw; std::vector<xmath::fvec3> Pw;
             for (int f = 0; f < nF; ++f)
             {
@@ -3768,12 +3845,21 @@ namespace xanim_package_editor
                 Feet[0].push_back(Pw[R.m_LF]); Feet[1].push_back(Pw[R.m_RF]);
                 if (f == 0) HipH = std::max(1e-3f, Pw[R.m_Hips].m_Y - std::min(Pw[R.m_LF].m_Y, Pw[R.m_RF].m_Y));
             }
+            for (int s = 0; s < 2; ++s) { for (auto& v : Feet[s]) v = v * (1.0f / HipH); Out[s] = xanimation::FindContacts(Feet[s], float(FPS)); }
+            return true;
+        }
+
+        // the feet in contact at a time (the clip as composed: low and slow, FindContacts in hip heights)
+        std::set<int> PoseContactsAt(double Seconds) noexcept
+        {
+            std::set<int> Out;
+            const auto& R = m_PT.m_Rig;
+            std::vector<xanimation::contact_interval> C2[2]; int FPS = 30, nF = 0; float HipH = 0;
+            if (!FootContacts(C2, FPS, nF, HipH)) return Out;
             const int fk = std::clamp(int(std::lround(Seconds * FPS)), 0, std::max(0, nF - 1));
             m_PT.m_ContactText.clear();
             for (int s = 0; s < 2; ++s)
-            {
-                for (auto& v : Feet[s]) v = v * (1.0f / HipH);
-                for (const auto& C : xanimation::FindContacts(Feet[s], float(FPS)))
+                for (const auto& C : C2[s])
                 {
                     m_PT.m_ContactText += std::format("{}{}:{}..{}", m_PT.m_ContactText.empty() ? "" : " ", s == 0 ? "L" : "R", C.m_First, C.m_Last);
                     // a foot just lifting or about to land is still the support: contacts widened by 0.1 s (the detector's low-and-slow
@@ -3781,9 +3867,144 @@ namespace xanim_package_editor
                     const int Wd = std::max(1, int(std::lround(0.1 * FPS)));
                     if (fk >= C.m_First - Wd && fk <= C.m_Last + Wd) Out.insert(s == 0 ? R.m_LF : R.m_RF);
                 }
-            }
             m_PT.m_ContactText += std::format(" (frame {} of {}, hip height {:.3f})", fk, nF, HipH);
             return Out;
+        }
+
+        //------------------------------------------------------------------------------------------------
+        // Clip events (T5): markers, footsteps, contacts, sync points on the selected clip, in composition ticks. Every change is one undo step.
+        static constexpr std::uint64_t auto_event_id_v = 0xF000000000000000ull;    // events DetectFootsteps made (it replaces only these)
+        std::string EventsPath() const { return std::format("AnimPackage/ImportSources[G:{}]/Clips[G:{}]/Events", m_iSelectedSource, m_iSelectedDescriptorClip); }
+        static const char* EventKindName(xanim_package::event_kind K) noexcept { for (const auto& E : xanim_package_desc::event_kind_v) if (E.m_Value == static_cast<std::uint32_t>(K)) return E.m_pName; return "Marker"; }
+        static bool EventKindFrom(std::string_view S, xanim_package::event_kind& K) noexcept { for (const auto& E : xanim_package_desc::event_kind_v) if (S == E.m_pName) { K = static_cast<xanim_package::event_kind>(E.m_Value); return true; } return false; }
+
+        std::string EventsInfo() noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) return "ClipEvent: select a clip first";
+            std::string T = std::format("{} events on '{}'", pOv->m_Events.size(), pOv->m_Name);
+            for (const auto& E : pOv->m_Events)
+                T += std::format("\n  id {:X} {} '{}' at {:.3f} s{}{}", E.m_Id, EventKindName(E.m_Kind), E.m_Name, double(E.m_Tick) / tl_tps_v
+                    , E.m_EndTick >= E.m_Tick ? std::format(" to {:.3f} s", double(E.m_EndTick) / tl_tps_v) : std::string{}, E.m_Bone.empty() ? std::string{} : " bone " + E.m_Bone);
+            return T;
+        }
+
+        // the steps that append one event (the caller runs them inside AsOneStep)
+        std::string EventAppend(const xanim_package_desc::clip_event& E) noexcept
+        {
+            auto* pOv = SelectedOv();
+            const int n = int(pOv->m_Events.size());
+            const auto P = EventsPath();
+            auto Set = [&](const std::string& Path, const std::string& V, const std::string& B) { return m_Undo.Execute(std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(Path), xeditor::Quote(V), xeditor::Quote(B))); };
+            if (auto Err = Set(P + "[]", std::to_string(n + 1), std::to_string(n)); !Err.empty()) return Err;
+            const auto F = [&](const char* pF) { return std::format("{}[G:{}]/{}", P, n, pF); };
+            const auto& D = SelectedOv()->m_Events[n];
+            if (auto Err = Set(F("Id"), std::to_string(E.m_Id), std::to_string(D.m_Id)); !Err.empty()) return Err;
+            if (auto Err = Set(F("Name"), E.m_Name, D.m_Name); !Err.empty()) return Err;
+            if (auto Err = Set(F("Kind"), EventKindName(E.m_Kind), EventKindName(D.m_Kind)); !Err.empty()) return Err;
+            if (auto Err = Set(F("Tick"), std::to_string(E.m_Tick), std::to_string(D.m_Tick)); !Err.empty()) return Err;
+            if (auto Err = Set(F("EndTick"), std::to_string(E.m_EndTick), std::to_string(D.m_EndTick)); !Err.empty()) return Err;
+            if (!E.m_Bone.empty()) if (auto Err = Set(F("Bone"), E.m_Bone, D.m_Bone); !Err.empty()) return Err;
+            return {};
+        }
+
+        std::uint64_t NewEventId() noexcept
+        {
+            auto* pOv = SelectedOv(); std::uint64_t Id = 1;
+            for (const auto& E : pOv->m_Events) if (E.m_Id < auto_event_id_v) Id = std::max(Id, E.m_Id + 1);
+            return Id;
+        }
+
+        // ClipEvent: -Add name (with -Kind, -Time, -End, -Bone), -Id id with fields to change, -Delete id, nothing: the list
+        std::string ClipEvent(const std::string& Add, const std::string& IdS, const std::string& Del, const std::string& KindS, const std::string& TimeS, const std::string& EndS, const std::string& Bone, const std::string& Name) noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) return "ClipEvent: select a clip first";
+            auto Ticks = [](const std::string& S, std::int64_t& T) { double v = 0; if (std::from_chars(S.data(), S.data() + S.size(), v).ec != std::errc() || v < 0) return false; T = std::llround(v * tl_tps_v); return true; };
+            auto Find = [&](const std::string& S) -> int { std::uint64_t Id = 0; if (std::from_chars(S.data(), S.data() + S.size(), Id, 16).ec != std::errc()) return -1; for (int i = 0; i < int(pOv->m_Events.size()); ++i) if (pOv->m_Events[i].m_Id == Id) return i; return -1; };
+            xanim_package::event_kind K{};
+            if (!KindS.empty() && !EventKindFrom(KindS, K)) return "ClipEvent: -Kind Marker|Footstep|Contact|Sync";
+            if (!Bone.empty() && PoseRigReady() && m_PT.m_Rig.Find(Bone) < 0) return std::format("ClipEvent: no bone '{}'", Bone);
+            if (!Del.empty())
+            {
+                const int k = Find(Del); if (k < 0) return std::format("ClipEvent: no event {}", Del);
+                const auto Nm = pOv->m_Events[k].m_Name;
+                if (auto Err = m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(EventsPath()), k)); !Err.empty()) return "ClipEvent: " + Err;
+                return std::format("ClipEvent: '{}' deleted", Nm);
+            }
+            if (!Add.empty())
+            {
+                xanim_package_desc::clip_event E; E.m_Id = NewEventId(); E.m_Name = Add; E.m_Kind = K;
+                E.m_Tick = std::llround(m_TimeSeconds * tl_tps_v);
+                if (!TimeS.empty() && !Ticks(TimeS, E.m_Tick)) return "ClipEvent: -Time is seconds";
+                if (!EndS.empty() && (!Ticks(EndS, E.m_EndTick) || E.m_EndTick < E.m_Tick)) return "ClipEvent: -End is seconds, not before -Time";
+                if (EndS.empty() && K == xanim_package::event_kind::CONTACT) E.m_EndTick = E.m_Tick + tl_tps_v / 4;      // a contact is an interval: a quarter second to start with
+                E.m_Bone = Bone;
+                if (auto Err = AsOneStep(std::format("Add event {}", Add), [&] { return EventAppend(E); }); !Err.empty()) return "ClipEvent: " + Err;
+                return std::format("ClipEvent: '{}' added (id {:X}) at {:.3f} s", Add, E.m_Id, double(E.m_Tick) / tl_tps_v);
+            }
+            if (!IdS.empty())
+            {
+                const int k = Find(IdS); if (k < 0) return std::format("ClipEvent: no event {}", IdS);
+                const auto E = pOv->m_Events[k];
+                const auto F = [&](const char* pF) { return std::format("{}[G:{}]/{}", EventsPath(), k, pF); };
+                auto Set = [&](const char* pF, const std::string& V, const std::string& B) { return V == B ? std::string{} : m_Undo.Execute(std::format("SetProperty -Path {} -Value {} -Before {}", xeditor::Quote(F(pF)), xeditor::Quote(V), xeditor::Quote(B))); };
+                std::int64_t T = E.m_Tick, End = E.m_EndTick;
+                if (!TimeS.empty() && !Ticks(TimeS, T)) return "ClipEvent: -Time is seconds";
+                if (!EndS.empty()) { if (EndS == "-1") End = -1; else if (!Ticks(EndS, End)) return "ClipEvent: -End is seconds (-1: a point)"; }
+                if (End >= 0 && E.m_EndTick >= 0 && EndS.empty()) End = T + (E.m_EndTick - E.m_Tick);      // moved: an interval keeps its length
+                if (End >= 0 && End < T) return "ClipEvent: the end is before the start";
+                const auto R = AsOneStep(std::format("Edit event {}", E.m_Name), [&]() -> std::string
+                {
+                    if (auto Err = Set("Tick", std::to_string(T), std::to_string(E.m_Tick)); !Err.empty()) return Err;
+                    if (auto Err = Set("EndTick", std::to_string(End), std::to_string(E.m_EndTick)); !Err.empty()) return Err;
+                    if (!KindS.empty()) if (auto Err = Set("Kind", EventKindName(K), EventKindName(E.m_Kind)); !Err.empty()) return Err;
+                    if (!Name.empty()) if (auto Err = Set("Name", Name, E.m_Name); !Err.empty()) return Err;
+                    if (!Bone.empty()) if (auto Err = Set("Bone", Bone == "-" ? std::string{} : Bone, E.m_Bone); !Err.empty()) return Err;
+                    return {};
+                });
+                return R.empty() ? std::format("ClipEvent: '{}' changed", E.m_Name) : "ClipEvent: " + R;
+            }
+            return EventsInfo();
+        }
+
+        bool PoseRigReady() noexcept { std::string E; return PoseRig(E); }
+
+        // DetectFootsteps: each foot's support contacts (the clip as composed) become Footstep bars (from where the foot lands, as long as it
+        // supports; the event fires at the landing); replaces only what it made before (user events are kept). One undo step.
+        std::string DetectFootsteps() noexcept
+        {
+            auto* pOv = SelectedOv();
+            if (!pOv) return "DetectFootsteps: select a clip first";
+            std::string Err; if (!PoseRig(Err)) return "DetectFootsteps: " + Err;
+            std::vector<xanimation::contact_interval> C[2]; int FPS = 30, nF = 0; float HipH = 0;
+            if (!FootContacts(C, FPS, nF, HipH)) return "DetectFootsteps: no feet or no frames (a humanoid foot on each side, the clip compiled)";
+            const auto& R = m_PT.m_Rig;
+            std::vector<xanim_package_desc::clip_event> New;
+            auto MakeEv = [](std::uint64_t Id, std::string N, xanim_package::event_kind K, std::int64_t A, std::int64_t B, const std::string& Bn) { xanim_package_desc::clip_event E; E.m_Id = Id; E.m_Name = std::move(N); E.m_Kind = K; E.m_Tick = A; E.m_EndTick = B; E.m_Bone = Bn; return E; };
+            std::uint64_t Id = auto_event_id_v;
+            for (int s = 0; s < 2; ++s)
+                for (const auto& I : C[s])
+                {
+                    const char* pSide = s == 0 ? "Left" : "Right";
+                    const std::string Bone = R.m_Names[s == 0 ? R.m_LF : R.m_RF];
+                    const std::int64_t A = std::llround(double(I.m_First) / FPS * tl_tps_v), B = std::llround(double(I.m_Last) / FPS * tl_tps_v);
+                    // one bar per support: a Footstep fires where the foot lands (its start) and lasts while it supports; a foot already down at
+                    // frame 0 did not land there: a Contact (no footstep sound at the clip's start)
+                    New.push_back(MakeEv(++Id, std::format("{}Foot", pSide), I.m_First > 0 ? xanim_package::event_kind::FOOTSTEP : xanim_package::event_kind::CONTACT, A, B, Bone));
+                }
+            std::sort(New.begin(), New.end(), [](const auto& a, const auto& b) { return a.m_Tick < b.m_Tick; });
+            int nOld = 0;
+            const auto Res = AsOneStep("Detect footsteps", [&]() -> std::string
+            {
+                for (int k = int(SelectedOv()->m_Events.size()) - 1; k >= 0; --k)
+                    if (SelectedOv()->m_Events[k].m_Id >= auto_event_id_v) { ++nOld; if (auto E = m_Undo.Execute(std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(EventsPath()), k)); !E.empty()) return E; }
+                for (const auto& E : New) if (auto X = EventAppend(E); !X.empty()) return X;
+                return {};
+            });
+            if (!Res.empty()) return "DetectFootsteps: " + Res;
+            int nSteps = 0; for (const auto& E : New) nSteps += E.m_Kind == xanim_package::event_kind::FOOTSTEP;
+            return std::format("DetectFootsteps: {} footsteps and {} contacts already down at the start (left {}, right {} supports; {} detected events replaced)", nSteps, New.size() - nSteps, C[0].size(), C[1].size(), nOld);
         }
 
         std::set<int> PoseEffectivePins(double Seconds) noexcept
@@ -5220,7 +5441,14 @@ namespace xanim_package_editor
             if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "KeySelected: -Time is seconds";
             return S.KeySelected(T, All == "1" || All == "true");
         }
-        case kind::auto_key:
+        case kind::clip_event:
+        {
+            std::string A, I, D, K, T, E, B, N;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, A); xeditor::cmd_util::GetArg(m_Parser, m_hB, I); xeditor::cmd_util::GetArg(m_Parser, m_hC, D); xeditor::cmd_util::GetArg(m_Parser, m_hD, K);
+            xeditor::cmd_util::GetArg(m_Parser, m_hE, T); xeditor::cmd_util::GetArg(m_Parser, m_hF, E); xeditor::cmd_util::GetArg(m_Parser, m_hG, B); xeditor::cmd_util::GetArg(m_Parser, m_hH, N);
+            return S.ClipEvent(A, I, D, K, T, E, B, N);
+        }
+        case kind::detect_footsteps: return S.DetectFootsteps();        case kind::auto_key:
         {
             std::string On; xeditor::cmd_util::GetArg(m_Parser, m_hA, On);
             S.m_PT.m_bAutoKey = On == "1" || On == "true";
