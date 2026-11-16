@@ -8,6 +8,7 @@
 // editors through xeditor::open_resource_editors.
 #include "source/Tools/Editor/xeditor_descriptor_editor.h"
 #include "source/Tools/Editor/xeditor_camera_toolbar.h"
+#include "source/Tools/Editor/xeditor_frame_recorder.h"      // Render video: the preview, frame by frame, to a video
 #include "dependencies/xeditor/include/xeditor/hint.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_inspector_pickers.h"
 #include "dependencies/xresource_pipeline_v2/source/editor/xresource_editor_resources.h"
@@ -59,7 +60,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video };
 
         session&    m_Session;
         kind        m_Kind;
@@ -201,6 +202,11 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
                 break;
             case kind::kimodo_takes_to_layers:  m_hA = m_Parser.addOption("Layer", "The Pose layer whose stored takes become Kimodo layers", true, 1); break;
+            case kind::render_video:
+                m_hA = m_Parser.addOption("Fps",     "Frames per second of the video (default 30)", false, 1);
+                m_hB = m_Parser.addOption("Seconds", "How long (default: the clip's length)", false, 1);
+                m_hC = m_Parser.addOption("Cancel",  "1: stop a recording", false, 1);
+                break;
             case kind::ball_flight:
                 m_hA = m_Parser.addOption("Effector", "What kicks it: RightFoot (default), LeftFoot, a hand or a bone", false, 1);
                 m_hB = m_Parser.addOption("Time",     "Seconds: the contact (default: the playhead)", false, 1);
@@ -257,7 +263,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
-        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd;
         // the last accepted candidate (its frames on this skeleton): KimodoTakeCheck compares the compiled take with it
         std::uint64_t m_KAcceptedLayer = 0; std::vector<xmath::transform3> m_KAcceptedFrames; int m_KAcceptedW = 0;
 
@@ -414,6 +420,7 @@ namespace xanim_package_editor
             , m_KeySelected          (m_Undo, *this, playback_cmd::kind::key_selected,            "KeySelected",          "K: keys the selected bone (or the last dragged handle as an IK key, or the pending pose when auto-key is off) at the playhead; -All 1 (Shift+K): every bone the layer owns. One undo step. Usage: KeySelected [-All 1] [-Time s]")
             , m_AutoKey              (m_Undo, *this, playback_cmd::kind::auto_key,                "AutoKey",              "Auto-key on (edits write keys) or off (an edit is a pending pose, shown, that K keys). Usage: AutoKey -On 1|0")
             , m_ClipEvent            (m_Undo, *this, playback_cmd::kind::clip_event,              "ClipEvent",            "The selected clip's events (T5: markers, footsteps, contacts, sync points; one undo step each). Usage: ClipEvent (list) | -Add name [-Kind k] [-Time s] [-End s] [-Bone b] | -Id id [-Time s] [-End s] [-Kind k] [-Name n] [-Bone b] | -Delete id")
+            , m_RenderVideoCmd       (m_Undo, *this, playback_cmd::kind::render_video,            "RenderVideo",          "The selected clip as a video, as the preview shows it (skin, props, camera): one frame per editor frame, then ffmpeg encodes Cache\\Temp\\AnimVideo\\<clip>.mp4 (the frames stay in Cache\\Temp\\AnimVideo\\<clip>). Usage: RenderVideo [-Fps 30] [-Seconds s] [-Cancel 1]")
             , m_BallFlight           (m_Undo, *this, playback_cmd::kind::ball_flight,             "BallFlight",           "A kick's check: the ball (a preview prop) leaves with the kicking handle's speed at the contact (x1.1: a typical instep kick's transfer), its flight drawn for 2 s or to the ground (no air drag); reports speed, launch angle, height, distance. Usage: BallFlight [-Effector RightFoot] [-Time s] [-Prop Ball] [-Off 1]")
             , m_DetectFootsteps      (m_Undo, *this, playback_cmd::kind::detect_footsteps,        "DetectFootsteps",      "Finds each foot's support contacts in the clip as composed: a Footstep where it lands and a Contact bar over the support (replaces only what it detected before; one undo step). Usage: DetectFootsteps")
             , m_KimodoTakeCheck      (m_Undo, *this, playback_cmd::kind::kimodo_take_check,       "KimodoTakeCheck",      "The compiled take of the last accepted Kimodo candidate against the candidate itself (every frame, every bone). Usage: KimodoTakeCheck")
@@ -429,7 +436,7 @@ namespace xanim_package_editor
             AddPanel("Clips",                dock::right,  [this] { RenderClips(); });
             AddPanel("Kimodo",               dock::right,  [this] { RenderKimodo(); });
             AddPanel("Layers",               dock::right,  [this] { RenderLayers(); });
-            if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value, 320.0f, 200.0f);     // (with Skin and Follow)
+            if (pDevice) m_CameraToolbar.Init(m_Document.m_Guid.m_Instance.m_Value, 390.0f, 230.0f);     // (with Skin, Follow and Video)
             AddPanel("AnimPackage Viewport", dock::center, [this] { RenderViewport(); }, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             AddPanel("Timeline",             dock::bottom_wide, [this] { RenderPlayback(); });       // under the viewport and the side columns
             m_TLView.m_HeaderWidth = 380;                                                               // name + weight + mode + mask + eye/solo/lock
@@ -4274,6 +4281,29 @@ namespace xanim_package_editor
         // at 60 Hz) times 1.1 (an instep kick: (1 + e) M / (M + m) with e 0.5, the leg's 1.2 kg against the ball's 0.43); a parabola under
         // gravity (model units are metres; no air drag) until it comes back to the ball's start height or 2 s. ponytail: no spin, no drag.
         std::vector<xmath::fvec3> m_Flight;
+        // Render video: the selected clip, paused, stepped one video frame per editor frame (xeditor::frame_recorder); its frames and the video
+        // go to <project>\Cache\Temp\AnimVideo (the clip's name)
+        xeditor::frame_recorder m_Recorder;
+        bool                    m_bRecorderWasRunning = false;
+        std::string StartVideo(int Fps, float Seconds) noexcept
+        {
+            auto* pClip = SelectedClip();
+            if (!pClip) return "RenderVideo: no clip is selected";
+            if (m_K.m_bPreview) return "RenderVideo: a Kimodo preview is showing (accept or discard it first)";
+            if (m_Recorder.Running()) return "RenderVideo: already recording (RenderVideo -Cancel 1 stops it)";
+            const float Length = Seconds > 0 ? Seconds : ClipLength(*pClip);
+            std::string Name = "clip";
+            if (auto* pDesc = Desc(); pDesc && m_iSelectedSource >= 0 && m_iSelectedSource < int(pDesc->m_ImportSources.size()))
+                if (const auto& Clips = pDesc->m_ImportSources[m_iSelectedSource].m_Clips; m_iSelectedDescriptorClip >= 0 && m_iSelectedDescriptorClip < int(Clips.size())) Name = Clips[m_iSelectedDescriptorClip].m_Name;
+            for (auto& c : Name) if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') c = '_';
+            const auto Dir = ProjectPath() / L"Cache" / L"Temp" / L"AnimVideo";
+            const int nFrames = std::max(1, int(std::ceil(Length * float(Fps) - 1e-4f)));
+            m_bPlaying = false;
+            m_Recorder.Start(Dir / Name, Dir / (Name + ".mp4"), nFrames, Fps);
+            m_bRecorderWasRunning = true;
+            return std::format("RenderVideo: recording {} frames ({:.2f} s at {} fps) to {}", nFrames, Length, Fps, (Dir / Name).string());
+        }
+
         std::string BallFlight(const std::string& Effector, double Seconds, const std::string& Prop) noexcept
         {
             std::string Err;
@@ -5204,6 +5234,9 @@ namespace xanim_package_editor
 
         void RenderViewport() noexcept
         {
+            if (const int f = m_Recorder.Frame(); f >= 0) { m_bPlaying = false; m_TimeSeconds = float(f) / float(m_Recorder.m_Fps); m_LoopsElapsed = 0; }
+            else if (m_bRecorderWasRunning && !m_Recorder.Running()) { m_bRecorderWasRunning = false; xeditor::LogConsole(m_Recorder.m_Result, xeditor::log_source::User); }
+            m_Viewport.m_Scene.m_State.m_bHideOverlay = m_Recorder.Running();
             m_CameraToolbar.Render(ImGui::GetContentRegionAvail(), m_Viewport.m_Scene.m_State, [this] { RenderViewportBody(); }
                                   , [this](bool bHorizontal, float ButtonHeight)
                                     {
@@ -5214,7 +5247,18 @@ namespace xanim_package_editor
                                         if (ImGui::Button(bHorizontal ? "Follow###Follow" : "F###Follow", bHorizontal ? ImVec2(60.0f, ButtonHeight) : ImVec2(32.0f, ButtonHeight))) { m_bFollow = !m_bFollow; m_bFollowHas = false; }
                                         if (bOn) ImGui::PopStyleColor();
                                         if (ImGui::IsItemHovered()) xeditor::hint::Text("The camera follows the character as it moves (%s)", bOn ? "on" : "off");
+                                        if (bHorizontal) ImGui::SameLine();
+                                        const bool bRec = m_Recorder.Running();
+                                        if (bRec) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
+                                        const std::string Label = bRec ? std::format("{}/{}###Video", m_Recorder.m_iShown, m_Recorder.m_nFrames) : std::string(bHorizontal ? "Video###Video" : "V###Video");
+                                        if (ImGui::Button(Label.c_str(), bHorizontal ? ImVec2(60.0f, ButtonHeight) : ImVec2(32.0f, ButtonHeight)))
+                                            xeditor::LogConsole(bRec ? m_Undo.Query("RenderVideo -Cancel 1") : m_Undo.Query("RenderVideo"), xeditor::log_source::User);
+                                        if (bRec) ImGui::PopStyleColor();
+                                        if (ImGui::IsItemHovered()) xeditor::hint::Text(bRec ? "Recording the clip to a video: click to stop" : "Render video: the selected clip as the preview shows it (skin, props, camera), 30 fps, to Cache\\Temp\\AnimVideo (ffmpeg encodes the .mp4)");
                                     });
+            if (m_Recorder.Running())          // (this frame's view, read back at the flip; the next frame writes it)
+                if (auto* pHost = xeditor::host::current())
+                    if (auto* pWindow = pHost->find<xgpu::window>()) m_Recorder.Capture(*pWindow, m_Viewport.RectMin(), m_Viewport.RectSize());
         }
 
         void RenderViewportBody() noexcept
@@ -5276,7 +5320,7 @@ namespace xanim_package_editor
             DrawPreviewProps();
             m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
             m_Viewport.m_Under = nullptr;
-            PoseAfterRender(Item);
+            if (!m_Recorder.Running()) PoseAfterRender(Item);     // (a video shows the clip, not the handles)
 
             // mask editing: a click on a bone adds it (with its branch; Shift: alone) to the selected layer's mask, or removes it
             if (m_bMaskEdit && m_Viewport.Over() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
@@ -5603,6 +5647,15 @@ namespace xanim_package_editor
             return S.ClipEvent(A, I, D, K, T, E, B, N);
         }
         case kind::detect_footsteps: return S.DetectFootsteps();
+        case kind::render_video:
+        {
+            std::string F, Sec, Cancel; int Fps = 30; float Seconds = 0;
+            xeditor::cmd_util::GetArg(m_Parser, m_hC, Cancel);
+            if (Cancel == "1" || Cancel == "true") { if (!S.m_Recorder.Running()) return "RenderVideo: not recording"; S.m_Recorder.Cancel(); S.m_bRecorderWasRunning = false; return S.m_Recorder.m_Result; }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hA, F) && (std::from_chars(F.data(), F.data() + F.size(), Fps).ec != std::errc() || Fps < 1 || Fps > 120)) return "RenderVideo: -Fps is 1 to 120";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Sec) && (std::from_chars(Sec.data(), Sec.data() + Sec.size(), Seconds).ec != std::errc() || Seconds <= 0)) return "RenderVideo: -Seconds is a positive number";
+            return S.StartVideo(Fps, Seconds);
+        }
         case kind::ball_flight:
         {
             std::string Eff = "RightFoot", Time, Prop = "Ball", Off; double T = S.m_TimeSeconds;
