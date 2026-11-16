@@ -814,21 +814,44 @@ namespace xanim_package_editor
                 }
                 else if (Op == "move" && n == 3)
                 {
-                    if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
-                    int t = 0;                                          // the final index: above row X = right after its layer in the mix order
+                    // the row's layers (every segment of a merged row) leave the list and land together, in their order, right above row X
+                    // (after its top layer in the mix order; the bottom / the clip row: first)
+                    for (int m : Mem) if (pOv->m_Layers[m].m_bLock) return std::format("layer '{}' is locked", pOv->m_Layers[m].m_Name);
+                    std::vector<int> M = Mem; std::sort(M.begin(), M.end());
+                    const int N = int(pOv->m_Layers.size());
+                    std::vector<int> Rest; for (int i = 0; i < N; ++i) if (!std::binary_search(M.begin(), M.end(), i)) Rest.push_back(i);
+                    int p = 0;
                     if (X && X != tl_base_row_v)
                     {
                         const auto* pA = RowOf(X); if (!pA) return std::format("no row {}", X);
-                        const int a = pA->m_iLayer - (iL < pA->m_iLayer ? 1 : 0);
-                        t = a + 1;
+                        const auto XM = pA->m_bMerged ? TLMembers(X) : std::vector<int>{ pA->m_iLayer };
+                        const int Top = *std::max_element(XM.begin(), XM.end());
+                        if (std::binary_search(M.begin(), M.end(), Top)) return "no change";
+                        p = int(std::find(Rest.begin(), Rest.end(), Top) - Rest.begin()) + 1;
                     }
+                    std::vector<int> Final(Rest.begin(), Rest.begin() + p);
+                    Final.insert(Final.end(), M.begin(), M.end()); Final.insert(Final.end(), Rest.begin() + p, Rest.end());
                     // contract v3: the row joins the folder or group of the row it lands above (the bottom / the clip row: the top level)
                     const std::uint64_t NewParent = (X && X != tl_base_row_v) ? TLParentOf(*pOv, RowOf(X)->m_iLayer) : 0;
-                    if (NewParent && L.m_Id && TLIsWithin(*pOv, NewParent, L.m_Id)) return std::format("'{}' cannot go inside itself", L.m_Name);
-                    const std::uint64_t OldParent = L.m_Parent;
-                    if (t == iL && NewParent == TLParentOf(*pOv, iL)) return "no change";
-                    if (t != iL) Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Move -Index {} -ToIndex {}", xeditor::Quote(LayersPath()), iL, t)); });
-                    if (NewParent != TLParentOf(*pOv, iL)) Steps.push_back([=, this] { return Set(t, "Parent", std::to_string(NewParent), std::to_string(OldParent)); });
+                    for (int m : M) if (NewParent && pOv->m_Layers[m].m_Id && TLIsWithin(*pOv, NewParent, pOv->m_Layers[m].m_Id)) return std::format("'{}' cannot go inside itself", pOv->m_Layers[m].m_Name);
+                    bool bSameOrder = true; for (int k = 0; k < N; ++k) bSameOrder = bSameOrder && Final[k] == k;
+                    if (bSameOrder && NewParent == TLParentOf(*pOv, M[0])) return "no change";
+                    // the moves, one by one on a simulated list (each ListOp Move takes the element out and puts it back at ToIndex)
+                    std::vector<int> Sim(N); for (int k = 0; k < N; ++k) Sim[k] = k;
+                    for (int k = 0; k < N; ++k)
+                    {
+                        const int j = int(std::find(Sim.begin(), Sim.end(), Final[k]) - Sim.begin());
+                        if (j == k) continue;
+                        Steps.push_back([=, this] { return m_Undo.Execute(std::format("ListOp -Path {} -Op Move -Index {} -ToIndex {}", xeditor::Quote(LayersPath()), j, k)); });
+                        const int v = Sim[j]; Sim.erase(Sim.begin() + j); Sim.insert(Sim.begin() + k, v);
+                    }
+                    for (int m : M)
+                        if (NewParent != TLParentOf(*pOv, m))
+                        {
+                            const int At = int(std::find(Final.begin(), Final.end(), m) - Final.begin());
+                            const std::uint64_t Old = pOv->m_Layers[m].m_Parent;
+                            Steps.push_back([=, this] { return Set(At, "Parent", std::to_string(NewParent), std::to_string(Old)); });
+                        }
                 }
                 else if (Op == "into" && n == 3)        // "into row container_row": the row goes inside a folder or group (on top of its children)
                 {
@@ -947,7 +970,7 @@ namespace xanim_package_editor
             std::string   Delete(std::span<const xeditor::timeline::item_ref> R) override
             { std::string Ops; for (auto& r : R) if (m_S.m_TLRows.count(r.m_Row) && !m_S.m_TLRows[r.m_Row].m_Bone.empty()) Ops += std::format("delete {} {}; ", r.m_Row, r.m_Item); return Ops.empty() ? std::string("only pose keys can be deleted here") : Run(Ops); }
             std::string   SetRowFlag(std::uint64_t Row, xeditor::timeline::row_flag F, bool bOn) override { return m_S.m_TLRows.count(Row) ? Run(std::format("{} {} {}", F == xeditor::timeline::row_flag::mute ? "mute" : "lock", Row, int(bOn))) : std::string("the clip row has no flags"); }
-            bool          CanMoveRow(std::uint64_t Row) override { return m_S.m_TLRows.count(Row) && m_S.m_TLRows[Row].m_Bone.empty() && !m_S.m_TLRows[Row].m_bMerged; }   // ponytail: a row of segments is reordered by its layers (split, move, join)
+            bool          CanMoveRow(std::uint64_t Row) override { return m_S.m_TLRows.count(Row) && m_S.m_TLRows[Row].m_Bone.empty() && !m_S.m_TLRows[Row].m_bWeight; }   // a row of segments moves as one unit
             std::string   MoveRow(std::uint64_t Row, std::uint64_t Above) override { return Run(std::format("move {} {}", Row, Above)); }
             bool          CanDropInto(std::uint64_t Row) override
             {
@@ -1023,7 +1046,7 @@ namespace xanim_package_editor
                     {
                         const auto& K = L.m_WeightKeys[k];
                         tl::item I; I.m_Ref = { R.m_Id, std::uint64_t(k + 1) }; I.m_Kind = tl::item_kind::key; I.m_Seg = { K.m_Tick, K.m_Tick }; I.m_Caps = tl::caps::move | tl::caps::del;
-                        I.m_Value = K.m_Value; I.m_ValueMin = 0; I.m_ValueMax = 1; I.m_Label = std::format("weight {:.2f}{}", K.m_Value, K.m_bStep ? " (step)" : "");
+                        I.m_Value = K.m_Value; I.m_ValueMin = 0; I.m_ValueMax = 1; I.m_bStepValue = K.m_bStep; I.m_Label = std::format("weight {:.2f}{}", K.m_Value, K.m_bStep ? " (step)" : "");
                         Out.push_back(std::move(I));
                     }
                     return;
@@ -1645,9 +1668,10 @@ namespace xanim_package_editor
                 if (ImGui::Button("Regenerate")) xeditor::LogConsole(KimodoRegenerate(m_iLayer, {}).substr(0, 400), xeditor::log_source::User);
                 ImGui::SameLine();
                 if (ImGui::Button("Alternatives")) xeditor::LogConsole(KimodoRegenerate(m_iLayer, std::format("{} {} {}", KL.m_Seed, KL.m_Seed + 1, KL.m_Seed + 2)).substr(0, 400), xeditor::log_source::User);
-                if (m_KL.m_LayerId == KL.m_Id && m_KL.m_Job == "candidate")
+                if (m_KL.m_LayerId == KL.m_Id && (m_KL.m_Job == "candidate" || m_KL.m_Job == "running"))      // each candidate as soon as its seed is done
                     for (int c = 0; c < int(m_KL.m_Cands.size()); ++c)
                     {
+                        if (!KimodoLayerDone(c)) continue;
                         ImGui::PushID(1000 + c);
                         if (ImGui::RadioButton(std::format("seed {} (seam {:.1f} cm)", m_KL.m_Cands[c].m_Seed, m_KL.m_Cands[c].m_SeamCm).c_str(), m_KL.m_iShow == c)) m_KL.m_iShow = c;
                         ImGui::SameLine(); if (ImGui::SmallButton("Accept")) xeditor::LogConsole(KimodoAcceptCandidate(c), xeditor::log_source::User);
@@ -2078,7 +2102,7 @@ namespace xanim_package_editor
         // Constraints rule (stated in every request): full-body poses of the stack below the layer at the segment's first and last frame and
         // at every Pose-layer key time inside it (at most 16), and the root path of the stack below over the whole segment.
         //----------------------------------------------------------------------------------------
-        struct kimodo_layer_cand { int m_Seed = 1; std::wstring m_Bvh; std::vector<xmath::transform3> m_Frames; float m_SeamCm = 0; double m_Ms = 0; };
+        struct kimodo_layer_cand { int m_Seed = 1; std::wstring m_Bvh; std::vector<xmath::transform3> m_Frames; float m_SeamCm = 0; double m_Ms = 0; int m_iJob = -1; bool m_bDone = false; };
         struct kimodo_layer_state
         {
             std::uint64_t                   m_LayerId = 0;
@@ -2099,7 +2123,11 @@ namespace xanim_package_editor
             std::vector<xmath::fvec3>       m_B0, m_B1;         // the stack below's first/last frame (the seam measure)
             std::string                     m_Text;             // the report so far
         } m_KL;
-        kimodo::job                         m_KLJob;            // one xkimodo client run at a time, polled once a frame
+        // the seeds run side by side, at most this many clients at once (ponytail: 3, the warm server queues what it cannot run together),
+        // each polled once a frame; a candidate appears as soon as its seed finishes
+        static constexpr int                kimodo_jobs_v = 3;
+        std::array<kimodo::job, kimodo_jobs_v> m_KLJobs;
+        bool KimodoLayerDone(int c) const noexcept { return c >= 0 && c < int(m_KL.m_Cands.size()) && m_KL.m_Cands[c].m_bDone; }
 
         static std::string KimodoReqSig(const xanim_package_desc::clip_layer& L)
         {
@@ -2111,9 +2139,9 @@ namespace xanim_package_editor
             if (!L.m_SourceKey.empty()) S += KimodoReqSig(L) == L.m_AcceptedSig ? ", matches its request" : ", request changed";
             if (L.m_Id && m_KL.m_LayerId == L.m_Id)
             {
-                if (m_KL.m_Job == "candidate") S += std::format(", {} candidate(s){}", m_KL.m_Cands.size(), m_KL.m_Sig == LayersSigNow() ? "" : " (stale)");
+                if (m_KL.m_Job == "candidate") S += std::format(", {} candidate(s){}", std::count_if(m_KL.m_Cands.begin(), m_KL.m_Cands.end(), [](const auto& C) { return C.m_bDone; }), m_KL.m_Sig == LayersSigNow() ? "" : " (stale)");
                 if (m_KL.m_Job == "failed") S += ", generation failed: " + m_KL.m_LastError;
-                if (m_KL.m_Job == "running") S += std::format(", generating ({} done)...", m_KL.m_Cands.size() - 1);
+                if (m_KL.m_Job == "running") S += std::format(", generating ({} done)...", std::count_if(m_KL.m_Cands.begin(), m_KL.m_Cands.end(), [](const auto& C) { return C.m_bDone; }));
                 if (m_KL.m_Job == "stale") S += ", " + m_KL.m_LastError;
             }
             return S;
@@ -2270,8 +2298,8 @@ namespace xanim_package_editor
             auto Pos = [&](const std::vector<xmath::transform3>& F, int f) { xanimation::pose P; P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, F[std::size_t(f) * nB + b]); FK.ComputeWorld(P); std::vector<xmath::fvec3> V(nB); for (int b = 0; b < nB; ++b) V[b] = FK.WorldPosition(b); return V; };
             const auto B0 = Pos(Win, 0), B1 = Pos(Win, W - 1);
 
-            // in the background (T4b): the seeds run one after another through the xkimodo client, polled once a frame; this returns at once
-            m_KLJob.Cancel();
+            // in the background (T4b): the seeds run side by side (bounded) through the xkimodo client, polled once a frame; this returns at once
+            for (auto& J : m_KLJobs) J.Cancel();
             m_KL = {};
             m_KL.m_LayerId = L.m_Id; m_KL.m_Sig = LayersSigNow(); m_KL.m_ReqSig = KimodoReqSig(L); m_KL.m_KS = KS; m_KL.m_Start = L.m_Start; m_KL.m_W = W;
             m_KL.m_Exe = Exe; m_KL.m_Stem = Stem; m_KL.m_Steps = std::clamp(L.m_Steps, 1, 200); m_KL.m_B0 = B0; m_KL.m_B1 = B1;
@@ -2281,18 +2309,25 @@ namespace xanim_package_editor
             while (In >> Seed) m_KL.m_Pending.push_back(Seed);
             if (m_KL.m_Pending.empty()) return Text + "KimodoRegenerate: no seed";
             m_KL.m_Text = Text;
+            const int nSeeds = int(m_KL.m_Pending.size());
             if (!KimodoLayerStartNext(Err)) return Text + "KimodoRegenerate: " + Err;
-            return Text + std::format("  running in the background ({} seed(s)); the row shows it; KimodoRegenerate -Wait 1 waits", m_KL.m_Pending.size() + 1);
+            return Text + std::format("  running in the background ({} seed(s), up to {} at once); the row shows it; KimodoRegenerate -Wait 1 waits", nSeeds, kimodo_jobs_v);
         }
 
+        // starts pending seeds on every free client slot
         bool KimodoLayerStartNext(std::string& Err) noexcept
         {
-            const int Seed = m_KL.m_Pending.front(); m_KL.m_Pending.erase(m_KL.m_Pending.begin());
-            const auto Bvh = std::format(L"{}_s{}.bvh", m_KL.m_Stem, Seed);
-            const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --steps {} --seed {} --constraints \"{}.json\" --bvh \"{}\"", m_KL.m_Prompt, m_KL.m_W, m_KL.m_Steps, Seed, m_KL.m_Stem, Bvh);
-            if (!m_KLJob.StartArgs(m_KL.m_Exe, Args, Bvh, std::format(L"{}_s{}.log", m_KL.m_Stem, Seed), Err)) { m_KL.m_Job = "failed"; m_KL.m_LastError = Err; return false; }
-            m_KL.m_Job = "running";
-            m_KL.m_Cands.push_back({ .m_Seed = Seed, .m_Bvh = Bvh });           // its frames when it ends
+            for (int j = 0; j < kimodo_jobs_v && !m_KL.m_Pending.empty(); ++j)
+            {
+                if (m_KLJobs[j].m_bRunning) continue;
+                const int Seed = m_KL.m_Pending.front(); m_KL.m_Pending.erase(m_KL.m_Pending.begin());
+                const auto Bvh = std::format(L"{}_s{}.bvh", m_KL.m_Stem, Seed);
+                const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --steps {} --seed {} --constraints \"{}.json\" --bvh \"{}\"", m_KL.m_Prompt, m_KL.m_W, m_KL.m_Steps, Seed, m_KL.m_Stem, Bvh);
+                if (!m_KLJobs[j].StartArgs(m_KL.m_Exe, Args, Bvh, std::format(L"{}_s{}.log", m_KL.m_Stem, Seed), Err)) { m_KL.m_Text += std::format("  seed {}: {}\n", Seed, Err); continue; }
+                m_KL.m_Job = "running";
+                m_KL.m_Cands.push_back({ .m_Seed = Seed, .m_Bvh = Bvh, .m_iJob = j });     // its frames when it ends
+            }
+            if (m_KL.m_Job != "running") { m_KL.m_Job = "failed"; m_KL.m_LastError = Err.empty() ? "no seed could start" : Err; return false; }
             return true;
         }
 
@@ -2300,9 +2335,29 @@ namespace xanim_package_editor
         // binds to a changed, moved or deleted segment: it is dropped as stale)
         void KimodoLayerPoll() noexcept
         {
-            bool Ok = false; std::string Msg;
-            if (!m_KLJob.Poll(Ok, Msg) || m_KL.m_Job != "running" || m_KL.m_Cands.empty()) return;
-            auto& C = m_KL.m_Cands.back();
+            for (int j = 0; j < kimodo_jobs_v; ++j)
+            {
+                bool Ok = false; std::string Msg;
+                if (!m_KLJobs[j].Poll(Ok, Msg) || m_KL.m_Job != "running") continue;
+                int c = -1; for (int i = 0; i < int(m_KL.m_Cands.size()); ++i) if (m_KL.m_Cands[i].m_iJob == j && !m_KL.m_Cands[i].m_bDone) c = i;
+                if (c >= 0) KimodoLayerFinish(c, Ok, Msg);
+                if (m_KL.m_Job != "running") { for (auto& J : m_KLJobs) J.Cancel(); return; }      // stale: the other seeds are dropped too
+            }
+            if (m_KL.m_Job != "running") return;
+            std::string Err;
+            if (!m_KL.m_Pending.empty()) { KimodoLayerStartNext(Err); return; }
+            bool bBusy = false; for (const auto& J : m_KLJobs) bBusy = bBusy || J.m_bRunning;
+            if (bBusy) return;
+            // all seeds ended: the candidates that made it (a failed seed stays listed, not done, never shown or accepted)
+            if (std::none_of(m_KL.m_Cands.begin(), m_KL.m_Cands.end(), [](const auto& C) { return C.m_bDone; })) { m_KL.m_Job = "failed"; if (m_KL.m_LastError.empty()) m_KL.m_LastError = "no seed made a candidate"; return; }
+            m_KL.m_Job = "candidate";
+        }
+
+        // one seed ended: its candidate (or why not); a late result for a changed segment makes the whole run stale
+        void KimodoLayerFinish(int c, bool Ok, const std::string& Msg) noexcept
+        {
+            auto& C = m_KL.m_Cands[c];
+            const int Slot = C.m_iJob; C.m_iJob = -1;
             const xanim_package_desc::clip_layer* pL = nullptr;
             if (auto* pOv = SelectedOv()) for (const auto& L : pOv->m_Layers) if (L.m_Id == m_KL.m_LayerId) pL = &L;
             if (!pL || KimodoReqSig(*pL) != m_KL.m_ReqSig) { m_KL.m_Job = "stale"; m_KL.m_LastError = "the segment changed while it generated (moved, edited or deleted): regenerate"; m_KL.m_Cands.clear(); m_KL.m_Pending.clear(); return; }
@@ -2310,7 +2365,7 @@ namespace xanim_package_editor
             auto* pCtx = KimodoRetargetCtx(Err); auto* pDesc = Desc();
             kimodo::bvh B;
             if (!Ok || !pCtx || !pDesc || !B.Load(C.m_Bvh, Err) || B.m_nFrames < m_KL.m_W)
-            { m_KL.m_Job = "failed"; m_KL.m_LastError = !Ok ? (Msg.empty() ? "xkimodo failed" : Msg) : Err.empty() ? "too few frames" : Err; m_KL.m_Cands.pop_back(); m_KL.m_Pending.clear(); return; }
+            { m_KL.m_LastError = !Ok ? (Msg.empty() ? "xkimodo failed" : Msg) : Err.empty() ? "too few frames" : Err; m_KL.m_Text += std::format("  seed {}: {}\n", C.m_Seed, m_KL.m_LastError); return; }
             const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size()), W = m_KL.m_W;
             C.m_Frames = FromKimodo(*pCtx, B, m_KL.m_KS, nB); C.m_Frames.resize(std::size_t(W) * nB);
             std::vector<std::int32_t> Parents(nB);
@@ -2319,10 +2374,10 @@ namespace xanim_package_editor
             auto Pos = [&](int f) { xanimation::pose P; P.resize(nB); for (int b = 0; b < nB; ++b) P.set(b, C.m_Frames[std::size_t(f) * nB + b]); FK.ComputeWorld(P); std::vector<xmath::fvec3> V(nB); for (int b = 0; b < nB; ++b) V[b] = FK.WorldPosition(b); return V; };
             const auto C0 = Pos(0), C1 = Pos(W - 1);
             if (int(m_KL.m_B0.size()) == nB) for (int b = 0; b < nB; ++b) C.m_SeamCm = std::max({ C.m_SeamCm, (C0[b] - m_KL.m_B0[b]).Length() * 100.0f, (C1[b] - m_KL.m_B1[b]).Length() * 100.0f });
-            C.m_Ms = (ImGui::GetTime() - m_KLJob.m_StartTime) * 1000.0;
-            m_KL.m_Text += std::format("  candidate {} (seed {}): {:.0f} ms; the seam (first/last frame vs the stack below) max {:.2f} cm\n", m_KL.m_Cands.size() - 1, C.m_Seed, C.m_Ms, C.m_SeamCm);
-            if (!m_KL.m_Pending.empty()) { if (!KimodoLayerStartNext(Err)) m_KL.m_Text += "  " + Err + "\n"; return; }
-            m_KL.m_Job = "candidate"; m_KL.m_iShow = 0;
+            C.m_Ms = (kimodo::job::Now() - m_KLJobs[Slot].m_StartTime) * 1000.0;
+            C.m_bDone = true;
+            if (!KimodoLayerDone(m_KL.m_iShow)) m_KL.m_iShow = c;          // the first one ready is shown
+            m_KL.m_Text += std::format("  candidate {} (seed {}): {:.0f} ms; the seam (first/last frame vs the stack below) max {:.2f} cm\n", c, C.m_Seed, C.m_Ms, C.m_SeamCm);
         }
 
         // a generated window into the clip's space: the root's channels un-normalized (Kimodo starts at the origin facing +Z), the rest kept
@@ -2381,7 +2436,8 @@ namespace xanim_package_editor
         {
             auto* pOv = SelectedOv(); auto* pDesc = Desc();
             if (!pOv || !pDesc) return "KimodoAcceptCandidate: select a clip first";
-            if (m_KL.m_Job != "candidate" || iCand < 0 || iCand >= int(m_KL.m_Cands.size())) return "KimodoAcceptCandidate: no such candidate (KimodoRegenerate first)";
+            if ((m_KL.m_Job != "candidate" && m_KL.m_Job != "running") || !KimodoLayerDone(iCand)) return "KimodoAcceptCandidate: no such candidate ready (KimodoRegenerate first, or wait for that seed)";
+            for (auto& J : m_KLJobs) J.Cancel();                    // accepting ends the run: the seeds still generating are dropped
             int iL = -1;
             for (int i = 0; i < int(pOv->m_Layers.size()); ++i) if (pOv->m_Layers[i].m_Id == m_KL.m_LayerId) iL = i;
             if (iL < 0) return "KimodoAcceptCandidate: the layer is gone";
@@ -2609,7 +2665,7 @@ namespace xanim_package_editor
         // the shown candidate, drawn as the pose at the playhead when it is inside the candidate's span
         void KimodoPreviewBones() noexcept
         {
-            if (m_KL.m_Job != "candidate" || m_KL.m_iShow < 0 || m_KL.m_iShow >= int(m_KL.m_Cands.size())) return;
+            if ((m_KL.m_Job != "candidate" && m_KL.m_Job != "running") || !KimodoLayerDone(m_KL.m_iShow)) return;
             const int f = int(std::lround((m_TimeSeconds - m_KL.m_Start / 6000.0) * 30.0));
             if (f < 0 || f >= m_KL.m_W) return;
             std::string Err;
@@ -4129,7 +4185,7 @@ namespace xanim_package_editor
             ImGui::EndDisabled();
             if (bBusy)
             {
-                ImGui::SameLine(); ImGui::Text("generating... %.0f s", ImGui::GetTime() - m_K.m_Job.m_StartTime);
+                ImGui::SameLine(); ImGui::Text("generating... %.0f s", kimodo::job::Now() - m_K.m_Job.m_StartTime);
                 ImGui::SameLine(); if (ImGui::Button("Cancel")) { m_K.m_Job.Cancel(); m_K.m_Status = "cancelled"; }
             }
 
@@ -4686,7 +4742,7 @@ namespace xanim_package_editor
         {
             std::string C; int i = -1;
             if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, C) || std::from_chars(C.data(), C.data() + C.size(), i).ec != std::errc()) return "KimodoShow: -Candidate i";
-            if (i >= int(S.m_KL.m_Cands.size())) return "KimodoShow: no such candidate";
+            if (i >= 0 && !S.KimodoLayerDone(i)) return "KimodoShow: no such candidate ready";
             S.m_KL.m_iShow = i; return std::format("KimodoShow: {}", i < 0 ? "none" : std::format("candidate {}", i));
         }
         case kind::bake_to_pose:

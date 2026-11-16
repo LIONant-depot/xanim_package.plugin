@@ -157,7 +157,8 @@ namespace xanim_package_editor::kimodo
     {
         PROCESS_INFORMATION     m_PI{};
         bool                    m_bRunning = false;
-        double                  m_StartTime = 0;
+        double                  m_StartTime = 0;            // wall clock (Now), not ImGui's: a script waiting in a command runs no frames
+        static double Now() noexcept { return double(GetTickCount64()) / 1000.0; }
         std::wstring            m_Bvh, m_Log;
 
         bool Start(const std::wstring& Exe, const std::wstring& TempDir, const std::string& Prompt, float Seconds, int Seed, std::string& Error) noexcept
@@ -180,7 +181,7 @@ namespace xanim_package_editor::kimodo
             const BOOL Ok = CreateProcessW(nullptr, Cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &SI, &m_PI);
             if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
             if (!Ok) { Error = std::format("xkimodo could not start (error {})", GetLastError()); return false; }
-            m_bRunning = true; m_StartTime = ImGui::GetTime();
+            m_bRunning = true; m_StartTime = Now();
             return true;
         }
 
@@ -198,7 +199,7 @@ namespace xanim_package_editor::kimodo
             const BOOL Ok = CreateProcessW(nullptr, Cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &SI, &m_PI);
             if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
             if (!Ok) { Error = std::format("xkimodo could not start (error {})", GetLastError()); return false; }
-            m_bRunning = true; m_StartTime = ImGui::GetTime();
+            m_bRunning = true; m_StartTime = Now();
             return true;
         }
 
