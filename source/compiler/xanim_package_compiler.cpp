@@ -626,6 +626,12 @@ namespace xanim_package_compiler
                         std::vector<float> Sm(Yaw.size());
                         for (int f = 0; f < N; ++f) { double S = 0; for (int k = f - H; k <= f + H; ++k) S += At(k); Sm[static_cast<std::size_t>(f)] = float(S / double(2 * H + 1)); }
                         const float Zero = Sm.empty() ? 0.0f : Sm.front();
+                        double Sq = 0; float Worst = 0;             // (data check: how far the body's heading swings around its facing)
+                        for (int f = 0; f < N; ++f) { const float d = Yaw[static_cast<std::size_t>(f)] - Sm[static_cast<std::size_t>(f)]; Sq += double(d) * d; Worst = std::max(Worst, std::abs(d)); }
+                        const float Rms = float(std::sqrt(Sq / std::max(1, N))) * 57.29578f; Worst *= 57.29578f;
+                        LogMessage(Worst > 20.0f ? xresource_pipeline::msg_type::WARNING : xresource_pipeline::msg_type::INFO
+                            , std::format("Clip '{}': the body's heading swings up to {:.1f} deg (rms {:.1f}) around its facing{}", CompiledName, Worst, Rms
+                            , Worst > 20.0f ? " - more than a gait's sway: motion matching reads its facing poorly (a strafe or a turn generated without a path/heading constraint?)" : ""));
                         for (auto& y : Sm) y -= Zero;
                         Yaw.swap(Sm);
                         for (float y : Yaw) Far = std::max(Far, std::abs(y));
@@ -1053,8 +1059,7 @@ namespace xanim_package_compiler
                     const auto Tr = xanimation::MeasureClip(xanimation::skeleton_view{ Par }, Nm, CV, RM, RT);
                     D.m_Speed = Tr.m_Speed; D.m_Direction = Tr.m_Direction; D.m_TurnRate = Tr.m_TurnRate; D.m_LoopError = Tr.m_LoopError; D.m_Height = Tr.m_Height;
                     LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': moves {:.2f} units/s at {:.0f} deg from its facing, turns {:.1f} deg/s, its ends {:.1f} deg apart{}, centroid height {:.2f}"
-                        , Names[i], Tr.m_Speed, Tr.m_Direction, Tr.m_TurnRate, Tr.m_LoopError, Tr.m_LoopError < 5 ? " (loops)" : "", Tr.m_Height));
-                }
+                        , Names[i], Tr.m_Speed, Tr.m_Direction, Tr.m_TurnRate, Tr.m_LoopError, Tr.m_LoopError < 5 ? " (loops)" : "", Tr.m_Height));                }
             }
 
             m_FinalPackage.m_nBones = static_cast<std::uint32_t>(ResolvedBones.size());
