@@ -539,10 +539,17 @@ namespace xanim_package_compiler
                             for (int f = 0; f < OutFrames; ++f) { const auto H = HipsAt(f); Travel[f] = xmath::fvec3(H.m_X - H0.m_X, 0, H.m_Z - H0.m_Z); Far = std::max(Far, Travel[f].Length()); }
                             if (Far > 0.05f)
                             {
+                                // (moved back below the root: the root's child on the hips' chain. Moving the root itself left the root bone a
+                                // clip's travel away from the character - skin weighted to it stretched there: C70, the 'wrong-way shadow' wedge)
+                                const int iBack = Chain.size() >= 2 ? Chain[Chain.size() - 2] : iSkelRoot;
                                 for (int f = 0; f < OutFrames; ++f)
                                 {
                                     AllRootMotion[RootMotionBase + f] = Travel[f];
-                                    AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot].m_Position -= Travel[f];
+                                    auto& K = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iBack];
+                                    if (iBack == iSkelRoot) { K.m_Position -= Travel[f]; continue; }
+                                    const auto& R = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot];
+                                    const auto L = R.m_Rotation.ConjugateCopy() * Travel[f];      // (into the root's frame; Chain ends at the root)
+                                    K.m_Position -= xmath::fvec3(L.m_X / R.m_Scale.m_X, L.m_Y / R.m_Scale.m_Y, L.m_Z / R.m_Scale.m_Z);
                                 }
                                 Out.m_LoopDisplacement = Travel[OutFrames - 1];
                                 LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the root bone stays; root motion from the hips ('{}'): {:.2f} units over the clip, the root moved back by it", CompiledName, Names[iHips], Travel[OutFrames - 1].Length()));
