@@ -1024,6 +1024,32 @@ namespace xanim_package_compiler
             // compiles of the same package without root motion differed by those 8 bytes (2026-11-15)
             m_FinalPackage.m_pRootMotion = AllRootMotion.empty() ? nullptr : new xmath::fvec3[AllRootMotion.size()];
             std::copy(AllRootMotion.begin(), AllRootMotion.end(), m_FinalPackage.m_pRootMotion);
+            // K5: every clip compressed too (from the keys just built from the source assets - never from a package: lossy data is never an input),
+            // its track indices made absolute into the package's arrays
+            {
+                std::vector<xanimation::compressed_clip::bone> Tracks; std::vector<std::uint64_t> Rot; std::vector<std::uint16_t> Q; std::vector<float> F;
+                std::size_t Raw = 0;
+                for (const auto& C : Clips)
+                {
+                    xanimation::clip_view V; V.m_Frames = { AllKeyFrames.data() + C.m_iFirstKeyFrame, std::size_t(C.m_nFrames) * m_FinalPackage.m_nBones };
+                    V.m_nBones = int(m_FinalPackage.m_nBones); V.m_nFrames = C.m_nFrames; V.m_FPS = C.m_FPS; V.m_bLoop = C.m_bLoop;
+                    auto Cc = xanimation::CompressClip(V);
+                    for (auto& B : Cc.m_Bones)
+                    {
+                        if (B.m_Rot == xanimation::compressed_clip::TRACK_ANIM) B.m_iRot += std::uint32_t(Rot.size());
+                        B.m_iPos   += std::uint32_t(B.m_Pos   == xanimation::compressed_clip::TRACK_RAW ? F.size() : Q.size());
+                        B.m_iScale += std::uint32_t(B.m_Scale == xanimation::compressed_clip::TRACK_RAW ? F.size() : Q.size());
+                        Tracks.push_back(B);
+                    }
+                    Rot.insert(Rot.end(), Cc.m_Rot64.begin(), Cc.m_Rot64.end()); Q.insert(Q.end(), Cc.m_Q16.begin(), Cc.m_Q16.end()); F.insert(F.end(), Cc.m_F32.begin(), Cc.m_F32.end());
+                    Raw += V.m_Frames.size() * sizeof(xmath::transform3);
+                }
+                auto Copy = [](auto& Src, auto*& Dst, std::uint32_t& n) { n = std::uint32_t(Src.size()); if (!Src.empty()) { Dst = new std::remove_reference_t<decltype(Src[0])>[Src.size()]; std::copy(Src.begin(), Src.end(), Dst); } };
+                Copy(Tracks, m_FinalPackage.m_pCTracks, m_FinalPackage.m_nCTracks); Copy(Rot, m_FinalPackage.m_pRot64, m_FinalPackage.m_nRot64);
+                Copy(Q, m_FinalPackage.m_pQ16, m_FinalPackage.m_nQ16); Copy(F, m_FinalPackage.m_pF32, m_FinalPackage.m_nF32);
+                const std::size_t Comp = Tracks.size() * 80 + Rot.size() * 8 + Q.size() * 2 + F.size() * 4;
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Compressed clips: {} -> {} bytes ({:.1f}x; the raw keys are kept for the editors until they decode on open)", Raw, Comp, Comp ? double(Raw) / double(Comp) : 0.0));
+            }
             m_RootTurn.resize(AllRootMotion.size(), 0.0f);
             if (!AllRootMotion.empty())
             {
