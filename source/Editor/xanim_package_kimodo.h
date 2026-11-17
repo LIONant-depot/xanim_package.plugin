@@ -247,6 +247,7 @@ namespace xanim_package_editor::kimodo
         std::vector<int>                    m_Frames;
         std::vector<soma_pose>              m_Poses;        // one per frame (not for root2d)
         std::vector<std::array<float, 2>>   m_Smooth;       // the root's (x, z) per frame
+        std::vector<std::array<float, 2>>   m_Heading;      // root2d: the body's heading per frame as (cos, sin) (empty: free)
     };
 
     inline bool WriteConstraints(const std::wstring& Path, const std::vector<constraint_set>& Sets, std::string& Error)
@@ -276,7 +277,14 @@ namespace xanim_package_editor::kimodo
             }
             F << ", \"smooth_root_2d\": [";
             for (std::size_t i = 0; i < C.m_Smooth.size(); ++i) F << (i ? ", " : "") << "[" << C.m_Smooth[i][0] << ", " << C.m_Smooth[i][1] << "]";
-            F << "]}" << (s + 1 < Sets.size() ? ",\n" : "\n");
+            F << "]";
+            if (!C.m_Heading.empty())
+            {
+                F << ", \"global_root_heading\": [";
+                for (std::size_t i = 0; i < C.m_Heading.size(); ++i) F << (i ? ", " : "") << "[" << C.m_Heading[i][0] << ", " << C.m_Heading[i][1] << "]";
+                F << "]";
+            }
+            F << "}" << (s + 1 < Sets.size() ? ",\n" : "\n");
         }
         F << "]\n";
         if (!F) { Error = "the constraints file could not be written"; return false; }
