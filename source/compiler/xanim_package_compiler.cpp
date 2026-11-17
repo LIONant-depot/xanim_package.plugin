@@ -1003,7 +1003,8 @@ namespace xanim_package_compiler
                     xanimation::clip_view CV; CV.m_nBones = nB; CV.m_nFrames = S.m_nFrames; CV.m_FPS = S.m_FPS; CV.m_bLoop = S.m_bLoop;
                     CV.m_Frames = { AllKeyFrames.data() + S.m_iFirstKeyFrame, std::size_t(S.m_nFrames) * nB };
                     std::span<const xmath::fvec3> RM; if (S.m_RootMotionMode != xanim_package::root_motion_mode::NONE) RM = { AllRootMotion.data() + S.m_iFirstRootMotion, std::size_t(S.m_nFrames) };
-                    const auto Tr = xanimation::MeasureClip(xanimation::skeleton_view{ Par }, Nm, CV, RM);
+                    std::span<const float> RT; if (!RM.empty() && m_RootTurn.size() >= S.m_iFirstRootMotion + std::size_t(S.m_nFrames)) RT = { m_RootTurn.data() + S.m_iFirstRootMotion, std::size_t(S.m_nFrames) };
+                    const auto Tr = xanimation::MeasureClip(xanimation::skeleton_view{ Par }, Nm, CV, RM, RT);
                     D.m_Speed = Tr.m_Speed; D.m_Direction = Tr.m_Direction; D.m_TurnRate = Tr.m_TurnRate; D.m_LoopError = Tr.m_LoopError; D.m_Height = Tr.m_Height;
                     LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': moves {:.2f} units/s at {:.0f} deg from its facing, turns {:.1f} deg/s, its ends {:.1f} deg apart{}, centroid height {:.2f}"
                         , Names[i], Tr.m_Speed, Tr.m_Direction, Tr.m_TurnRate, Tr.m_LoopError, Tr.m_LoopError < 5 ? " (loops)" : "", Tr.m_Height));
