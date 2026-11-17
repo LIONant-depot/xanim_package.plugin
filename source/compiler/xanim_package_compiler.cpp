@@ -241,6 +241,7 @@ namespace xanim_package_compiler
 
         // every raw clip's skeleton frames (the layers' sources and bases), made once per compile and written for the editor (LayerSources.bin)
         std::vector<xanim_package_layers::source_frames> m_SourceFrames;
+        std::vector<float>                               m_RootTurn;     // parallel to the package's root motion: the root's turn about +Y per frame (radians)
         const xanim_package_layers::source_frames* FindSourceFrames(const std::wstring& Key, const std::string& Clip) const
         {
             for (const auto& S : m_SourceFrames) if (S.m_Key == Key && S.m_Clip == Clip) return &S;
@@ -546,6 +547,58 @@ namespace xanim_package_compiler
                                 LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the root bone stays; root motion from the hips ('{}'): {:.2f} units over the clip, the root moved back by it", CompiledName, Names[iHips], Travel[OutFrames - 1].Length()));
                             }
                         }
+                    }
+                }
+            }
+
+            // The root turn (2026-11-17, K4): with root motion the body's facing turn about +Y (the hips' turn applied to the rest's forward, from the
+            // body roles' legs) is taken out of the pose too - the root key turned back about the origin, where the hips now stand - and stored per
+            // frame next to the root motion, so a turning clip turns the entity. A clip that keeps its facing (within 2 deg) stores zeros.
+            if (RootMotion != xanim_package::root_motion_mode::NONE && bHaveAnimatedRoot)
+            {
+                const std::size_t Base = Out.m_iFirstRootMotion;
+                if (m_RootTurn.size() < Base) m_RootTurn.resize(Base, 0.0f);
+                m_RootTurn.resize(Base + static_cast<std::size_t>(OutFrames), 0.0f);
+                std::vector<std::string_view> Names(static_cast<std::size_t>(nSkelBones)); std::vector<std::int32_t> Par(static_cast<std::size_t>(nSkelBones)); xanimation::pose RestP; RestP.resize(nSkelBones);
+                for (int b = 0; b < nSkelBones; ++b)
+                {
+                    Names[b] = ResolvedBones[b].m_Name; Par[b] = ResolvedBones[b].m_iParent;
+                    RestP.m_Position[b] = ResolvedBones[b].m_RestPosition; RestP.m_Scale[b] = ResolvedBones[b].m_RestScale;
+                    RestP.m_Rotation[b] = xmath::fquat(ResolvedBones[b].m_RestRotX, ResolvedBones[b].m_RestRotY, ResolvedBones[b].m_RestRotZ, ResolvedBones[b].m_RestRotW).NormalizeSafeCopy();
+                }
+                const xanimation::skeleton_view SV{ Par };
+                const auto Rig = xanimation::FindWarpRig(SV, xanimation::BodyRoles(SV, Names, RestP));
+                if (Rig.valid() && Rig.m_Legs.size() >= 2)
+                {
+                    xanimation::details::rigid_worlds W; xanimation::details::Worlds(SV, RestP, W);
+                    auto Side = W.m_P[Rig.m_Legs.front().m_Thigh] - W.m_P[Rig.m_Legs.back().m_Thigh]; Side.m_Y = 0;
+                    const auto Fwd = Side.Cross(xmath::fvec3(0, 1, 0)).NormalizeSafeCopy();
+                    const auto RestHipsInv = W.m_R[Rig.m_Hips].ConjugateCopy();
+                    xanimation::pose P; P.resize(nSkelBones);
+                    std::vector<float> Yaw(static_cast<std::size_t>(OutFrames));
+                    float Prev = 0, Acc = 0, Far = 0;
+                    for (int f = 0; f < OutFrames; ++f)
+                    {
+                        for (int b = 0; b < nSkelBones; ++b) P.set(b, AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + b]);
+                        xanimation::details::Worlds(SV, P, W);
+                        auto F = (W.m_R[Rig.m_Hips] * RestHipsInv) * Fwd; F.m_Y = 0;
+                        const float A = std::atan2(F.m_X, F.m_Z);
+                        if (f == 0) Prev = A;
+                        float d = A - Prev; while (d > 3.14159265f) d -= 6.2831853f; while (d < -3.14159265f) d += 6.2831853f;     // (unwrapped)
+                        Acc += d; Prev = A; Yaw[static_cast<std::size_t>(f)] = Acc; Far = std::max(Far, std::abs(Acc));
+                    }
+                    if (Far > 0.035f)
+                    {
+                        for (int f = 0; f < OutFrames; ++f)
+                        {
+                            const float T = Yaw[static_cast<std::size_t>(f)];
+                            m_RootTurn[Base + static_cast<std::size_t>(f)] = T;
+                            const xmath::fquat Q(0.0f, std::sin(-0.5f * T), 0.0f, std::cos(-0.5f * T));
+                            auto& K = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot];
+                            K.m_Rotation = (Q * K.m_Rotation).NormalizeSafeCopy();
+                            K.m_Position = Q * K.m_Position;
+                        }
+                        LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the root turn taken out of the pose: {:.1f} deg over the clip", CompiledName, Yaw.back() * 57.29578f));
                     }
                 }
             }
@@ -880,6 +933,7 @@ namespace xanim_package_compiler
             std::vector<std::string>               Names;
             std::vector<xmath::transform3>          AllKeyFrames;
             std::vector<xmath::fvec3>               AllRootMotion;
+            m_RootTurn.clear();
             std::vector<xanim_package::event>       AllEvents;
 
             // every raw clip on this skeleton first (retargeted or folded): a clip's layers may take any other clip of the package as their source
@@ -970,6 +1024,13 @@ namespace xanim_package_compiler
             // compiles of the same package without root motion differed by those 8 bytes (2026-11-15)
             m_FinalPackage.m_pRootMotion = AllRootMotion.empty() ? nullptr : new xmath::fvec3[AllRootMotion.size()];
             std::copy(AllRootMotion.begin(), AllRootMotion.end(), m_FinalPackage.m_pRootMotion);
+            m_RootTurn.resize(AllRootMotion.size(), 0.0f);
+            if (!AllRootMotion.empty())
+            {
+                m_FinalPackage.m_nRootTurnFrames = static_cast<std::uint32_t>(m_RootTurn.size());
+                m_FinalPackage.m_pRootTurn = new float[m_RootTurn.size()];
+                std::copy(m_RootTurn.begin(), m_RootTurn.end(), m_FinalPackage.m_pRootTurn);
+            }
             m_FinalPackage.m_nTotalEvents = static_cast<std::uint32_t>(AllEvents.size());
             if (!AllEvents.empty())
             {

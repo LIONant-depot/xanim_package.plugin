@@ -60,7 +60,7 @@ namespace xanim_package
 
     struct anim_package
     {
-        inline static constexpr auto xserializer_version_v = 3;     // 2: events; 3: clip traits
+        inline static constexpr auto xserializer_version_v = 4;     // 2: events; 3: clip traits; 4: root turn
 
                                         anim_package    (void)                          noexcept = default;
         inline                         anim_package    (xserializer::stream& Stream)    noexcept;
@@ -81,6 +81,13 @@ namespace xanim_package
             if (C.m_RootMotionMode == root_motion_mode::NONE) return {};
             return { m_pRootMotion + C.m_iFirstRootMotion, static_cast<std::size_t>(C.m_nFrames) };
         }
+        // The clip's root turn per frame (radians about +Y from its first frame, unwrapped), parallel to getClipRootMotion; empty: no turn
+        inline std::span<float>                 getClipRootTurn    (int iClip)     const noexcept
+        {
+            auto& C = m_pClips[iClip];
+            if (C.m_RootMotionMode == root_motion_mode::NONE || m_nRootTurnFrames != m_nTotalRootMotionFrames || m_pRootTurn == nullptr) return {};
+            return { m_pRootTurn + C.m_iFirstRootMotion, static_cast<std::size_t>(C.m_nFrames) };
+        }
         inline std::span<event>                 getClipEvents      (int iClip)     const noexcept { auto& C = m_pClips[iClip]; return { m_pEvents + C.m_iFirstEvent, C.m_nEvents }; }
 
         clip*               m_pClips            {nullptr};   // m_nClips entries
@@ -91,11 +98,13 @@ namespace xanim_package
         xmath::transform3*  m_pKeyFrame         {nullptr};   // m_nTotalKeyFrames entries, concatenated per-clip
         xmath::fvec3*       m_pRootMotion       {nullptr};   // m_nTotalRootMotionFrames entries, concatenated across clips with root motion
         event*              m_pEvents           {nullptr};   // m_nTotalEvents entries, concatenated per clip
+        float*              m_pRootTurn         {nullptr};   // m_nRootTurnFrames entries: 0 or m_nTotalRootMotionFrames, parallel to m_pRootMotion (the root's turn about +Y)
         std::uint16_t       m_nClips                  {0};
         std::uint32_t       m_nBones                  {0};   // shared bone width/order for every clip
         std::uint32_t       m_nTotalKeyFrames         {0};
         std::uint32_t       m_nTotalRootMotionFrames  {0};
         std::uint32_t       m_nTotalEvents            {0};
+        std::uint32_t       m_nRootTurnFrames         {0};
     };
 
     //-------------------------------------------------------------------------
@@ -122,6 +131,7 @@ namespace xanim_package
         if (m_pKeyFrame)       delete[] m_pKeyFrame;
         if (m_pRootMotion)     delete[] m_pRootMotion;
         if (m_pEvents)         delete[] m_pEvents;
+        if (m_pRootTurn)       delete[] m_pRootTurn;
 
         Initialize();
     }
@@ -230,6 +240,8 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Package.m_pRootMotion,      Package.m_nTotalRootMotionFrames))
             || (Err = Stream.Serialize(Package.m_nTotalEvents))
             || (Err = Stream.Serialize(Package.m_pEvents,          Package.m_nTotalEvents))
+            || (Err = Stream.Serialize(Package.m_nRootTurnFrames))
+            || (Err = Stream.Serialize(Package.m_pRootTurn,        Package.m_nRootTurnFrames))
             ;
         return Err;
     }
