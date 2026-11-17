@@ -61,7 +61,7 @@ namespace xanim_package
 
     struct anim_package
     {
-        inline static constexpr auto xserializer_version_v = 5;     // 2: events; 3: clip traits; 4: root turn; 5: compressed clips
+        inline static constexpr auto xserializer_version_v = 6;     // 2: events; 3: clip traits; 4: root turn; 5: compressed clips; 6: the raw keys in a sidecar
 
                                         anim_package    (void)                          noexcept = default;
         inline                         anim_package    (xserializer::stream& Stream)    noexcept;
@@ -118,7 +118,38 @@ namespace xanim_package
         std::uint32_t       m_nTotalEvents            {0};
         std::uint32_t       m_nRootTurnFrames         {0};
         std::uint32_t       m_nCTracks = 0, m_nRot64 = 0, m_nQ16 = 0, m_nF32 = 0;
+        std::uint32_t       m_nSidecarKeys = 0;     // K5 step 2: the raw keys live in <package file>.keys (anim_keys), m_nSidecarKeys of them; m_pKeyFrame is
+                                                    // null until LoadKeys attaches them (the editors, package-to-package imports); the runtime samples the compressed tracks
+        void*               m_pKeysBlock   {nullptr};   // (the attached sidecar's block, freed with the package; never saved: always null in the file)
     };
+
+    // The sidecar: the raw keys of a package, exactly as compiled from the source assets
+    struct anim_keys
+    {
+        inline static constexpr auto xserializer_version_v = 1;
+        anim_keys(void) noexcept = default;
+        anim_keys(xserializer::stream&) noexcept {}
+        xmath::transform3*  m_pKeyFrame = nullptr;
+        std::uint32_t       m_nKeys     = 0;
+    };
+
+    // Attaches the sidecar's raw keys to a loaded package (Path: the package's file). False: none needed (no sidecar keys) or it could not be read
+    inline bool LoadKeys(anim_package& Pkg, std::wstring_view PackagePath) noexcept
+    {
+        if (Pkg.m_nSidecarKeys == 0 || Pkg.m_pKeyFrame) return false;
+        anim_keys* pKeys = nullptr; xserializer::stream Stream;
+        if (Stream.Load(std::wstring(PackagePath) + L".keys", pKeys) || !pKeys) return false;
+        if (pKeys->m_nKeys != Pkg.m_nSidecarKeys) { xserializer::default_memory_handler_v.Free(xserializer::mem_type{ .m_bUnique = true }, pKeys); return false; }
+        Pkg.m_pKeyFrame = pKeys->m_pKeyFrame; Pkg.m_nTotalKeyFrames = pKeys->m_nKeys; Pkg.m_pKeysBlock = pKeys;
+        return true;
+    }
+    // Frees a package loaded in place, its sidecar too
+    inline void FreeLoaded(anim_package* pPkg) noexcept
+    {
+        if (pPkg == nullptr) return;
+        if (pPkg->m_pKeysBlock) xserializer::default_memory_handler_v.Free(xserializer::mem_type{ .m_bUnique = true }, pPkg->m_pKeysBlock);
+        xserializer::default_memory_handler_v.Free(xserializer::mem_type{ .m_bUnique = true }, pPkg);
+    }
 
     //-------------------------------------------------------------------------
 
@@ -219,6 +250,17 @@ namespace xserializer::io_functions
     }
     //-------------------------------------------------------------------------
     template<> inline
+    xerr SerializeIO<xanim_package::anim_keys>(xserializer::stream& Stream, const xanim_package::anim_keys& K) noexcept
+    {
+        xerr Err;
+        false
+            || (Err = Stream.Serialize(K.m_nKeys))
+            || (Err = Stream.Serialize(K.m_pKeyFrame, K.m_nKeys))
+            ;
+        return Err;
+    }
+    //-------------------------------------------------------------------------
+    template<> inline
     xerr SerializeIO<xanimation::compressed_clip::bone>(xserializer::stream& Stream, const xanimation::compressed_clip::bone& B) noexcept
     {
         xerr Err;
@@ -285,6 +327,7 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Package.m_pQ16,             Package.m_nQ16))
             || (Err = Stream.Serialize(Package.m_nF32))
             || (Err = Stream.Serialize(Package.m_pF32,             Package.m_nF32))
+            || (Err = Stream.Serialize(Package.m_nSidecarKeys))
             ;
         return Err;
     }

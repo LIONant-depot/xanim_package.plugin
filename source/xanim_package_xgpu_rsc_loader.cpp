@@ -26,6 +26,9 @@ xresource::loader< xrsc::anim_package_type_guid_v >::data_type* xresource::loade
     {
         return nullptr;
     }
+    // the raw keys (the editors read them; the runtime samples the compressed tracks): XLION_ANIM_NO_KEYS=1 leaves them on disk, as a game would
+    static const bool bNoKeys = [] { const char* e = std::getenv("XLION_ANIM_NO_KEYS"); return e && *e == '1'; }();
+    if (!bNoKeys) xanim_package::LoadKeys(*pPackage, Path);
 
     return pPackage;
 }
@@ -38,5 +41,5 @@ xresource::loader< xrsc::anim_package_type_guid_v >::data_type* xresource::loade
 
 void xresource::loader< xrsc::anim_package_type_guid_v >::Destroy(xresource::mgr& Mgr, data_type&& Data, const full_guid& GUID)
 {
-    xserializer::default_memory_handler_v.Free(xserializer::mem_type{ .m_bUnique = true }, &Data);
+    xanim_package::FreeLoaded(&Data);
 }

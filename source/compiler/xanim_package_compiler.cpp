@@ -241,7 +241,8 @@ namespace xanim_package_compiler
 
         // every raw clip's skeleton frames (the layers' sources and bases), made once per compile and written for the editor (LayerSources.bin)
         std::vector<xanim_package_layers::source_frames> m_SourceFrames;
-        std::vector<float>                               m_RootTurn;     // parallel to the package's root motion: the root's turn about +Y per frame (radians)
+        std::vector<float>                               m_RootTurn;
+        std::vector<xmath::transform3>                   m_SidecarKeys;  // K5 step 2: the raw keys, written next to the package (<package>.keys)     // parallel to the package's root motion: the root's turn about +Y per frame (radians)
         const xanim_package_layers::source_frames* FindSourceFrames(const std::wstring& Key, const std::string& Clip) const
         {
             for (const auto& S : m_SourceFrames) if (S.m_Key == Key && S.m_Clip == Clip) return &S;
@@ -678,7 +679,10 @@ namespace xanim_package_compiler
             xserializer::stream Stream;
             if (auto Err = Stream.Load(Compiled, pPackage); Err || !pPackage)
                 return xerr::create_f<state, "The animation package of an import source is not compiled: compile it first">();
-            struct free_it { xanim_package::anim_package* P; ~free_it() { if (P) xserializer::default_memory_handler_v.Free(xserializer::mem_type{ .m_bUnique = true }, P); } } Free{ pPackage };
+            struct free_it { xanim_package::anim_package* P; ~free_it() { xanim_package::FreeLoaded(P); } } Free{ pPackage };
+            // its raw keys, exact as compiled from its sources (never its compressed tracks: lossy data is never an input)
+            if (pPackage->m_nSidecarKeys && !xanim_package::LoadKeys(*pPackage, Compiled))
+                return xerr::create_f<state, "The animation package of an import source has no raw keys next to it (.keys): compile it again">();
 
             const auto& Bones = Other.m_ResolvedSkeletonBones.m_Bones;
             if (Bones.size() != pPackage->m_nBones)
@@ -1016,9 +1020,10 @@ namespace xanim_package_compiler
             for (std::size_t i = 0; i < ResolvedBones.size(); ++i)
                 m_FinalPackage.m_pBoneNameHashes[i] = ResolvedBones[i].m_NameHash;
 
-            m_FinalPackage.m_nTotalKeyFrames = static_cast<std::uint32_t>(AllKeyFrames.size());
-            m_FinalPackage.m_pKeyFrame = new xmath::transform3[AllKeyFrames.size()];
-            std::copy(AllKeyFrames.begin(), AllKeyFrames.end(), m_FinalPackage.m_pKeyFrame);
+            // the raw keys go to the sidecar (<package>.keys, written with the package); the package itself carries the compressed tracks
+            m_FinalPackage.m_nTotalKeyFrames = 0; m_FinalPackage.m_pKeyFrame = nullptr;
+            m_FinalPackage.m_nSidecarKeys = static_cast<std::uint32_t>(AllKeyFrames.size());
+            m_SidecarKeys = AllKeyFrames;
 
             m_FinalPackage.m_nTotalRootMotionFrames = static_cast<std::uint32_t>(AllRootMotion.size());
             // an empty array is nullptr: new T[0] is a real heap address, and xserializer wrote it into the file as 8 raw bytes (count 0) - two
@@ -1204,6 +1209,11 @@ namespace xanim_package_compiler
 
         void Serialize(const std::wstring_view FilePath)
         {
+            {   // the sidecar first (a package whose keys are missing is refused by its readers)
+                xanim_package::anim_keys K; K.m_nKeys = static_cast<std::uint32_t>(m_SidecarKeys.size()); K.m_pKeyFrame = m_SidecarKeys.empty() ? nullptr : m_SidecarKeys.data();
+                xserializer::stream S;
+                if (auto Err = S.Save(std::wstring(FilePath) + L".keys", K, xserializer::compression_level::FAST); Err) throw(std::runtime_error(std::string(Err.getMessage())));
+            }
             xserializer::stream Serializer;
             if (auto Err = Serializer.Save
                 ( FilePath
