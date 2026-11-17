@@ -575,7 +575,8 @@ namespace xanim_package_compiler
                     RestP.m_Rotation[b] = xmath::fquat(ResolvedBones[b].m_RestRotX, ResolvedBones[b].m_RestRotY, ResolvedBones[b].m_RestRotZ, ResolvedBones[b].m_RestRotW).NormalizeSafeCopy();
                 }
                 const xanimation::skeleton_view SV{ Par };
-                const auto Rig = xanimation::FindWarpRig(SV, xanimation::BodyRoles(SV, Names, RestP));
+                const auto Roles = xanimation::BodyRoles(SV, Names, RestP);
+                const auto Rig = xanimation::FindWarpRig(SV, Roles);
                 if (Rig.valid() && Rig.m_Legs.size() >= 2)
                 {
                     xanimation::details::rigid_worlds W; xanimation::details::Worlds(SV, RestP, W);
@@ -583,17 +584,51 @@ namespace xanim_package_compiler
                     const auto Fwd = Side.Cross(xmath::fvec3(0, 1, 0)).NormalizeSafeCopy();
                     const auto RestHipsInv = W.m_R[Rig.m_Hips].ConjugateCopy();
                     xanimation::pose P; P.resize(nSkelBones);
+                    int Arm0 = -1, Arm1 = -1;          // (the upper arms, Arm0 on the side of the first leg; none: the hips alone)
+                    for (int b = 0; b < nSkelBones; ++b) if (Roles[static_cast<std::size_t>(b)] == 7) { if (Arm0 < 0) Arm0 = b; else if (Arm1 < 0) Arm1 = b; }
+                    if (Arm1 < 0) Arm0 = -1;
+                    else if ((W.m_P[Arm0] - W.m_P[Arm1]).Dot(Side) < 0) std::swap(Arm0, Arm1);
                     std::vector<float> Yaw(static_cast<std::size_t>(OutFrames));
                     float Prev = 0, Acc = 0, Far = 0;
                     for (int f = 0; f < OutFrames; ++f)
                     {
                         for (int b = 0; b < nSkelBones; ++b) P.set(b, AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + b]);
                         xanimation::details::Worlds(SV, P, W);
+                        // the body's heading from the hips' and the shoulders' lines together (Unity's body orientation): the hips alone twist
+                        // with the gait (a side-step opens them toward the travel)
                         auto F = (W.m_R[Rig.m_Hips] * RestHipsInv) * Fwd; F.m_Y = 0;
+                        if (Arm0 >= 0)
+                        {
+                            auto S1 = W.m_P[Rig.m_Legs.front().m_Thigh] - W.m_P[Rig.m_Legs.back().m_Thigh], S2 = W.m_P[Arm0] - W.m_P[Arm1]; S1.m_Y = 0; S2.m_Y = 0;
+                            const auto S = S1.NormalizeSafeCopy() + S2.NormalizeSafeCopy();
+                            if (S.LengthSq() > 1e-6f) F = S.Cross(xmath::fvec3(0, 1, 0));
+                        }
                         const float A = std::atan2(F.m_X, F.m_Z);
                         if (f == 0) Prev = A;
                         float d = A - Prev; while (d > 3.14159265f) d -= 6.2831853f; while (d < -3.14159265f) d += 6.2831853f;     // (unwrapped)
-                        Acc += d; Prev = A; Yaw[static_cast<std::size_t>(f)] = Acc; Far = std::max(Far, std::abs(Acc));
+                        Acc += d; Prev = A; Yaw[static_cast<std::size_t>(f)] = Acc;
+                    }
+                    // the facing is the hips' heading without the gait's sway: a centred average over a stride (1 s); past the clip's ends the
+                    // heading goes on along a line fitted to its first / last stride (a steady turn stays exact), then the whole is shifted so frame
+                    // 0 faces 0 (the entity faces the smoothed heading; the pose keeps its hips' twist). Raw, a side-step's hips swing 12-42 deg
+                    // every step: the entity wiggled with them and motion matching read the swing as facing (AnimDemo's strafer kept Stand)
+                    {
+                        const int H = std::max(1, int(std::lround(0.5 * double(FinalFPS)))), N = OutFrames;
+                        auto Line = [&](int a, int b) { double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;          // least squares over frames a..b
+                            for (int k = a; k <= b; ++k) { const double y = Yaw[static_cast<std::size_t>(k)]; n += 1; sx += k; sy += y; sxx += double(k) * k; sxy += k * y; }
+                            const double d = n * sxx - sx * sx, m = d > 1e-9 ? (n * sxy - sx * sy) / d : 0.0; return std::pair{ m, (sy - m * sx) / n }; };
+                        const auto L0 = Line(0, std::min(N - 1, 2 * H)), L1 = Line(std::max(0, N - 1 - 2 * H), N - 1);
+                        // a loop goes round instead (frame N is frame 0 one pass on: the seam's pose twist then matches - a line there left the
+                        // TurnLeft loop's hips 15-18 m/s off at every wrap)
+                        auto At = [&](int k) {
+                            if (bLoop) { const int q = int(std::floor(double(k) / N)); return double(Yaw[static_cast<std::size_t>(k - q * N)]) + q * double(Yaw[static_cast<std::size_t>(N - 1)]); }
+                            return k < 0 ? L0.first * k + L0.second : k >= N ? L1.first * k + L1.second : double(Yaw[static_cast<std::size_t>(k)]); };
+                        std::vector<float> Sm(Yaw.size());
+                        for (int f = 0; f < N; ++f) { double S = 0; for (int k = f - H; k <= f + H; ++k) S += At(k); Sm[static_cast<std::size_t>(f)] = float(S / double(2 * H + 1)); }
+                        const float Zero = Sm.empty() ? 0.0f : Sm.front();
+                        for (auto& y : Sm) y -= Zero;
+                        Yaw.swap(Sm);
+                        for (float y : Yaw) Far = std::max(Far, std::abs(y));
                     }
                     if (Far > 0.035f)
                     {
