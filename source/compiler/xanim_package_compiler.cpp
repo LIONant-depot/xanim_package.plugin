@@ -499,6 +499,54 @@ namespace xanim_package_compiler
                     }
 
                     Out.m_LoopDisplacement = AllRootMotion[RootMotionBase + OutFrames - 1];
+
+                    // The travel from the hips (2026-11-17, K2/K4): a rig whose root bone stays while the pelvis walks (retargeted and Kimodo clips) gives
+                    // no root motion from the root. Then the hips' horizontal travel is the root motion and the root is moved back by it, so the body
+                    // stays over the character's origin (their height, the walk's bob, stays in the pose)
+                    float RootTravel = 0;
+                    for (int f = 0; f < OutFrames; ++f) RootTravel = std::max(RootTravel, AllRootMotion[RootMotionBase + f].Length());
+                    int iHips = -1;
+                    if (RootTravel < 1e-3f && OutFrames > 1)
+                    {
+                        std::vector<std::string_view> Names(static_cast<std::size_t>(nSkelBones)); std::vector<std::int32_t> Par(static_cast<std::size_t>(nSkelBones)); xanimation::pose RestP; RestP.resize(nSkelBones);
+                        for (int b = 0; b < nSkelBones; ++b)
+                        {
+                            Names[b] = ResolvedBones[b].m_Name; Par[b] = ResolvedBones[b].m_iParent;
+                            RestP.m_Position[b] = ResolvedBones[b].m_RestPosition; RestP.m_Scale[b] = ResolvedBones[b].m_RestScale;
+                            RestP.m_Rotation[b] = xmath::fquat(ResolvedBones[b].m_RestRotX, ResolvedBones[b].m_RestRotY, ResolvedBones[b].m_RestRotZ, ResolvedBones[b].m_RestRotW).NormalizeSafeCopy();
+                        }
+                        const auto Roles = xanimation::BodyRoles(xanimation::skeleton_view{ Par }, Names, RestP);
+                        for (int b = 0; b < nSkelBones && iHips < 0; ++b) if (Roles[b] == std::uint8_t(xanimation::bone_slot::HIPS)) iHips = b;
+                        if (iHips >= 0)
+                        {
+                            std::vector<int> Chain; for (int b = iHips; b >= 0; b = Par[b]) Chain.push_back(b);
+                            auto HipsAt = [&](int f)
+                            {
+                                xmath::fvec3 P(0, 0, 0); xmath::fquat R = xmath::fquat::fromIdentity(); xmath::fvec3 S(1, 1, 1);
+                                for (auto It = Chain.rbegin(); It != Chain.rend(); ++It)
+                                {
+                                    const auto& K = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + *It];
+                                    P = P + R * xmath::fvec3(S.m_X * K.m_Position.m_X, S.m_Y * K.m_Position.m_Y, S.m_Z * K.m_Position.m_Z);
+                                    R = (R * K.m_Rotation).NormalizeSafeCopy(); S = xmath::fvec3(S.m_X * K.m_Scale.m_X, S.m_Y * K.m_Scale.m_Y, S.m_Z * K.m_Scale.m_Z);
+                                }
+                                return P;
+                            };
+                            const auto H0 = HipsAt(0);
+                            std::vector<xmath::fvec3> Travel(static_cast<std::size_t>(OutFrames));
+                            float Far = 0;
+                            for (int f = 0; f < OutFrames; ++f) { const auto H = HipsAt(f); Travel[f] = xmath::fvec3(H.m_X - H0.m_X, 0, H.m_Z - H0.m_Z); Far = std::max(Far, Travel[f].Length()); }
+                            if (Far > 0.05f)
+                            {
+                                for (int f = 0; f < OutFrames; ++f)
+                                {
+                                    AllRootMotion[RootMotionBase + f] = Travel[f];
+                                    AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot].m_Position -= Travel[f];
+                                }
+                                Out.m_LoopDisplacement = Travel[OutFrames - 1];
+                                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the root bone stays; root motion from the hips ('{}'): {:.2f} units over the clip, the root moved back by it", CompiledName, Names[iHips], Travel[OutFrames - 1].Length()));
+                            }
+                        }
+                    }
                 }
             }
 
