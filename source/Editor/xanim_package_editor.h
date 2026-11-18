@@ -62,7 +62,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
         kind        m_Kind;
@@ -148,7 +148,7 @@ namespace xanim_package_editor
                 break;
             case kind::pose_pin:
                 m_hA = m_Parser.addOption("Handle", "A handle to pin or unpin (toggle)", false, 1);
-                m_hB = m_Parser.addOption("Preset", "Feet, Hands, Both, None, or Auto (feet in contact pinned automatically on/off: \"Auto 1|0\")", false, 1);
+                m_hB = m_Parser.addOption("Preset", "Feet, Hands, Both, None, Auto (feet in contact pinned automatically on/off: \"Auto 1|0\"), or Preserve (an edit keeps the swinging feet on their own paths: \"Preserve 1|0\")", false, 1);
                 break;
             case kind::pose_mirror: case kind::pose_copy: case kind::pose_paste:
                 m_hA = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
@@ -206,6 +206,12 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
                 break;
             case kind::kimodo_takes_to_layers:  m_hA = m_Parser.addOption("Layer", "The Pose layer whose stored takes become Kimodo layers", true, 1); break;
+            case kind::motion_paths:
+                m_hA = m_Parser.addOption("On",     "1: show the motion paths (hands, feet, hips, head) and onion skins around the playhead; 0: hide", false, 1);
+                m_hB = m_Parser.addOption("Window", "Seconds before and after the playhead the paths cover (default 1)", false, 1);
+                m_hC = m_Parser.addOption("Onion",  "Onion ghosts each side of the playhead (0-4, default 2)", false, 1);
+                m_hD = m_Parser.addOption("Step",   "Frames between onion ghosts (default 6)", false, 1);
+                break;
             case kind::preview_overlay:
                 m_hA = m_Parser.addOption("Clip",     "The overlay clip's name (empty: off)", true, 1);
                 m_hB = m_Parser.addOption("From",     "The bone it starts at (empty: the whole body)", false, 1);
@@ -273,7 +279,7 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
-        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
         // KUX2 (R66): a runtime overlay slot (the Animation component's Overlay) previewed over the selected clip with the runtime's own mix
         std::string m_OvPrevClip, m_OvPrevFrom, m_OvPrevMaskFrom = "\x01"; bool m_bOvPrevAdditive = false; float m_OvPrevWeight = 1.0f;
         xanimation::skeleton_data m_OvPrevSD; const void* m_pOvPrevSkel = nullptr;
@@ -434,6 +440,7 @@ namespace xanim_package_editor
             , m_KeySelected          (m_Undo, *this, playback_cmd::kind::key_selected,            "KeySelected",          "K: keys the selected bone (or the last dragged handle as an IK key, or the pending pose when auto-key is off) at the playhead; -All 1 (Shift+K): every bone the layer owns. One undo step. Usage: KeySelected [-All 1] [-Time s]")
             , m_AutoKey              (m_Undo, *this, playback_cmd::kind::auto_key,                "AutoKey",              "Auto-key on (edits write keys) or off (an edit is a pending pose, shown, that K keys). Usage: AutoKey -On 1|0")
             , m_ClipEvent            (m_Undo, *this, playback_cmd::kind::clip_event,              "ClipEvent",            "The selected clip's events (T5: markers, footsteps, contacts, sync points; one undo step each). Usage: ClipEvent (list) | -Add name [-Kind k] [-Time s] [-End s] [-Bone b] | -Id id [-Time s] [-End s] [-Kind k] [-Name n] [-Bone b] | -Delete id")
+            , m_MotionPathsCmd       (m_Undo, *this, playback_cmd::kind::motion_paths,            "MotionPaths",          "C88 motion sculpting: shows each effector's path (hands, feet, hips, head) over a window around the playhead - a tick per frame, colour by speed (blue slow, red fast), the playhead's point larger - and onion ghosts of the whole body before and after. Reports each path's length and top speed in the window. Usage: MotionPaths [-On 1|0] [-Window seconds] [-Onion n] [-Step frames]")
             , m_PreviewOverlayCmd    (m_Undo, *this, playback_cmd::kind::preview_overlay,         "PreviewOverlay",       "Previews a runtime overlay slot over the selected clip, mixed as the Animation component's Overlay does (the clip over the pose from a bone, or added). Usage: PreviewOverlay -Clip name [-From bone] [-Additive 1] [-Weight 0..1]; -Clip \"\" turns it off")
             , m_RenderVideoCmd       (m_Undo, *this, playback_cmd::kind::render_video,            "RenderVideo",          "The selected clip as a video, as the preview shows it (skin, props, camera): one frame per editor frame, then ffmpeg encodes Cache\\Temp\\AnimVideo\\<clip>.mp4 (the frames stay in Cache\\Temp\\AnimVideo\\<clip>). Usage: RenderVideo [-Fps 30] [-Seconds s] [-Cancel 1]")
             , m_BallFlight           (m_Undo, *this, playback_cmd::kind::ball_flight,             "BallFlight",           "A kick's check: the ball (a preview prop) leaves with the kicking handle's speed at the contact (x1.1: a typical instep kick's transfer), its flight drawn for 2 s or to the ground (no air drag); reports speed, launch angle, height, distance. Usage: BallFlight [-Effector RightFoot] [-Time s] [-Prop Ball] [-Off 1]")
@@ -3193,6 +3200,7 @@ namespace xanim_package_editor
         // Scope: [Key - Lo, Key + Hi] seconds (the adaptive caller grows it). Every other key of this layer inside the scope is an anchor:
         // a full-body constraint, kept exactly (never rewritten), and the blend meets it. The Kimodo window is stored as a take
         // (Cache\KimodoTakes\<package>\) and listed on the layer (provenance).
+        int m_nPreservedFootFrames = 0;     // (C88 (2): the swing frames the last refine kept on the feet's own paths)
         bool SuggestRefine(int iLayer, int Seed, double Lo, double Hi, const std::string& Why, const std::vector<xmath::transform3>& Own, std::string& Report, std::string& Err) noexcept
         {
             using clock = std::chrono::steady_clock;
@@ -3295,6 +3303,7 @@ namespace xanim_package_editor
                 for (int c0 = 0;; c0 += Stride) { const int s = std::min(c0, W - MaxW); Chunks.push_back({ s, s + MaxW }); if (s + MaxW >= W) break; }
             }
             static int s_Count = 0;
+            m_nPreservedFootFrames = 0;
             std::filesystem::create_directories(m_Document.m_TempDir);
             const auto t1 = clock::now();
             std::vector<std::vector<xmath::transform3>> Gen(Chunks.size());
@@ -3305,6 +3314,16 @@ namespace xanim_package_editor
                 const std::vector<xmath::transform3> Wc(Win.begin() + std::size_t(c0) * nB, Win.begin() + std::size_t(c1) * nB);
                 kimodo_space KS; std::vector<kimodo::soma_pose> SP;
                 if (!ToKimodo(*pCtx, Wc, n, nB, KS, SP, Err)) return false;
+                // C88 (2) preserve-trajectory: the clip before the edit over the same frames, in the same Kimodo space (its first frame is outside
+                // the edit's scope, so the space matches; checked), so a swinging foot is constrained to where it went before the edit
+                std::vector<kimodo::soma_pose> SPo; bool bPreserve = false;
+                if (m_PT.m_bPreserveFeet && Own.size() == Accepted.size())
+                {
+                    std::vector<xmath::transform3> Wo(std::size_t(n) * nB);
+                    for (int i = 0; i < n; ++i) { const auto Po = SamplePose(Own, FPS, nF, nB, Key + double(c0 + i - K) / 30.0); std::copy(Po.begin(), Po.end(), Wo.begin() + std::size_t(i) * nB); }
+                    kimodo_space KSo; std::string E2;
+                    bPreserve = ToKimodo(*pCtx, Wo, n, nB, KSo, SPo, E2) && (KSo.m_Origin - KS.m_Origin).Length() < 0.01f && std::abs(KSo.m_Norm.Dot(KS.m_Norm)) > 0.9999f;
+                }
                 auto Root2 = [&](int i) { return std::array<float, 2>{ SP[i].m_Root[0], SP[i].m_Root[2] }; };
                 std::vector<kimodo::constraint_set> Sets;
                 // full body inside this window, at most 20 (Kimodo's guidance): the edges just outside the scope, the key and the user's keys
@@ -3322,7 +3341,13 @@ namespace xanim_package_editor
                 for (int s = 0; s < 2; ++s)
                 {
                     kimodo::constraint_set Set{ s ? "right-foot" : "left-foot", {}, {}, {} };
-                    for (int f = a; f <= b && Set.m_Frames.size() < 16; f += FootStride) if (InContact[s][f] && f != K) { Set.m_Frames.push_back(f - c0); Set.m_Poses.push_back(SP[f - c0]); Set.m_Smooth.push_back(Root2(f - c0)); }
+                    const bool bKeep = bPreserve && K >= c0 && K < c1 && (FootPos[s][K] - [&] { std::vector<xmath::fvec3> Q; World(&Win[std::size_t(K) * nB], Q); return Q[Feet[s]]; }()).Length() < 0.01f;
+                    for (int f = a; f <= b && Set.m_Frames.size() < 16; f += FootStride)
+                    {
+                        if (f == K) continue;
+                        if (InContact[s][f]) { Set.m_Frames.push_back(f - c0); Set.m_Poses.push_back(SP[f - c0]); Set.m_Smooth.push_back(Root2(f - c0)); }
+                        else if (bKeep) { Set.m_Frames.push_back(f - c0); Set.m_Poses.push_back(SPo[f - c0]); Set.m_Smooth.push_back(Root2(f - c0)); ++m_nPreservedFootFrames; }
+                    }
                     nFootFrames += int(Set.m_Frames.size());
                     if (!Set.m_Frames.empty()) Sets.push_back(std::move(Set));
                 }
@@ -3555,9 +3580,9 @@ namespace xanim_package_editor
                 if (i == K) for (int b = 0; b < nB; ++b) if (Owned[b]) KeyMiss = std::max(KeyMiss, AngleDeg(Pp[b].m_Rotation, Win[std::size_t(K) * nB + b].m_Rotation));
             }
             const float SkateAfter = 0.5f * (Skate(AfterFeet[0], nullptr) + Skate(AfterFeet[1], nullptr));
-            Report = std::format("refine scope -{:.2f} .. +{:.2f} s ({} frames as {} Kimodo window(s) of up to {} frames{}, 25 steps, {} anchors): {} frames keyed ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm); "
+            Report = std::format("refine scope -{:.2f} .. +{:.2f} s ({} frames as {} Kimodo window(s) of up to {} frames{}, 25 steps, {} anchors): {} frames keyed ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm), {} swing frames kept on their own paths; "
                                  "skate in contact {:.4f} -> {:.4f} hip heights/s; the key kept within {:.4f} deg; balance: the hips shifted on {} still frames (max {:.1f} cm); time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms"
-                , double(K - A) / 30.0, double(B - K) / 30.0, W, Chunks.size(), MaxW, Chunks.size() > 1 ? ", stitched" : "", Anchors.size(), nFrames, nKeys, nFootFrames, PinMax * 100.0f, SkateBefore, SkateAfter, KeyMiss, nBalanced, MaxShift * 100.0f, ms(t0, t1), ms(t1, t2), ms(t2, t3));
+                , double(K - A) / 30.0, double(B - K) / 30.0, W, Chunks.size(), MaxW, Chunks.size() > 1 ? ", stitched" : "", Anchors.size(), nFrames, nKeys, nFootFrames - m_nPreservedFootFrames, PinMax * 100.0f, m_nPreservedFootFrames, SkateBefore, SkateAfter, KeyMiss, nBalanced, MaxShift * 100.0f, ms(t0, t1), ms(t1, t2), ms(t2, t3));
             return true;
         }
 
@@ -3793,6 +3818,7 @@ namespace xanim_package_editor
             pose_rig                            m_Rig; std::size_t m_RigKey = 0;
             std::set<int>                       m_Pins;                 // handles pinned by the user
             bool                                m_bAutoPins = true;     // the feet in contact at the playhead pinned too
+            bool                                m_bPreserveFeet = true; // C88 (2): an edit's refine keeps each foot on its own path while it swings (contacts stay pinned) - the hips move, the feet keep stepping
             int                                 m_Drag = -1;            // the handle being dragged
             bool                                m_bFK = false;          // the drag turns that one bone (its tip handle)
             int                                 m_FKBone = -1;          // the bone selected for FK
@@ -4633,6 +4659,118 @@ namespace xanim_package_editor
             }
         }
 
+        // C88 (motion sculpting, step 1, read-only): each effector's path over a window around the playhead and onion ghosts of the body,
+        // from the clip as composed (the frames SuggestClipFrames gives: the layers included) - the motion itself is what you look at, the
+        // timeline becomes the secondary view. Console parity: MotionPaths (the same state, and a report of what is drawn).
+        struct motion_paths
+        {
+            bool                                        m_bOn = false;
+            float                                       m_Window = 1.0f;     // s each side of the playhead
+            int                                         m_Onion = 2, m_Step = 6;
+            const void*                                 m_pKey = nullptr; std::size_t m_KeySize = 0; std::uint64_t m_KeySum = 0;
+            int                                         m_FPS = 30, m_nF = 0;
+            std::vector<int>                            m_Eff;               // the effector bones (the posing handles)
+            std::vector<std::vector<xmath::fvec3>>      m_P;                 // [effector][frame] handle position, model space
+            std::vector<std::vector<xmath::fvec3>>      m_Bones;             // [frame][bone] joint positions, model space (onion ghosts)
+            struct tick { int m_Eff, m_Frame; ImVec2 m_S; };
+            std::vector<tick>                           m_Ticks;             // the path ticks as drawn last frame (picking)
+            int                                         m_HoverEff = -1, m_HoverFrame = -1;
+            int                                         m_Grab = -1;         // a tick was grabbed: the playhead moved to it; its handle's drag starts next frame
+        } m_Paths;
+
+        // the composed clip's world positions per frame, recomputed only when the composed frames change
+        bool MotionPathsUpdate(std::string& Err) noexcept
+        {
+            if (!PoseRig(Err)) return false;
+            const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0;
+            if (!SuggestClipFrames(pF, FPS, nF, Err)) return false;
+            const auto& R = m_PT.m_Rig; const int nB = R.count();
+            if (nB == 0 || int(pF->size()) != nF * nB) { Err = "the clip and the skeleton disagree on the bones (compile the package)"; return false; }
+            std::uint64_t Sum = 0;      // (a cheap fingerprint: an edit changes some frame's numbers)
+            for (std::size_t i = 0; i < pF->size(); i += 7) { const auto& T = (*pF)[i]; std::uint32_t u; std::memcpy(&u, &T.m_Rotation.m_X, 4); Sum = Sum * 1099511628211ull ^ u; std::memcpy(&u, &T.m_Position.m_Y, 4); Sum ^= u; }
+            if (m_Paths.m_pKey == pF && m_Paths.m_KeySize == pF->size() && m_Paths.m_KeySum == Sum && !m_Paths.m_P.empty()) return true;
+            m_Paths.m_pKey = pF; m_Paths.m_KeySize = pF->size(); m_Paths.m_KeySum = Sum; m_Paths.m_FPS = FPS; m_Paths.m_nF = nF;
+            m_Paths.m_Eff = R.Effectors();
+            m_Paths.m_P.assign(m_Paths.m_Eff.size(), {}); m_Paths.m_Bones.assign(std::size_t(nF), {});
+            xanimation::pose P; P.resize(nB);
+            for (int f = 0; f < nF; ++f)
+            {
+                for (int b = 0; b < nB; ++b) P.set(b, (*pF)[std::size_t(f) * nB + b]);
+                xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(P);
+                for (std::size_t e = 0; e < m_Paths.m_Eff.size(); ++e) m_Paths.m_P[e].push_back(HandleModel(FK, m_Paths.m_Eff[e]));
+                auto& Bf = m_Paths.m_Bones[std::size_t(f)]; Bf.resize(std::size_t(nB));
+                for (int b = 0; b < nB; ++b) Bf[std::size_t(b)] = FK.WorldPosition(b);
+            }
+            return true;
+        }
+
+        // what the paths show, for a person in the info line and for an AI from the console (the same numbers)
+        std::string MotionPathsReport() noexcept
+        {
+            if (!m_Paths.m_bOn) return "MotionPaths: off";
+            std::string Err;
+            if (!MotionPathsUpdate(Err)) return "MotionPaths: on, nothing to show: " + Err;
+            const int nF = m_Paths.m_nF, Fps = m_Paths.m_FPS;
+            const int f0 = std::max(0, int(std::floor((m_TimeSeconds - m_Paths.m_Window) * Fps))), f1 = std::min(nF - 1, int(std::ceil((m_TimeSeconds + m_Paths.m_Window) * Fps)));
+            std::string Out = std::format("MotionPaths: on, frames {}..{} of {} ({:.2f} s each side), onion {} every {} frames;", f0, f1, nF, m_Paths.m_Window, m_Paths.m_Onion, m_Paths.m_Step);
+            for (std::size_t e = 0; e < m_Paths.m_Eff.size(); ++e)
+            {
+                float Len = 0, Top = 0; const auto& Pe = m_Paths.m_P[e];
+                for (int f = f0 + 1; f <= f1; ++f) { const float d = (Pe[std::size_t(f)] - Pe[std::size_t(f - 1)]).Length(); Len += d; Top = std::max(Top, d * Fps); }
+                Out += std::format(" {} {:.2f} m (top {:.2f} m/s)", m_PT.m_Rig.Name(m_Paths.m_Eff[e]), Len, Top);
+            }
+            return Out;
+        }
+
+        void MotionPathsAfterRender() noexcept
+        {
+            std::string Err;
+            if (!m_Paths.m_bOn || int(m_PoseBones.size()) != m_PT.m_Rig.count() || !MotionPathsUpdate(Err) || m_Paths.m_nF < 2) return;
+            const int nF = m_Paths.m_nF, Fps = m_Paths.m_FPS, nB = m_PT.m_Rig.count();
+            const int fNow = std::clamp(int(std::lround(m_TimeSeconds * Fps)), 0, nF - 1);
+            // drawn = model + the offset the preview shows the root at (root motion), as the posing handles do
+            const auto& BNow = m_Paths.m_Bones[std::size_t(fNow)];
+            const xmath::fvec3 Off = m_PoseBones[0].m_Position - BNow[0];
+            auto* DL = ImGui::GetWindowDrawList();
+            // onion ghosts: the skeleton a few steps before (cool) and after (warm) the playhead, fading with distance
+            for (int k = -m_Paths.m_Onion; k <= m_Paths.m_Onion; ++k)
+            {
+                const int f = fNow + k * m_Paths.m_Step;
+                if (k == 0 || f < 0 || f >= nF) continue;
+                const int a = int(150 - 30 * std::abs(k));
+                const ImU32 Col = k < 0 ? IM_COL32(110, 170, 255, a) : IM_COL32(255, 180, 110, a);
+                const auto& Bf = m_Paths.m_Bones[std::size_t(f)];
+                for (int b = 1; b < nB; ++b)
+                {
+                    const int p = m_PT.m_Rig.m_Par[std::size_t(b)]; if (p < 0) continue;
+                    ImVec2 A, B; if (m_Viewport.Project(Bf[std::size_t(p)] + Off, A) && m_Viewport.Project(Bf[std::size_t(b)] + Off, B)) DL->AddLine(A, B, Col, 1.5f);
+                }
+            }
+            // the paths: a tick per frame, colour by speed (blue slow .. red fast at 4 m/s), the past dimmer than the future
+            const int f0 = std::max(0, fNow - int(m_Paths.m_Window * Fps)), f1 = std::min(nF - 1, fNow + int(m_Paths.m_Window * Fps));
+            m_Paths.m_Ticks.clear();
+            for (std::size_t e = 0; e < m_Paths.m_Eff.size(); ++e)
+            {
+                const auto& Pe = m_Paths.m_P[e];
+                ImVec2 Prev; bool bPrev = false;
+                for (int f = f0; f <= f1; ++f)
+                {
+                    ImVec2 S; if (!m_Viewport.Project(Pe[std::size_t(f)] + Off, S)) { bPrev = false; continue; }
+                    if (bPrev)
+                    {
+                        const float v = (Pe[std::size_t(f)] - Pe[std::size_t(f - 1)]).Length() * Fps, u = std::clamp(v / 4.0f, 0.0f, 1.0f);
+                        const int al = f <= fNow ? 140 : 230;
+                        DL->AddLine(Prev, S, IM_COL32(int(60 + 195 * u), int(140 - 60 * u), int(255 - 205 * u), al), 2.0f);
+                    }
+                    const bool bHot = m_Paths.m_HoverEff == m_Paths.m_Eff[e] && m_Paths.m_HoverFrame == f;
+                    DL->AddCircleFilled(S, f == fNow ? 4.5f : bHot ? 5.0f : 1.8f, f == fNow ? IM_COL32(255, 255, 255, 255) : bHot ? IM_COL32(120, 220, 255, 255) : IM_COL32(230, 230, 230, 170));
+                    if (bHot) DL->AddText(ImVec2(S.x + 10, S.y - 18), IM_COL32(255, 255, 255, 255), std::format("{} at frame {}: drag to change the motion here", m_PT.m_Rig.Name(m_Paths.m_Eff[e]), f).c_str());
+                    if (f != fNow) m_Paths.m_Ticks.push_back({ m_Paths.m_Eff[e], f, S });
+                    Prev = S; bPrev = true;
+                }
+            }
+        }
+
         // after the viewport renders: the handles, the ghost, the clicks and keys
         void PoseAfterRender(const xskeleton_editor::viewport_item& Item) noexcept
         {
@@ -4704,13 +4842,32 @@ namespace xanim_package_editor
                     DL->AddText(ImVec2(S.x + 14, S.y - 24), IM_COL32(120, 220, 255, 255), std::format("Suggestion {}/{} (seed {}): Tab next, Enter accept, Esc keep yours", m_PT.m_Cand + 1, m_Suggest.m_Candidates.size(), m_Suggest.m_Candidates[m_PT.m_Cand].m_Seed).c_str());
             }
 
+            // C88 (1b): a motion-path tick under the mouse (the handles win)
+            m_Paths.m_HoverEff = m_Paths.m_HoverFrame = -1;
+            if (m_Paths.m_bOn && m_PT.m_Drag < 0 && m_PT.m_Hover < 0 && m_PT.m_PinHover < 0 && m_Viewport.Over())
+            {
+                const ImVec2 M = ImGui::GetIO().MousePos; float Best = 7.0f * 7.0f;
+                for (const auto& Tk : m_Paths.m_Ticks) { const float d = (Tk.m_S.x - M.x) * (Tk.m_S.x - M.x) + (Tk.m_S.y - M.y) * (Tk.m_S.y - M.y); if (d < Best) { Best = d; m_Paths.m_HoverEff = Tk.m_Eff; m_Paths.m_HoverFrame = Tk.m_Frame; } }
+                if (m_Paths.m_HoverEff >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                {
+                    if (auto* pClip = SelectedClip()) { m_TimeSeconds = std::clamp(float(m_Paths.m_HoverFrame) / float(std::max(1, m_Paths.m_FPS)), 0.0f, session::ClipLength(*pClip)); m_LoopsElapsed = 0; m_bPlaying = false; }
+                    m_Paths.m_Grab = m_Paths.m_HoverEff;
+                }
+            }
+            bool bGrab = false;
+            if (m_Paths.m_Grab >= 0 && m_PT.m_Drag < 0)
+            {   // the frame after the playhead moved: the handle now stands at the tick that was clicked
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) { m_PT.m_Hover = m_Paths.m_Grab; m_PT.m_bHoverTip = false; bGrab = true; }
+                if (m_Paths.m_Grab != m_PT.m_Hover || !bGrab) m_Paths.m_Grab = -1;
+            }
             // mouse: a handle wins over a bone pick; right-click pins; a click on a bone selects it for FK
-            if (m_Viewport.Over() && m_PT.m_Drag < 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Middle))
+            if ((m_Viewport.Over() || bGrab) && m_PT.m_Drag < 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Middle))
             {
                 const ImVec2 Mouse = ImGui::GetIO().MousePos;
                 if (m_PT.m_PinHover >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) PoseTogglePin(m_PT.m_PinHover);
-                else if (m_PT.m_Hover >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                else if (m_PT.m_Hover >= 0 && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || bGrab))
                 {
+                    m_Paths.m_Grab = -1;
                     std::string E2;
                     if (PoseAt(m_TimeSeconds, m_PT.m_Base, E2))
                     {
@@ -4842,6 +4999,10 @@ namespace xanim_package_editor
                     : "Posing and IK keys keep every joint inside the skeleton's limits (this Pose layer's BoneLimits).\nTurn off only for an impossible pose, such as a broken leg.");
             }
             ImGui::SameLine(); ImGui::Checkbox("Auto feet", &m_PT.m_bAutoPins);
+            ImGui::SameLine(); ImGui::Checkbox("Keep feet paths", &m_PT.m_bPreserveFeet);
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("On: an edit keeps each foot on its own path while it swings, and pinned while it is down -\nmove the hips across a walk and the feet keep stepping. Off: only the feet in contact are held.\nConsole: PosePin -Preset \"Preserve 1|0\"");
+            ImGui::SameLine(); ImGui::Checkbox("Paths", &m_Paths.m_bOn);
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("Motion paths: where the hands, feet, hips and head travel around the playhead (a tick per frame,\nblue slow .. red fast), with onion ghosts of the body before (blue) and after (orange).\nConsole: MotionPaths -On 1 [-Window s] [-Onion n] [-Step frames]");
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button, m_PT.m_bAutoKey ? IM_COL32(170, 40, 40, 255) : IM_COL32(70, 70, 70, 255));
             if (ImGui::SmallButton(m_PT.m_bAutoKey ? "Auto-key" : "Auto-key off")) { m_PT.m_bAutoKey = !m_PT.m_bAutoKey; if (m_PT.m_bAutoKey) m_PT.m_bPending = false; }
@@ -5416,7 +5577,7 @@ namespace xanim_package_editor
             DrawPreviewProps();
             m_Viewport.Render(std::span<const xskeleton_editor::viewport_item>(&Item, 1));
             m_Viewport.m_Under = nullptr;
-            if (!m_Recorder.Running()) PoseAfterRender(Item);     // (a video shows the clip, not the handles)
+            if (!m_Recorder.Running()) { MotionPathsAfterRender(); PoseAfterRender(Item); }     // (a video shows the clip, not the handles or the paths)
 
             // mask editing: a click on a bone adds it (with its branch; Shift: alone) to the selected layer's mask, or removes it
             if (m_bMaskEdit && m_Viewport.Over() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
@@ -5755,6 +5916,15 @@ namespace xanim_package_editor
             return S.ClipEvent(A, I, D, K, T, E, B, N);
         }
         case kind::detect_footsteps: return S.DetectFootsteps();
+        case kind::motion_paths:
+        {
+            std::string On, Wn, On2, St;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hA, On)) S.m_Paths.m_bOn = On == "1" || On == "true";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Wn)) { float W = 1; std::from_chars(Wn.data(), Wn.data() + Wn.size(), W); S.m_Paths.m_Window = std::clamp(W, 0.1f, 10.0f); }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hC, On2)) { int n = 2; std::from_chars(On2.data(), On2.data() + On2.size(), n); S.m_Paths.m_Onion = std::clamp(n, 0, 4); }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hD, St)) { int n = 6; std::from_chars(St.data(), St.data() + St.size(), n); S.m_Paths.m_Step = std::clamp(n, 1, 60); }
+            return S.MotionPathsReport();
+        }
         case kind::preview_overlay:
         {
             std::string C, F, Ad, Wt;
@@ -5797,7 +5967,8 @@ namespace xanim_package_editor
                 auto Set = [&](std::initializer_list<int> B) { S.m_PT.m_Pins.clear(); for (int b : B) if (b >= 0) S.m_PT.m_Pins.insert(b); };
                 if (P == "Feet") Set({ R.m_LF, R.m_RF }); else if (P == "Hands") Set({ R.m_LH, R.m_RH }); else if (P == "Both") Set({ R.m_LF, R.m_RF, R.m_LH, R.m_RH }); else if (P == "None") Set({});
                 else if (P == "Auto 1" || P == "Auto 0") S.m_PT.m_bAutoPins = P == "Auto 1";
-                else return "PosePin: -Preset Feet|Hands|Both|None|\"Auto 1|0\"";
+                else if (P == "Preserve 1" || P == "Preserve 0") S.m_PT.m_bPreserveFeet = P == "Preserve 1";
+                else return "PosePin: -Preset Feet|Hands|Both|None|\"Auto 1|0\"|\"Preserve 1|0\"";
             }
             if (xeditor::cmd_util::GetArg(m_Parser, m_hA, H))
             {
