@@ -33,6 +33,7 @@ namespace xanim_package_compiler
             std::wstring   m_SourceFile;
             bool           m_bInSkeletonSpace = false;     // the keys are already the package skeleton's own (retargeted: its Pre/PostTransform are not applied again)
             std::uint64_t  m_FromSkeleton = 0;             // a clip taken from another animation PACKAGE: that package's skeleton (its keys are in that skeleton's space already)
+            bool           m_bPlanted = false;             // the Retarget's PlantFeet held its feet already (E58 does not plant again)
         };
 
         // The Retarget of an import source: its descriptor read (which reads both skeletons' bone manifests), the mapping resolved and the retargeter made.
@@ -895,6 +896,7 @@ namespace xanim_package_compiler
                             else
                             {
                                 for (int f = 0; f < nFrames; ++f) DF[f] = Worlds(Dk.m_Parent, Baked, nDst, f)[Row.m_Target] * (1.0f / Hd);
+                                Raw.m_bPlanted = true;
                                 LogMessage(xresource_pipeline::msg_type::INFO, std::format("  {} foot planted over the source's {} contacts: skate {:.4f}/s -> {:.4f}/s; {} frames solved, largest miss {:.4f} hip heights"
                                     , pSide, Sc.size(), Before, Skate(DF), Res.m_nFrames, Res.m_MaxMiss / Hd));
                             }
@@ -912,6 +914,59 @@ namespace xanim_package_compiler
             Raw.m_Anim = std::move(Out);
             Raw.m_bInSkeletonSpace = true;
             return {};
+        }
+
+        // E58 (Tomas 2026-11-18: "feet planting etc... is general for all our animations, no matter where the source comes from"): the clean-up
+        // of ANY source on this skeleton - each leg's contacts found on the clip itself (low and slow, in hip heights) and its skate logged;
+        // with PlantFeet the foot is held over them (xanimation PlantFoot, the same solver the Retarget uses) and measured again. The clip is
+        // left in this skeleton's space (its Pre/PostTransform applied, as SkeletonFrames does).
+        void CleanUpRaw(raw_clip& Raw, const xskeleton_desc::bone_manifest& Manifest, bool bPlant)
+        {
+            const auto& Bones = Manifest.m_Bones;
+            const int nB = static_cast<int>(Bones.size()), nF = Raw.m_Anim.m_nFrames;
+            if (nB == 0 || nF < 2) return;
+            std::vector<std::int32_t> Parents(nB); std::vector<std::string_view> Names(nB); xanimation::pose Rest; Rest.resize(nB);
+            for (int b = 0; b < nB; ++b)
+            {
+                Parents[b] = Bones[b].m_iParent; Names[b] = Bones[b].m_Name;
+                Rest.set(b, xmath::transform3{ .m_Scale = Bones[b].m_RestScale, .m_Rotation = xmath::fquat(Bones[b].m_RestRotX, Bones[b].m_RestRotY, Bones[b].m_RestRotZ, Bones[b].m_RestRotW), .m_Position = Bones[b].m_RestPosition });
+            }
+            const xanimation::skeleton_view SV{ std::span<const std::int32_t>(Parents) };
+            const auto Roles = xanimation::BodyRoles(SV, Names, Rest);
+            const auto Rig = xanimation::FindWarpRig(SV, Roles, &Rest);
+            if (!Rig.valid()) return;                                   // (no legs: nothing to plant or measure)
+            std::vector<xmath::fquat> R; std::vector<xmath::fvec3> P;
+            xanimation::details::WorldRP(SV, Rest, R, P);
+            const float Hip = std::max(P[static_cast<std::size_t>(Rig.m_Hips)].m_Y, 1e-3f);
+            auto Frames = SkeletonFrames(Raw, Manifest);
+            auto Feet = [&](int Foot)
+            {
+                std::vector<xmath::fvec3> F(static_cast<std::size_t>(nF)); xanimation::pose Q; Q.resize(nB);
+                for (int f = 0; f < nF; ++f) { for (int b = 0; b < nB; ++b) Q.set(b, Frames[static_cast<std::size_t>(f) * nB + b]); xanimation::details::WorldRP(SV, Q, R, P); F[static_cast<std::size_t>(f)] = P[static_cast<std::size_t>(Foot)] * (1.0f / Hip); }
+                return F;
+            };
+            const float Fps = static_cast<float>(std::max(1, Raw.m_Anim.m_FPS));
+            bool bChanged = false;
+            for (std::size_t l = 0; l < Rig.m_Legs.size(); ++l)
+            {
+                const auto& Lg = Rig.m_Legs[l];
+                auto F = Feet(Lg.m_Foot);
+                const auto C = xanimation::FindContacts(F, Fps);
+                auto Skate = [&](const std::vector<xmath::fvec3>& Q) { float T = 0; for (const auto& I : C) { float Path = 0; for (int f = I.m_First + 1; f <= I.m_Last; ++f) Path += std::hypot(Q[f].m_X - Q[f - 1].m_X, Q[f].m_Z - Q[f - 1].m_Z); T += Path * Hip; } return T; };
+                const float Before = Skate(F);
+                if (!bPlant || C.empty()) { LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': leg {} - {} contacts, the planted foot slides {:.1f} cm in all", Raw.m_Anim.m_Name, l, C.size(), Before * 100)); continue; }
+                xanimation::leg_chain Leg; Leg.m_Thigh = Lg.m_Thigh; Leg.m_Calf = Lg.m_Calf; Leg.m_Foot = Lg.m_Foot;
+                const auto Res = xanimation::PlantFoot(Frames, nB, Parents, Leg, C);
+                if (!Res.m_bOk) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': leg {} - PlantFeet skipped (not thigh -> calf -> foot)", Raw.m_Anim.m_Name, l)); continue; }
+                bChanged = true;
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': leg {} planted over {} contacts - the foot slides {:.1f} cm -> {:.1f} cm in all; {} frames solved, largest miss {:.1f} cm"
+                    , Raw.m_Anim.m_Name, l, C.size(), Before * 100, Skate(Feet(Lg.m_Foot)) * 100, Res.m_nFrames, Res.m_MaxMiss * 100));
+            }
+            if (!bChanged) return;
+            xraw3d::anim Out; Out.m_Name = Raw.m_Anim.m_Name; Out.m_FPS = Raw.m_Anim.m_FPS; Out.m_nFrames = nF; Out.m_Bone.resize(nB);
+            for (int b = 0; b < nB; ++b) { Out.m_Bone[b] = {}; Out.m_Bone[b].m_Name = Bones[b].m_Name; Out.m_Bone[b].m_iParent = Bones[b].m_iParent; }
+            Out.m_KeyFrame = std::move(Frames);
+            Raw.m_Anim = std::move(Out); Raw.m_bInSkeletonSpace = true;
         }
 
         const xanim_package_desc::import_source* FindSource(const std::wstring& Path) const noexcept
@@ -996,6 +1051,8 @@ namespace xanim_package_compiler
                     if (auto Err = RetargetRaw(Raw, *pSource); Err) return Err;           // (a package clip is in its skeleton's space already: RetargetRaw knows)
                 }
                 else if (!Raw.m_bInSkeletonSpace) FoldRaw(Raw, ResolvedBones);            // an asset on this skeleton: its nodes folded into this skeleton's joints
+                const auto* pSrc = FindSource(Raw.m_SourceFile);
+                CleanUpRaw(Raw, Manifest, pSrc && pSrc->m_bPlantFeet && !Raw.m_bPlanted);      // E58: every source: its feet measured, planted when asked
             }
 
             // the skeleton frames of every raw clip: what layers compose from, and the editor's live preview reads the same (LayerSources.bin)

@@ -412,6 +412,7 @@ namespace xanim_package_desc
         std::vector<clip>  m_Clips   = {};      // every clip found in THIS source, curated
         float              m_Seconds = 2.0f;    // NEW_ANIMATION: its length
         int                m_FPS     = 30;      // NEW_ANIMATION: its frame rate
+        bool               m_bPlantFeet = false; // E58 clean-up (any source): planted feet held still where the clip has them down (a retargeted source the Retarget planted is left as is)
 
         // The kind as it counts: a source saved before kinds existed that names a Retarget is a different-skeleton asset
         import_kind kind(void) const noexcept { return (m_Kind == import_kind::SAME_SKELETON_ASSET && !m_Retarget.empty()) ? import_kind::DIFFERENT_SKELETON_ASSET : m_Kind; }
@@ -436,6 +437,9 @@ namespace xanim_package_desc
             , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bPackage(); return F; }> >
         , obj_member<"Retarget", &import_source::m_Retarget, member_help<"The Retarget resource that moves these animations from the skeleton they were made on (its Source) to this package's skeleton (its Destination)">
             , member_dynamic_flags<+[](const import_source& O) { xproperty::flags::type F{}; F.m_bDontShow = !O.bDifferent(); return F; }> >
+        , obj_scope<"CleanUp"
+            , obj_member<"PlantFeet", &import_source::m_bPlantFeet, member_help<"Where this source's clips have a foot down (low and slow), the foot is held at one place - its height, roll and turn kept, the leg bends to reach it. Any source: an asset on this skeleton, a package, a retarget, Kimodo, video. The compile log shows each foot's skate before and after">>
+            >
         , obj_member<"Clips",   &import_source::m_Clips >
         )
     };
