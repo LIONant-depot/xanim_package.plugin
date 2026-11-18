@@ -23,6 +23,8 @@
 #include "plugins/xretarget.plugin/source/xretarget_descriptor.h"
 #include "plugins/xretarget.plugin/source/xretarget_mapping.h"
 #include "dependencies/xAnimation/source/xanimation.h"
+#include "dependencies/xAnimation/source/adapters/xanimation_resources.h"     // (KUX2: MakeSkeleton, SampleClip - the runtime's own sampling)
+#include "dependencies/xAnimation/source/blend/xanimation_overlay.h"          // (KUX2: the runtime overlay slot's mix)
 #include "plugins/xanim_package.plugin/source/Editor/xanim_package_kimodo.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_layers.h"
 #include "plugins/xskeleton.plugin/source/xskeleton_joints.h"
@@ -60,7 +62,7 @@ namespace xanim_package_editor
     struct playback_cmd : xundo::query_command_base
     {
         enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
-                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video };
+                        , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay };
 
         session&    m_Session;
         kind        m_Kind;
@@ -203,6 +205,12 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Time", "Seconds (default: the playhead)", false, 1);
                 break;
             case kind::kimodo_takes_to_layers:  m_hA = m_Parser.addOption("Layer", "The Pose layer whose stored takes become Kimodo layers", true, 1); break;
+            case kind::preview_overlay:
+                m_hA = m_Parser.addOption("Clip",     "The overlay clip's name (empty: off)", true, 1);
+                m_hB = m_Parser.addOption("From",     "The bone it starts at (empty: the whole body)", false, 1);
+                m_hC = m_Parser.addOption("Additive", "1: added on the clip (relative to the overlay's first frame); 0: over it", false, 1);
+                m_hD = m_Parser.addOption("Weight",   "0..1 (default 1)", false, 1);
+                break;
             case kind::render_video:
                 m_hA = m_Parser.addOption("Fps",     "Frames per second of the video (default 30)", false, 1);
                 m_hB = m_Parser.addOption("Seconds", "How long (default: the clip's length)", false, 1);
@@ -264,7 +272,11 @@ namespace xanim_package_editor
         playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
-        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd;
+        playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd;
+        // KUX2 (R66): a runtime overlay slot (the Animation component's Overlay) previewed over the selected clip with the runtime's own mix
+        std::string m_OvPrevClip, m_OvPrevFrom, m_OvPrevMaskFrom = "\x01"; bool m_bOvPrevAdditive = false; float m_OvPrevWeight = 1.0f;
+        xanimation::skeleton_data m_OvPrevSD; const void* m_pOvPrevSkel = nullptr;
+        xanimation::pose m_OvPrevBase, m_OvPrevPose, m_OvPrevRef, m_OvPrevScratch; std::vector<float> m_OvPrevMask;
         // the last accepted candidate (its frames on this skeleton): KimodoTakeCheck compares the compiled take with it
         std::uint64_t m_KAcceptedLayer = 0; std::vector<xmath::transform3> m_KAcceptedFrames; int m_KAcceptedW = 0;
 
@@ -421,6 +433,7 @@ namespace xanim_package_editor
             , m_KeySelected          (m_Undo, *this, playback_cmd::kind::key_selected,            "KeySelected",          "K: keys the selected bone (or the last dragged handle as an IK key, or the pending pose when auto-key is off) at the playhead; -All 1 (Shift+K): every bone the layer owns. One undo step. Usage: KeySelected [-All 1] [-Time s]")
             , m_AutoKey              (m_Undo, *this, playback_cmd::kind::auto_key,                "AutoKey",              "Auto-key on (edits write keys) or off (an edit is a pending pose, shown, that K keys). Usage: AutoKey -On 1|0")
             , m_ClipEvent            (m_Undo, *this, playback_cmd::kind::clip_event,              "ClipEvent",            "The selected clip's events (T5: markers, footsteps, contacts, sync points; one undo step each). Usage: ClipEvent (list) | -Add name [-Kind k] [-Time s] [-End s] [-Bone b] | -Id id [-Time s] [-End s] [-Kind k] [-Name n] [-Bone b] | -Delete id")
+            , m_PreviewOverlayCmd    (m_Undo, *this, playback_cmd::kind::preview_overlay,         "PreviewOverlay",       "Previews a runtime overlay slot over the selected clip, mixed as the Animation component's Overlay does (the clip over the pose from a bone, or added). Usage: PreviewOverlay -Clip name [-From bone] [-Additive 1] [-Weight 0..1]; -Clip \"\" turns it off")
             , m_RenderVideoCmd       (m_Undo, *this, playback_cmd::kind::render_video,            "RenderVideo",          "The selected clip as a video, as the preview shows it (skin, props, camera): one frame per editor frame, then ffmpeg encodes Cache\\Temp\\AnimVideo\\<clip>.mp4 (the frames stay in Cache\\Temp\\AnimVideo\\<clip>). Usage: RenderVideo [-Fps 30] [-Seconds s] [-Cancel 1]")
             , m_BallFlight           (m_Undo, *this, playback_cmd::kind::ball_flight,             "BallFlight",           "A kick's check: the ball (a preview prop) leaves with the kicking handle's speed at the contact (x1.1: a typical instep kick's transfer), its flight drawn for 2 s or to the ground (no air drag); reports speed, launch angle, height, distance. Usage: BallFlight [-Effector RightFoot] [-Time s] [-Prop Ball] [-Off 1]")
             , m_DetectFootsteps      (m_Undo, *this, playback_cmd::kind::detect_footsteps,        "DetectFootsteps",      "Finds each foot's support contacts in the clip as composed: a Footstep where it lands and a Contact bar over the support (replaces only what it detected before; one undo step). Usage: DetectFootsteps")
@@ -1871,6 +1884,7 @@ namespace xanim_package_editor
             if (ImGui::IsItemHovered()) xeditor::hint::Text("On: the viewport shows the layers composed now (the compile's own function, on the source frames before\nthe clip's trim / downsample / root motion). Off: the compiled clip.");
             ImGui::SameLine(); ImGui::Checkbox("Edit mask", &m_bMaskEdit);
             if (ImGui::IsItemHovered()) xeditor::hint::Text("A click on a bone adds it (with its branch) to the selected layer's mask, or removes it.\nShift-click: this bone only.");
+            RenderOverlayPreview();
             if (!m_LayerError.empty()) ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "%s", m_LayerError.c_str());
             ImGui::Separator();
 
@@ -5214,6 +5228,7 @@ namespace xanim_package_editor
             else if (auto* pClip = SelectedClip())
             {
                 xgpu::tools::editors::ComputeAnimatedBoneWorlds(Skeleton, *pPackage, m_iSelectedClip, m_TimeSeconds, m_PoseWorlds);
+                if (!m_OvPrevClip.empty()) PreviewOverlay(Skeleton, *pPackage);       // (KUX2: the runtime overlay slot, the same mix)
                 if (pClip->m_RootMotionMode != xanim_package::root_motion_mode::NONE)
                 {
                     const auto Offset = xgpu::tools::editors::ComputeRootMotionOffset(*pClip, pPackage->getClipRootMotion(m_iSelectedClip), m_TimeSeconds, m_LoopsElapsed);
@@ -5229,6 +5244,58 @@ namespace xanim_package_editor
                 m_PoseBones[i].m_Right    = m_PoseWorlds[i].Right();
                 m_PoseBones[i].m_Up       = m_PoseWorlds[i].Up();
             }
+        }
+
+        // KUX2 (R66): the selected clip with a runtime overlay slot mixed in as the Animation component mixes it (xlionrender_anim_pose.h's
+        // ApplyOverlaySlot: FlattenMask from a bone, ApplyOverlay; the overlay at the preview's time, looped), at a fixed weight
+        void PreviewOverlay(const xskeleton::skeleton& Skel, const xanim_package::anim_package& Pkg) noexcept
+        {
+            const int iOv = Pkg.findClipIndex(xstrtool::CRC32(m_OvPrevClip));
+            if (iOv < 0 || m_iSelectedClip < 0) return;
+            if (m_pOvPrevSkel != &Skel || m_OvPrevSD.m_Parent.size() != Skel.getBones().size()) { m_OvPrevSD = xanimation::MakeSkeleton(Skel); m_pOvPrevSkel = &Skel; m_OvPrevMaskFrom = "\x01"; }
+            auto& S = m_OvPrevSD;
+            if (!xanimation::SampleClip(S, Pkg, m_iSelectedClip, m_TimeSeconds, false, m_OvPrevBase, m_OvPrevScratch)) return;
+            const auto& C = Pkg.getClips()[std::size_t(iOv)];
+            const float Len = C.m_FPS > 0 ? float(C.m_nFrames) / float(C.m_FPS) : 0.0f;
+            if (!xanimation::SampleClip(S, Pkg, iOv, Len > 0 ? std::fmod(std::max(0.0f, m_TimeSeconds), Len) : 0.0f, false, m_OvPrevPose, m_OvPrevScratch)) return;
+            if (m_bOvPrevAdditive && !xanimation::SampleClip(S, Pkg, iOv, 0.0f, false, m_OvPrevRef, m_OvPrevScratch)) return;
+            if (m_OvPrevMaskFrom != m_OvPrevFrom)
+            {
+                m_OvPrevMaskFrom = m_OvPrevFrom;
+                xanimation::mask_rules M;
+                const int B = m_OvPrevFrom.empty() ? 0 : Skel.findBoneIndex(xstrtool::CRC32(m_OvPrevFrom));
+                if (B >= 0) M.m_Entries.push_back({ B, 1.0f, true, m_OvPrevFrom.empty() ? 0 : 2 });
+                m_OvPrevMask = xanimation::FlattenMask(S.view(), M);
+            }
+            xanimation::ApplyOverlay(m_OvPrevBase, m_OvPrevPose, m_OvPrevMask, m_OvPrevWeight, m_bOvPrevAdditive, &m_OvPrevRef);
+            m_PoseWorlds.resize(S.m_Parent.size());
+            xanimation::ComputeBoneWorlds(S.view(), m_OvPrevBase, m_PoseWorlds);
+        }
+
+        // The overlay preview's row (in the Layers panel): which clip, from which bone, override or additive, the weight
+        void RenderOverlayPreview() noexcept
+        {
+            auto* pDesc = Desc(); auto* pPackage = Package();
+            if (!pDesc || !pPackage) return;
+            ImGui::SetNextItemWidth(170);
+            if (ImGui::BeginCombo("Overlay preview", m_OvPrevClip.empty() ? "(none)" : m_OvPrevClip.c_str()))
+            {
+                if (ImGui::Selectable("(none)", m_OvPrevClip.empty())) m_OvPrevClip.clear();
+                for (const auto& Src : pDesc->m_ImportSources) for (const auto& Cl : Src.m_Clips)
+                    if (!Cl.m_bDelete && pPackage->findClipIndex(xstrtool::CRC32(Cl.m_Name)) >= 0 && ImGui::Selectable(Cl.m_Name.c_str(), Cl.m_Name == m_OvPrevClip)) m_OvPrevClip = Cl.m_Name;
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("A runtime overlay slot (the Animation component's Overlay) over the selected clip, mixed as the game mixes it:\nan upper-body action over a walk. Console: PreviewOverlay -Clip name [-From bone] [-Additive 1] [-Weight w]");
+            if (m_OvPrevClip.empty()) return;
+            ImGui::SameLine(); ImGui::SetNextItemWidth(150);
+            if (ImGui::BeginCombo("from", m_OvPrevFrom.empty() ? "(whole body)" : m_OvPrevFrom.c_str(), ImGuiComboFlags_HeightLarge))
+            {
+                if (ImGui::Selectable("(whole body)", m_OvPrevFrom.empty())) m_OvPrevFrom.clear();
+                for (const auto& B : pDesc->m_ResolvedSkeletonBones.m_Bones) if (ImGui::Selectable(B.m_Name.c_str(), B.m_Name == m_OvPrevFrom)) m_OvPrevFrom = B.m_Name;
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine(); ImGui::Checkbox("Additive##ovprev", &m_bOvPrevAdditive);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::SliderFloat("##ovprevw", &m_OvPrevWeight, 0.0f, 1.0f, "weight %.2f");
         }
 
         // the description's PreviewProps as wire shapes over the bones (the shared shape the Ragdoll editor draws its bodies with)
@@ -5675,6 +5742,15 @@ namespace xanim_package_editor
             return S.ClipEvent(A, I, D, K, T, E, B, N);
         }
         case kind::detect_footsteps: return S.DetectFootsteps();
+        case kind::preview_overlay:
+        {
+            std::string C, F, Ad, Wt;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, C); xeditor::cmd_util::GetArg(m_Parser, m_hB, F); xeditor::cmd_util::GetArg(m_Parser, m_hC, Ad); xeditor::cmd_util::GetArg(m_Parser, m_hD, Wt);
+            if (!C.empty() && (!S.Package() || S.Package()->findClipIndex(xstrtool::CRC32(C)) < 0)) return std::format("PreviewOverlay: no compiled clip '{}'", C);
+            S.m_OvPrevClip = C; S.m_OvPrevFrom = F; S.m_bOvPrevAdditive = Ad == "1" || Ad == "true";
+            float W = 1; if (!Wt.empty()) std::from_chars(Wt.data(), Wt.data() + Wt.size(), W); S.m_OvPrevWeight = std::clamp(W, 0.0f, 1.0f);
+            return C.empty() ? std::string("PreviewOverlay: off") : std::format("PreviewOverlay: '{}' over the selected clip from {} ({}, weight {:.2f})", C, F.empty() ? "the root" : F, S.m_bOvPrevAdditive ? "additive" : "override", S.m_OvPrevWeight);
+        }
         case kind::render_video:
         {
             std::string F, Sec, Cancel; int Fps = 30; float Seconds = 0;
