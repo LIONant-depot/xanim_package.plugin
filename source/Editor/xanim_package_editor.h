@@ -1480,6 +1480,18 @@ namespace xanim_package_editor
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The selected keys' interval to the next key: smooth (the layer's curve), linear or step (hold)");
             }
             tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height - ImGui::GetFrameHeightWithSpacing() });
+            // C88 (3): the live edit scope on the timeline too - an amber band over the frames keying the preview would change
+            if (const auto E = EditScope(); E.m_bOn)
+            {
+                const auto& V = m_TLView.m_View; const auto& B = m_TLView.m_Body;
+                auto X = [&](int f) { return B.Min.x + float(V.X(double(f) * double(tl_tps_v) / E.m_FPS)); };
+                auto* DL = ImGui::GetWindowDrawList();
+                DL->PushClipRect(B.Min, B.Max, true);
+                DL->AddRectFilled({ X(E.m_F0), B.Min.y }, { X(E.m_F1), B.Max.y }, IM_COL32(255, 170, 40, 40));
+                DL->AddLine({ X(E.m_F0), B.Min.y }, { X(E.m_F0), B.Max.y }, IM_COL32(255, 170, 40, 200), 1.5f);
+                DL->AddLine({ X(E.m_F1), B.Min.y }, { X(E.m_F1), B.Max.y }, IM_COL32(255, 170, 40, 200), 1.5f);
+                DL->PopClipRect();
+            }
         }
 
         // LayerTimeline: view state changes (never the descriptor) and the timeline as text (tests read it)
@@ -3828,6 +3840,7 @@ namespace xanim_package_editor
             xmath::fvec3                        m_Offset{ 0, 0, 0 };    // drawn - model (root motion shown)
             xmath::fvec3                        m_Plane{ 0, 0, 0 }, m_Normal{ 0, 0, 1 }, m_Start{ 0, 0, 0 }, m_Target{ 0, 0, 0 };    // drawn space
             xanimation::pose                    m_Preview; bool m_bPreview = false;
+            double                              m_PreviewTime = 0;      // where the preview pose would be keyed (C88 (3): the edit scope)
             std::string                         m_Note;                 // the last drag: reached / missed by x cm: why
             int                                 m_LastEff = -1;
             std::vector<xmath::transform3>      m_Copy;
@@ -4542,7 +4555,7 @@ namespace xanim_package_editor
         {
             m_TimeSeconds = float(Seconds);                                     // the playhead goes where the pending pose is (it is dropped when the playhead leaves)
             m_PT.m_PendingPose = P; m_PT.m_bPending = true; m_PT.m_PendingTime = m_TimeSeconds;
-            m_PT.m_Preview = P; m_PT.m_bPreview = true;
+            m_PT.m_Preview = P; m_PT.m_bPreview = true; m_PT.m_PreviewTime = m_TimeSeconds;
             return "pending: not keyed (auto-key is off): K keys it";
         }
 
@@ -4610,7 +4623,7 @@ namespace xanim_package_editor
             m_PT.m_Note = Note; m_PT.m_LastEff = Eff;
             std::string PinText; for (int b : Pins) if (b != Eff) PinText += (PinText.empty() ? "" : " ") + R.Name(b);
             const auto Head = std::format("PoseDrag: {} {} at {:.3f} s: {}; pins [{}] held within {:.3f} cm", bFK ? "FK" : "IK", R.Name(Eff), Seconds, Note, PinText, PinErr);
-            if (!bCommit) { m_PT.m_Preview = Out; m_PT.m_bPreview = true; return Head + " (preview only)"; }
+            if (!bCommit) { m_PT.m_Preview = Out; m_PT.m_bPreview = true; m_PT.m_PreviewTime = Seconds; return Head + " (preview only)\n" + EditScopeText(); }
             m_PT.m_bPreview = false;
             if (!m_PT.m_bAutoKey) return Head + "\n" + PosePend(Out, Seconds);         // auto-key off: pending until K
             const auto C = PoseCommit(Out, Seconds, std::format("Pose {} {}", bFK ? "turn" : "drag", R.Name(Eff)), Eff);
@@ -4724,7 +4737,7 @@ namespace xanim_package_editor
                     if (std::abs(Den) > 1e-6f) m_PT.m_Target = Eye + Ray * ((m_PT.m_Plane - Eye).Dot(m_PT.m_Normal) / Den);
                     std::string Note;
                     PoseSolve(m_PT.m_Base, m_PT.m_Drag, m_PT.m_Target - m_PT.m_Offset, m_PT.m_bFK, m_PT.m_DragPins, m_PT.m_Preview, Note);
-                    m_PT.m_Note = Note; m_PT.m_bPreview = true;
+                    m_PT.m_Note = Note; m_PT.m_bPreview = true; m_PT.m_PreviewTime = m_PT.m_Time;
                     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
                     {   // released: the keys, one undo step
                         const int Eff = m_PT.m_Drag; m_PT.m_Drag = -1;
@@ -4815,11 +4828,74 @@ namespace xanim_package_editor
                 for (int f = f0 + 1; f <= f1; ++f) { const float d = (Pe[std::size_t(f)] - Pe[std::size_t(f - 1)]).Length(); Len += d; Top = std::max(Top, d * Fps); }
                 Out += std::format(" {} {:.2f} m (top {:.2f} m/s)", m_PT.m_Rig.Name(m_Paths.m_Eff[e]), Len, Top);
             }
+            if (m_PT.m_bPreview) Out += "; " + EditScopeText();
             return Out;
+        }
+
+        // C88 (3) the live edit scope (G-40 write set): while a drag, turn or pending pose shows, which frames and bones keying it would
+        // change. Bones: those the preview turns (or the hips it moves) against the clip as composed. Frames: per bone, the top Pose
+        // layer's smooth curve reaches two keys each side (the tangents at the neighbours change), else the layer's falloff (a new layer:
+        // 0.5 s; falloff 0: to the clip's ends). Drawn on the paths and the skeleton; MotionPaths and PoseDrag -Commit 0 report it.
+        struct edit_scope { bool m_bOn = false; int m_F0 = 0, m_F1 = 0, m_FKey = 0, m_FPS = 30; std::vector<int> m_Bones; };
+        edit_scope EditScope() noexcept
+        {
+            edit_scope E;
+            const auto& R = m_PT.m_Rig; const int nB = R.count();
+            const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0; std::string Err;
+            if (!m_PT.m_bPreview || m_PT.m_Preview.count() != nB || nB == 0 || !SuggestClipFrames(pF, FPS, nF, Err) || int(pF->size()) != nF * nB) return E;
+            const auto Base = SamplePose(*pF, FPS, nF, nB, m_PT.m_PreviewTime);
+            for (int b = 0; b < nB; ++b)
+                if (AngleDeg(Base[b].m_Rotation, m_PT.m_Preview.m_Rotation[b]) >= 0.05f || (b == R.m_Hips && (Base[b].m_Position - m_PT.m_Preview.m_Position[b]).Length() > 1e-4f))
+                    E.m_Bones.push_back(b);
+            if (E.m_Bones.empty()) return E;
+            const auto* pOv = SelectedOv();
+            const xanim_package_desc::clip_layer* pL = nullptr;
+            if (pOv && !pOv->m_Layers.empty() && pOv->m_Layers.back().m_Kind == xanim_package_desc::layer_kind::POSE && !pOv->m_Layers.back().m_bLock) pL = &pOv->m_Layers.back();
+            const double Fall = pL ? double(pL->m_Falloff) : 0.5, T = m_PT.m_PreviewTime, Dur = double(std::max(0, nF - 1)) / FPS;
+            const auto Tk = xanim_package_layers::ToTick(T);
+            double A = T, B = T;
+            for (int b : E.m_Bones)
+            {
+                std::vector<double> Before, After;          // this bone's keys on the layer, nearest first
+                if (pL) for (const auto& K : pL->m_Keys) if (K.m_Bone == R.m_Names[b]) { const double t = xanimation::TicksToSeconds(K.m_Tick); if (K.m_Tick < Tk) Before.push_back(t); else if (K.m_Tick > Tk) After.push_back(t); }
+                std::sort(Before.rbegin(), Before.rend()); std::sort(After.begin(), After.end());
+                A = std::min(A, Before.size() >= 2 ? Before[1] : !Before.empty() ? Before[0] : Fall > 0 ? T - Fall : 0.0);
+                B = std::max(B, After.size() >= 2 ? After[1] : !After.empty() ? After[0] : Fall > 0 ? T + Fall : Dur);
+            }
+            E.m_bOn = true; E.m_FPS = FPS;
+            E.m_F0 = std::clamp(int(std::floor(A * FPS)), 0, nF - 1); E.m_F1 = std::clamp(int(std::ceil(B * FPS)), 0, nF - 1); E.m_FKey = std::clamp(int(std::lround(T * FPS)), 0, nF - 1);
+            return E;
+        }
+        std::string EditScopeText() noexcept { return EditScopeText(EditScope()); }
+        std::string EditScopeText(const edit_scope& E) noexcept
+        {
+            if (!E.m_bOn) return "edit scope: none (nothing previewed or nothing changes)";
+            const int Fps = std::max(1, E.m_FPS);
+            std::string Names; for (std::size_t i = 0; i < E.m_Bones.size() && i < 8; ++i) Names += (i ? ", " : "") + m_PT.m_Rig.Name(E.m_Bones[i]);
+            if (E.m_Bones.size() > 8) Names += std::format(" and {} more", E.m_Bones.size() - 8);
+            return std::format("edit scope: frames {}..{} ({:.2f} s before the key at frame {}, {:.2f} s after), {} bone{} ({}){}", E.m_F0, E.m_F1, double(E.m_FKey - E.m_F0) / Fps, E.m_FKey, double(E.m_F1 - E.m_FKey) / Fps
+                , E.m_Bones.size(), E.m_Bones.size() == 1 ? "" : "s", Names, m_PT.m_bPreserveFeet ? "; the other feet kept on their paths" : "");
+        }
+        // drawn: the changed bones thick amber on the shown skeleton, a line of text in the viewport's corner (the path ticks: below)
+        void EditScopeAfterRender(const edit_scope& E) noexcept
+        {
+            if (!E.m_bOn || int(m_PoseBones.size()) != m_PT.m_Rig.count()) return;
+            auto* DL = ImGui::GetWindowDrawList();
+            for (int b : E.m_Bones)
+            {
+                const int p = m_PT.m_Rig.m_Par[std::size_t(b)];
+                ImVec2 S0, S1;
+                if (p >= 0 && m_Viewport.Project(m_PoseBones[std::size_t(p)].m_Position, S0) && m_Viewport.Project(m_PoseBones[std::size_t(b)].m_Position, S1)) DL->AddLine(S0, S1, IM_COL32(255, 170, 40, 200), 4.0f);
+            }
+            const auto P = ImGui::GetWindowPos();
+            const auto T = EditScopeText(E);
+            DL->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(P.x + 12, P.y + 40), IM_COL32(255, 190, 80, 255), T.c_str(), nullptr, ImGui::GetWindowWidth() - 24);
         }
 
         void MotionPathsAfterRender() noexcept
         {
+            const auto Scope = EditScope();
+            EditScopeAfterRender(Scope);
             std::string Err;
             if (!m_Paths.m_bOn || int(m_PoseBones.size()) != m_PT.m_Rig.count() || !MotionPathsUpdate(Err) || m_Paths.m_nF < 2) return;
             const int nF = m_Paths.m_nF, Fps = m_Paths.m_FPS, nB = m_PT.m_Rig.count();
@@ -4861,6 +4937,7 @@ namespace xanim_package_editor
                     const bool bHot = m_Paths.m_HoverEff == m_Paths.m_Eff[e] && m_Paths.m_HoverFrame == f;
                     DL->AddCircleFilled(S, f == fNow ? 4.5f : bHot ? 5.0f : 1.8f, f == fNow ? IM_COL32(255, 255, 255, 255) : bHot ? IM_COL32(120, 220, 255, 255) : IM_COL32(230, 230, 230, 170));
                     if (bHot) DL->AddText(ImVec2(S.x + 10, S.y - 18), IM_COL32(255, 255, 255, 255), std::format("{} at frame {}: drag to change the motion here", m_PT.m_Rig.Name(m_Paths.m_Eff[e]), f).c_str());
+                    if (Scope.m_bOn && f >= Scope.m_F0 && f <= Scope.m_F1) DL->AddCircle(S, 3.5f, IM_COL32(255, 170, 40, 230), 0, 1.5f);      // will change
                     if (f != fNow) m_Paths.m_Ticks.push_back({ m_Paths.m_Eff[e], f, S });
                     Prev = S; bPrev = true;
                 }
@@ -5039,7 +5116,7 @@ namespace xanim_package_editor
                 const auto Rp = FB.WorldRotation(R.m_Par[b]);
                 m_PT.m_Preview = m_PT.m_GizmoBase;
                 m_PT.m_Preview.m_Rotation[b] = (Rp.ConjugateCopy() * World.ExtractRotation()).NormalizeCopy();
-                m_PT.m_bPreview = true;
+                m_PT.m_bPreview = true; m_PT.m_PreviewTime = m_PT.m_GizmoTime;
             }
             if (m_PT.m_bGizmoUsing && !bUsing)
             {   // released: the key, one undo step
