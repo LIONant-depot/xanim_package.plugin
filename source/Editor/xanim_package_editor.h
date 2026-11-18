@@ -2871,7 +2871,7 @@ namespace xanim_package_editor
             std::string Err;
             auto* pCtx = KimodoRetargetCtx(Err);
             const std::vector<xmath::transform3>* pF = nullptr; int FPS = 30, nF = 0;
-            const bool bFrames = pCtx && SuggestClipFrames(pF, FPS, nF, Err);
+            const bool bFrames = pDesc && pCtx && SuggestClipFrames(pF, FPS, nF, Err);     // (the windows below read the skeleton of the descriptor)
             const auto TakeDir = ProjectPath() / L"Cache" / L"KimodoTakes" / std::format(L"{:016X}", m_Document.m_Guid.m_Instance.m_Value);
             const std::wstring Folder = pDesc ? pDesc->m_Kimodo.m_Folder : std::wstring(L"Assets\\Kimodo");
             const auto Dir = ProjectPath() / Folder;
