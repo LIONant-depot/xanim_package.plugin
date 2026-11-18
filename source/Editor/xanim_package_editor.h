@@ -4191,11 +4191,16 @@ namespace xanim_package_editor
         }
 
         // A pose (every bone's local) at a time as keys on the top Pose layer: the bones it changes, the hips' shift too. ONE undo step.
-        std::string PoseCommit(const xanimation::pose& P, double Seconds, const std::string& Label) noexcept
+        // Moved: the bone a drag or turn aimed at (-1: a whole pose - paste, mirror, a pending pose); with Keep feet paths on, the other feet
+        // keep their pre-edit paths over the frames the edit changes (PreserveFeetKeys, in the same undo step).
+        std::string PoseCommit(const xanimation::pose& P, double Seconds, const std::string& Label, int Moved = -1) noexcept
         {
             const auto& R = m_PT.m_Rig;
             const int nB = R.count();
             if (P.count() != nB) return "the pose does not fit the skeleton";
+            std::vector<xmath::transform3> Before; std::vector<xanimation::contact_interval> Con[2]; int FPS = 30, nF = 0; float HipH = 0;
+            const bool bPreserve = Moved >= 0 && m_PT.m_bPreserveFeet && FootContacts(Con, FPS, nF, HipH);
+            if (bPreserve) { const std::vector<xmath::transform3>* pF = nullptr; int a = 0, n = 0; std::string E0; if (SuggestClipFrames(pF, a, n, E0)) Before = *pF; }
             std::string Out;
             const auto E = AsOneStep(Label, [&]() -> std::string
             {
@@ -4210,7 +4215,9 @@ namespace xanim_package_editor
                 m_Suggest.m_Candidates.push_back(std::move(C));
                 Out = SuggestPoseAccept(iL, 0, false);
                 m_Suggest = {};
-                return Out.find(" keys on layer ") != std::string::npos ? std::string{} : Out;
+                if (Out.find(" keys on layer ") == std::string::npos) return Out;
+                if (!Before.empty()) Out += std::format("; keep feet paths: {}", PreserveFeetKeys(iL, Moved, Before, FPS, nF, Con));
+                return std::string{};
             });
             if (!E.empty()) return E;
             return Out;
@@ -4309,23 +4316,112 @@ namespace xanim_package_editor
                     xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "IkKeys")), k));
                     Out = std::format("IkKey: {}'s key at {:.3f} s deleted", R.Name(b), Seconds); return {};
                 }
-                const bool bNew = k < 0;
-                if (bNew) { k = int(L.m_IkKeys.size()); SetLayer(iL, "IkKeys[]", std::to_string(k + 1), std::to_string(k)); }
-                const auto Old = bNew ? xanim_package_desc::layer_ik_key{} : SelectedOv()->m_Layers[iL].m_IkKeys[k];
-                auto Fd = [&](const char* p) { return std::format("IkKeys[G:{}]/{}", k, p); };
-                if (bNew) { SetLayer(iL, Fd("Tick").c_str(), std::to_string(Tick), "0"); SetLayer(iL, Fd("Effector").c_str(), R.m_Names[b], ""); }
-                SetLayer(iL, Fd("PX").c_str(), F(Pos.m_X), F(Old.m_PX)); SetLayer(iL, Fd("PY").c_str(), F(Pos.m_Y), F(Old.m_PY)); SetLayer(iL, Fd("PZ").c_str(), F(Pos.m_Z), F(Old.m_PZ));
-                if (bRot != Old.m_bRotation) SetLayer(iL, Fd("Rotated").c_str(), bRot ? "true" : "false", Old.m_bRotation ? "true" : "false");
-                if (bRot) { SetLayer(iL, Fd("X").c_str(), F(Rot.m_X), F(Old.m_X)); SetLayer(iL, Fd("Y").c_str(), F(Rot.m_Y), F(Old.m_Y)); SetLayer(iL, Fd("Z").c_str(), F(Rot.m_Z), F(Old.m_Z)); SetLayer(iL, Fd("W").c_str(), F(Rot.m_W), F(Old.m_W)); }
-                if (bPin != Old.m_bPinned) SetLayer(iL, Fd("Pinned").c_str(), bPin ? "true" : "false", Old.m_bPinned ? "true" : "false");
-                const auto& At = R.m_AttachB[b];
-                if (At.m_X != Old.m_AX) SetLayer(iL, Fd("AX").c_str(), F(At.m_X), F(Old.m_AX));
-                if (At.m_Y != Old.m_AY) SetLayer(iL, Fd("AY").c_str(), F(At.m_Y), F(Old.m_AY));
-                if (At.m_Z != Old.m_AZ) SetLayer(iL, Fd("AZ").c_str(), F(At.m_Z), F(Old.m_AZ));
+                const bool bNew = IkKeyWrite(iL, b, Tick, k, Pos, Rot, bRot, bPin);
                 Out = std::format("IkKey: layer {} key {} {} {} at {:.3f} s: {:.4f} {:.4f} {:.4f}{}{}", iL, k, bNew ? "added" : "replaced", R.Name(b), Seconds, Pos.m_X, Pos.m_Y, Pos.m_Z, bPin ? " pinned" : "", bRot ? " +rotation" : "");
                 return {};
             });
             return E.empty() ? Out : "IkKey: " + E;
+        }
+
+        // writes effector b's IK key at Tick on layer iL (k: the key to replace, -1 = a new one; on return the key's index); true when added
+        bool IkKeyWrite(int iL, int b, std::int64_t Tick, int& k, const xmath::fvec3& Pos, const xmath::fquat& Rot, bool bRot, bool bPin) noexcept
+        {
+            const auto& R = m_PT.m_Rig;
+            const bool bNew = k < 0;
+            if (bNew) { k = int(SelectedOv()->m_Layers[iL].m_IkKeys.size()); SetLayer(iL, "IkKeys[]", std::to_string(k + 1), std::to_string(k)); }
+            const auto Old = bNew ? xanim_package_desc::layer_ik_key{} : SelectedOv()->m_Layers[iL].m_IkKeys[k];
+            auto Fd = [&](const char* p) { return std::format("IkKeys[G:{}]/{}", k, p); };
+            if (bNew) { SetLayer(iL, Fd("Tick").c_str(), std::to_string(Tick), "0"); SetLayer(iL, Fd("Effector").c_str(), R.m_Names[b], ""); }
+            SetLayer(iL, Fd("PX").c_str(), F(Pos.m_X), F(Old.m_PX)); SetLayer(iL, Fd("PY").c_str(), F(Pos.m_Y), F(Old.m_PY)); SetLayer(iL, Fd("PZ").c_str(), F(Pos.m_Z), F(Old.m_PZ));
+            if (bRot != Old.m_bRotation) SetLayer(iL, Fd("Rotated").c_str(), bRot ? "true" : "false", Old.m_bRotation ? "true" : "false");
+            if (bRot) { SetLayer(iL, Fd("X").c_str(), F(Rot.m_X), F(Old.m_X)); SetLayer(iL, Fd("Y").c_str(), F(Rot.m_Y), F(Old.m_Y)); SetLayer(iL, Fd("Z").c_str(), F(Rot.m_Z), F(Old.m_Z)); SetLayer(iL, Fd("W").c_str(), F(Rot.m_W), F(Old.m_W)); }
+            if (bPin != Old.m_bPinned) SetLayer(iL, Fd("Pinned").c_str(), bPin ? "true" : "false", Old.m_bPinned ? "true" : "false");
+            const auto& At = R.m_AttachB[b];
+            if (At.m_X != Old.m_AX) SetLayer(iL, Fd("AX").c_str(), F(At.m_X), F(Old.m_AX));
+            if (At.m_Y != Old.m_AY) SetLayer(iL, Fd("AY").c_str(), F(At.m_Y), F(Old.m_AY));
+            if (At.m_Z != Old.m_AZ) SetLayer(iL, Fd("AZ").c_str(), F(At.m_Z), F(Old.m_AZ));
+            return bNew;
+        }
+
+        // C88 (2) for plain drags (no refine): the feet the edit did not aim at stay on their pre-edit paths - IK keys over the frames the edit
+        // changed, pinned from each contact's first frame (held while down), every 4 frames while swinging (the smooth curve between). The span
+        // reaches out to planted frames with half the layer's falloff of contact around them, so the IK's own ease in/out pulls a planted foot to
+        // where it already is (or to the clip's ends). The last key is never pinned (a last pinned key holds to the clip's end).
+        // Moved: the bone the edit aimed at; a foot whose leg holds it (foot up to, not including, the hips) is the user's and is left alone.
+        // Returns what it did (keys, and how far the feet end from their paths); Before / Con: the clip as composed and the feet's contacts before the edit.
+        std::string PreserveFeetKeys(int iL, int Moved, const std::vector<xmath::transform3>& Before, int FPS, int nF, const std::vector<xanimation::contact_interval> (&Con)[2]) noexcept
+        {
+            const auto& R = m_PT.m_Rig; const int nB = R.count();
+            const std::vector<xmath::transform3>* pA = nullptr; int FA = 30, nA = 0; std::string Err;
+            if (!SuggestClipFrames(pA, FA, nA, Err) || nA != nF || FA != FPS || pA->size() != Before.size() || Before.size() != std::size_t(nF) * nB) return "not measured: " + Err;
+            const std::vector<xmath::transform3> After = *pA;      // the keys below recompose the stack
+            const int Fall = int(std::lround(std::max(0.0, double(SelectedOv()->m_Layers[iL].m_Falloff)) * FPS));
+            xanimation::body_ik FK; FK.Setup(R.m_Par); xanimation::pose P; P.resize(nB);
+            auto Handle = [&](const std::vector<xmath::transform3>& Fr, int f, int b) { for (int i = 0; i < nB; ++i) P.set(i, Fr[std::size_t(f) * nB + i]); FK.ComputeWorld(P); return HandleModel(FK, b); };
+            int nKeys = 0; std::vector<std::array<int, 3>> Spans;     // side, first, last frame
+            std::set<std::pair<int, int>> Keyed;
+            auto KeyAt = [&](int b, int f, bool bPin)                   // the foot's pre-edit handle and rotation at frame f as an IK key
+            {
+                if (!Keyed.insert({ b, f }).second) return;
+                for (int i = 0; i < nB; ++i) P.set(i, Before[std::size_t(f) * nB + i]);
+                FK.ComputeWorld(P);
+                int k = -1;
+                IkKeyWrite(iL, b, xanim_package_layers::ToTick(double(f) / FPS), k, HandleModel(FK, b), FK.WorldRotation(b), true, bPin);
+                ++nKeys;
+            };
+            for (int s = 0; s < 2; ++s)
+            {
+                const int b = s == 0 ? R.m_LF : R.m_RF;
+                if (b < 0) continue;
+                bool bUsers = false; for (int a = b; a >= 0 && a != R.m_Hips; a = R.m_Par[a]) bUsers |= a == Moved;
+                if (bUsers) continue;
+                int f0 = -1, f1 = -1;
+                for (int f = 0; f < nF; ++f) if ((Handle(After, f, b) - Handle(Before, f, b)).Length() > 0.001f) { if (f0 < 0) f0 = f; f1 = f; }
+                if (f0 < 0) continue;
+                auto InC = [&](int f) -> const xanimation::contact_interval* { for (const auto& c : Con[s]) if (f >= c.m_First && f <= c.m_Last) return &c; return nullptr; };
+                // ponytail: no contact long enough before/after: the span runs to the clip's end (sparse keys, only the swing frames cost)
+                int a = 0, z = nF - 1;
+                // half the falloff planted is enough: the ease's far half weighs under 0.5 and the foot is near its landing spot there
+                for (int f = f0; f >= 0; --f) if (const auto* c = InC(f); c && 2 * (f - c->m_First) >= Fall) { a = f; break; }
+                for (int f = f1; f < nF; ++f) if (const auto* c = InC(f); c && 2 * (c->m_Last - f) >= Fall) { z = f; break; }
+                Spans.push_back({ s, a, z });
+                // the foot's own keys in the span go (the motion they made is in Before, so it is kept)
+                const auto TA = xanim_package_layers::ToTick(double(a) / FPS), TZ = xanim_package_layers::ToTick(double(z) / FPS);
+                const auto& Keys = SelectedOv()->m_Layers[iL].m_IkKeys;
+                for (int k = int(Keys.size()) - 1; k >= 0; --k)
+                    if (Keys[k].m_Effector == R.m_Names[b] && Keys[k].m_Tick >= TA && Keys[k].m_Tick <= TZ)
+                        xeditor::Run(m_Undo, std::format("ListOp -Path {} -Op Delete -Index {}", xeditor::Quote(LayerPath(iL, "IkKeys")), k));
+                for (int f = a; f <= z; ++f)
+                {
+                    const auto* c = InC(f);
+                    if (f == a || f == z || (c ? f == c->m_First : (f - a) % 4 == 0 || InC(f - 1))) KeyAt(b, f, c && f != z);
+                }
+            }
+            // a second pass where the swing's smooth curve between keys left a foot more than 1 cm off its path: a key there (contact frames
+            // are held at their first frame on purpose: the clip's own skate goes); then the result, each kept foot against its path
+            int nAdded = 0;
+            float Miss = 0, Held = 0; int MissF = -1; std::string MissFoot;
+            for (int Pass = 0; Pass < 2 && nKeys; ++Pass)
+            {
+                if (!SuggestClipFrames(pA, FA, nA, Err) || pA->size() != Before.size()) break;
+                const std::vector<xmath::transform3> Now = *pA;
+                Miss = 0; Held = 0; MissF = -1;
+                for (const auto& [s, a, z] : Spans)
+                {
+                    const int b = s == 0 ? R.m_LF : R.m_RF;
+                    for (int f = a; f <= z; ++f)
+                    {
+                        const float d = (Handle(Now, f, b) - Handle(Before, f, b)).Length();
+                        bool bC = false; for (const auto& c : Con[s]) bC |= f >= c.m_First && f <= c.m_Last;
+                        if (bC) Held = std::max(Held, d);
+                        else if (d > Miss) { Miss = d; MissF = f; MissFoot = R.Name(b); }
+                        if (Pass == 0 && !bC && d > 0.01f && f != a && f != z) { KeyAt(b, f, false); ++nAdded; }
+                    }
+                }
+                if (!nAdded) break;
+            }
+            return std::format("{} IK keys ({} where the curve missed), swinging feet within {:.2f} cm of their paths{}, planted feet held (the clip's own drift: up to {:.2f} cm)"
+                , nKeys, nAdded, Miss * 100.0f, MissF >= 0 ? std::format(" (worst {} at frame {})", MissFoot, MissF) : "", Held * 100.0f);
         }
 
         // where a preview prop's centre is at a time (model space, the composed animation: a prop a bone holds moves with it); IK keys aim at it
@@ -4517,7 +4613,7 @@ namespace xanim_package_editor
             if (!bCommit) { m_PT.m_Preview = Out; m_PT.m_bPreview = true; return Head + " (preview only)"; }
             m_PT.m_bPreview = false;
             if (!m_PT.m_bAutoKey) return Head + "\n" + PosePend(Out, Seconds);         // auto-key off: pending until K
-            const auto C = PoseCommit(Out, Seconds, std::format("Pose {} {}", bFK ? "turn" : "drag", R.Name(Eff)));
+            const auto C = PoseCommit(Out, Seconds, std::format("Pose {} {}", bFK ? "turn" : "drag", R.Name(Eff)), Eff);
             return Head + "\n" + C;
         }
 
@@ -4636,7 +4732,7 @@ namespace xanim_package_editor
                         if ((m_PT.m_Target - m_PT.m_Start).Length() > 1e-5f)
                         {
                             m_PT.m_LastEff = Eff;
-                            const auto R = m_PT.m_bAutoKey ? PoseCommit(P, m_PT.m_Time, std::format("Pose {} {}", m_PT.m_bFK ? "turn" : "drag", m_PT.m_Rig.Name(Eff))) : PosePend(P, m_PT.m_Time);
+                            const auto R = m_PT.m_bAutoKey ? PoseCommit(P, m_PT.m_Time, std::format("Pose {} {}", m_PT.m_bFK ? "turn" : "drag", m_PT.m_Rig.Name(Eff)), Eff) : PosePend(P, m_PT.m_Time);
                             if (R.find(" keys on layer ") == std::string::npos) m_PT.m_Note = R;
                             xeditor::LogConsole(std::format("Pose: {} ({})", m_PT.m_Note, R.substr(0, 160)), xeditor::log_source::User);
                         }
@@ -4951,7 +5047,7 @@ namespace xanim_package_editor
                 if (m_PT.m_bPreview)
                 {
                     const auto P = m_PT.m_Preview; m_PT.m_bPreview = false;
-                    const auto C = m_PT.m_bAutoKey ? PoseCommit(P, m_PT.m_GizmoTime, std::format("Pose rotate {}", R.m_Names[b])) : PosePend(P, m_PT.m_GizmoTime);
+                    const auto C = m_PT.m_bAutoKey ? PoseCommit(P, m_PT.m_GizmoTime, std::format("Pose rotate {}", R.m_Names[b]), b) : PosePend(P, m_PT.m_GizmoTime);
                     m_PT.m_Note = C.find(" keys on layer ") != std::string::npos ? std::format("{} turned", R.m_Names[b]) : C;
                     xeditor::LogConsole(std::format("Pose: {} ({})", m_PT.m_Note, C.substr(0, 160)), xeditor::log_source::User);
                 }
@@ -4972,7 +5068,7 @@ namespace xanim_package_editor
             const auto Turn = (xanimation::details::AxisAngle(xmath::fvec3(0, 0, 1), TurnDeg.m_Z * D) * xanimation::details::AxisAngle(xmath::fvec3(0, 1, 0), TurnDeg.m_Y * D) * xanimation::details::AxisAngle(xmath::fvec3(1, 0, 0), TurnDeg.m_X * D)).NormalizeCopy();
             auto P = Base;
             P.m_Rotation[b] = (FK.WorldRotation(R.m_Par[b]).ConjugateCopy() * Turn * FK.WorldRotation(b)).NormalizeCopy();
-            return "PoseRotate: " + PoseCommit(P, Seconds, std::format("Pose rotate {}", R.m_Names[b]));
+            return "PoseRotate: " + PoseCommit(P, Seconds, std::format("Pose rotate {}", R.m_Names[b]), b);
         }
 
         // the Pose tool's bar over the viewport
