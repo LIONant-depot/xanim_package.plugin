@@ -84,6 +84,7 @@ namespace xanim_package_editor
                 m_hB = m_Parser.addOption("Seconds", "Length in seconds (default 5)", false, 1);
                 m_hC = m_Parser.addOption("Seed",    "Seed (default 1): another seed, another take", false, 1);
                 m_hD = m_Parser.addOption("Path",    "\"vx vz\" metres per second: the root goes straight at this velocity (+Z ahead, +X to the left) while facing ahead the whole take - strafes, a backward walk (Kimodo's root path + heading constraints)", false, 1);
+                m_hE = m_Parser.addOption("Goal",    "\"x z from to\": the root stays where it starts until 'from' seconds and is at (x, z) metres (+Z ahead, +X to the left) from 'to' on, facing ahead the whole take - a step or a stagger that ends where it must (recovery clips, R68)", false, 1);
                 break;
             case kind::kimodo_accept: m_hA = m_Parser.addOption("Name", "The clip's file name (default: from the prompt)", false, 1); break;
             case kind::layer_add:
@@ -2085,7 +2086,7 @@ namespace xanim_package_editor
 
         // pVx (set): the root goes straight at (Vx, Vz) m/s facing ahead the whole take (Kimodo's root2d path + global heading on every
         // frame): a text-only "side-step" turned its body ~40 deg over 4 s (plan C72) - a strafe needs the path and the facing stated
-        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0) noexcept
+        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0, const float* pGoal = nullptr) noexcept
         {
             if (auto* pWhy = KimodoWhyNot()) return std::string("KimodoGenerate: ") + pWhy;
             if (m_K.m_Job.m_bRunning) return "KimodoGenerate: a generation is already running";
@@ -2094,7 +2095,7 @@ namespace xanim_package_editor
             std::string Err;
             if (!KimodoResolveSkeleton(Err)) return "KimodoGenerate: " + Err;
             Seconds = std::clamp(Seconds, 0.5f, 60.0f);
-            if (pVx)
+            if (pVx || pGoal)
             {
                 static int s_Count = 0;
                 std::filesystem::create_directories(m_Document.m_TempDir);
@@ -2104,6 +2105,12 @@ namespace xanim_package_editor
                 for (int f = 0; f < N; ++f)
                 {
                     const float t = float(f) / 30.0f;
+                    if (pGoal)          // (the goal: pinned at the start until from, at (x, z) from to; free in between - the motion decides the step)
+                    {
+                        if (t <= pGoal[2]) { Path.m_Frames.push_back(f); Path.m_Smooth.push_back({ 0.0f, 0.0f }); Path.m_Heading.push_back({ 1.0f, 0.0f }); }
+                        else if (t >= pGoal[3]) { Path.m_Frames.push_back(f); Path.m_Smooth.push_back({ pGoal[0], pGoal[1] }); Path.m_Heading.push_back({ 1.0f, 0.0f }); }
+                        continue;
+                    }
                     Path.m_Frames.push_back(f); Path.m_Smooth.push_back({ *pVx * t, Vz * t }); Path.m_Heading.push_back({ 1.0f, 0.0f });      // (heading 0: facing +Z, Kimodo's atan2(dz, -dx) of right - left hip)
                 }
                 if (!kimodo::WriteConstraints(Stem + L".json", { Path }, Err)) return "KimodoGenerate: " + Err;
@@ -5549,6 +5556,12 @@ namespace xanim_package_editor
             std::from_chars(Secs.data(), Secs.data() + Secs.size(), Seconds); std::from_chars(Seed.data(), Seed.data() + Seed.size(), iSeed);
             std::snprintf(S.m_K.m_Prompt, sizeof(S.m_K.m_Prompt), "%s", Prompt.c_str()); S.m_K.m_Seconds = Seconds; S.m_K.m_Seed = iSeed;
             std::string Path; float Vx = 0, Vz = 0; bool bPath = false;
+            if (std::string Goal; xeditor::cmd_util::GetArg(m_Parser, m_hE, Goal))
+            {
+                float G[4]{};
+                if (std::sscanf(Goal.c_str(), "%f %f %f %f", &G[0], &G[1], &G[2], &G[3]) != 4) return "KimodoGenerate: -Goal wants \"x z from to\" (metres, seconds)";
+                return S.KimodoGenerate(Prompt, Seconds, iSeed, nullptr, 0, G);
+            }
             if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Path))
             {
                 if (std::sscanf(Path.c_str(), "%f %f", &Vx, &Vz) != 2) return "KimodoGenerate: -Path wants \"vx vz\" (metres per second)";
