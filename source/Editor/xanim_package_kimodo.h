@@ -11,6 +11,7 @@
 // its models: XKIMODO_MODELS, else xkimodo's own default (its folder's models\).
 
 #include <windows.h>
+#include "dependencies/xAnimation/source/xanimation_env.h"      // (xanimation::EnvW: _wgetenv without MSVC's C4996)
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -145,7 +146,7 @@ namespace xanim_package_editor::kimodo
     //--------------------------------------------------------------------------------------------
     inline std::wstring FindExe() noexcept
     {
-        if (const wchar_t* E = _wgetenv(L"XKIMODO_EXE"); E && *E) return E;
+        if (std::wstring E = xanimation::EnvW(L"XKIMODO_EXE"); !E.empty()) return E;
         wchar_t Buf[MAX_PATH]; GetModuleFileNameW(nullptr, Buf, MAX_PATH);
         for (auto Dir = std::filesystem::path(Buf).parent_path(); !Dir.empty() && Dir != Dir.root_path(); Dir = Dir.parent_path())
             for (const wchar_t* B : { L"cuda", L"vulkan", L"cpu" })
@@ -172,7 +173,7 @@ namespace xanim_package_editor::kimodo
             std::wstring P = xstrtool::To(Prompt);
             for (auto& c : P) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
             std::wstring Cmd = std::format(L"\"{}\" gen --prompt \"{}\" --seconds {:.2f} --seed {} --bvh \"{}\"", Exe, P, Seconds, Seed, m_Bvh);
-            if (const wchar_t* M = _wgetenv(L"XKIMODO_MODELS"); M && *M) Cmd += std::format(L" --models \"{}\"", M);
+            if (const std::wstring M = xanimation::EnvW(L"XKIMODO_MODELS"); !M.empty()) Cmd += std::format(L" --models \"{}\"", M);
 
             SECURITY_ATTRIBUTES SA{ sizeof(SA), nullptr, TRUE };
             HANDLE hLog = CreateFileW(m_Log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &SA, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -191,7 +192,7 @@ namespace xanim_package_editor::kimodo
             m_Bvh = Bvh; m_Log = Log;
             std::error_code Ec; std::filesystem::remove(m_Bvh, Ec);
             std::wstring Cmd = std::format(L"\"{}\" {}", Exe, Args);
-            if (const wchar_t* M = _wgetenv(L"XKIMODO_MODELS"); M && *M) Cmd += std::format(L" --models \"{}\"", M);
+            if (const std::wstring M = xanimation::EnvW(L"XKIMODO_MODELS"); !M.empty()) Cmd += std::format(L" --models \"{}\"", M);
             SECURITY_ATTRIBUTES SA{ sizeof(SA), nullptr, TRUE };
             HANDLE hLog = CreateFileW(m_Log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &SA, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             STARTUPINFOW SI{ sizeof(SI) };
@@ -295,7 +296,7 @@ namespace xanim_package_editor::kimodo
     inline bool RunBlocking(const std::wstring& Exe, const std::wstring& Args, const std::wstring& Log, DWORD TimeoutMs, std::string& Error)
     {
         std::wstring Cmd = std::format(L"\"{}\" {}", Exe, Args);
-        if (const wchar_t* M = _wgetenv(L"XKIMODO_MODELS"); M && *M) Cmd += std::format(L" --models \"{}\"", M);
+        if (const std::wstring M = xanimation::EnvW(L"XKIMODO_MODELS"); !M.empty()) Cmd += std::format(L" --models \"{}\"", M);
         SECURITY_ATTRIBUTES SA{ sizeof(SA), nullptr, TRUE };
         HANDLE hLog = CreateFileW(Log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &SA, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         STARTUPINFOW SI{ sizeof(SI) };

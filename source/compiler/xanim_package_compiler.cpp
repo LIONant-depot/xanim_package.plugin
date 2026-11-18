@@ -1,4 +1,5 @@
 #include "xanim_package_compiler.h"
+#include "dependencies/xAnimation/source/xanimation_env.h"      // (xanimation::OpenW: _wfopen without MSVC's C4996)
 #include "dependencies/xAnimation/source/semantic/xanimation_clip_traits.h"
 
 #include "dependencies/xraw3d/source/xraw3d.h"
@@ -872,7 +873,7 @@ namespace xanim_package_compiler
                             auto SP = Worlds(Sk.m_Parent, Frames, nSrc, f); const auto DP = Worlds(Dk.m_Parent, Baked, nDst, f);
                             SF.push_back(Ctx.m_Mapping.m_Auto.m_Map.m_Registration * SP[Row.m_Source] * (1.0f / Hs)); DF.push_back(DP[Row.m_Target] * (1.0f / Hd));
                         }
-                        const auto Sc = xanimation::FindContacts(SF, Raw.m_Anim.m_FPS), Dc = xanimation::FindContacts(DF, Raw.m_Anim.m_FPS);
+                        const auto Sc = xanimation::FindContacts(SF, float(Raw.m_Anim.m_FPS)), Dc = xanimation::FindContacts(DF, float(Raw.m_Anim.m_FPS));
                         auto Mean = [](const std::vector<xanimation::contact_interval>& C) { float T = 0; for (const auto& I : C) T += I.m_Skate; return C.empty() ? 0.0f : T / static_cast<float>(C.size()); };
                         const char* pSide = Row.m_Side == xanimation::bone_side::LEFT ? "left" : "right";
                         LogMessage(xresource_pipeline::msg_type::INFO, std::format("  {} foot contacts: source {} (skate {:.3f}/s), destination {} (skate {:.3f}/s)", pSide, Sc.size(), Mean(Sc), Dc.size(), Mean(Dc)));
@@ -1024,7 +1025,7 @@ namespace xanim_package_compiler
                                   , Conf[b] == xanimation::frame_confidence::SUGGESTED ? "suggested" : "needs confirmation"
                                   , L[b].m_TwistCentre * D, L[b].m_TwistHalf * D, L[b].m_SwingCy * D, L[b].m_SwingCz * D, L[b].m_SwingRy * D, L[b].m_SwingRz * D);
             }
-            if (std::FILE* f = _wfopen(std::format(L"{}\\JointRanges.txt", m_ResourceLogPath).c_str(), L"wb")) { std::fwrite(Txt.data(), 1, Txt.size(), f); std::fclose(f); }
+            if (std::FILE* f = xanimation::OpenW(std::format(L"{}\\JointRanges.txt", m_ResourceLogPath).c_str(), L"wb")) { std::fwrite(Txt.data(), 1, Txt.size(), f); std::fclose(f); }
             else LogMessage(xresource_pipeline::msg_type::WARNING, "JointRanges.txt could not be written");
         }
 

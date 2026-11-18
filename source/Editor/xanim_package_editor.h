@@ -826,7 +826,7 @@ namespace xanim_package_editor
             for (const auto& Part : Parts)
             {
                 char W[16] = {}, A[40] = {}; unsigned long long R = 0;
-                const int n = std::sscanf(Part.c_str(), " %15s %llu %39s", W, &R, A);
+                const int n = xanimation::Scan(Part.c_str(), " %15s %llu %39s", W, &R, A);
                 const unsigned long long X = std::strtoull(A, nullptr, 10);    // a flag, or a row id (64 bits: not through a double)
                 const double             F = std::strtod(A, nullptr);         // a weight
                 if (n <= 0) continue;
@@ -908,7 +908,7 @@ namespace xanim_package_editor
                 {
                     if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
                     char M[16] = {};
-                    if (std::sscanf(Part.c_str(), " %*s %*llu %*llu %15s", M) != 1) return "interp row item smooth|linear|step";
+                    if (xanimation::Scan(Part.c_str(), " %*s %*llu %*llu %15s", M) != 1) return "interp row item smooth|linear|step";
                     const std::string Mode(M);
                     if (Mode != "smooth" && Mode != "linear" && Mode != "step") return "interp row item smooth|linear|step";
                     const bool bStep = Mode == "step", bLin = Mode == "linear";
@@ -935,7 +935,7 @@ namespace xanim_package_editor
                 else if (Op == "addw" && pR->m_bWeight)        // "addw weight_row tick value": a weight key (0..1); one at that time already: refused
                 {
                     long long Tk = 0; float Val = 0;
-                    if (std::sscanf(Part.c_str(), " %*s %*llu %lld %f", &Tk, &Val) != 2 || Tk < 0 || !(Val >= 0 && Val <= 1)) return "addw row tick value(0..1)";
+                    if (xanimation::Scan(Part.c_str(), " %*s %*llu %lld %f", &Tk, &Val) != 2 || Tk < 0 || !(Val >= 0 && Val <= 1)) return "addw row tick value(0..1)";
                     if (L.m_bLock) return std::format("layer '{}' is locked", L.m_Name);
                     for (const auto& K : L.m_WeightKeys) if (K.m_Tick == Tk) return "a weight key is already at that time";
                     const int nW = int(L.m_WeightKeys.size());
@@ -1481,10 +1481,10 @@ namespace xanim_package_editor
             namespace tl = xeditor::timeline;
             std::string A;
             if (!(A = Time).empty()) { double s = 0; if (std::from_chars(A.data(), A.data() + A.size(), s).ec == std::errc()) { m_TimeSeconds = float(std::max(0.0, s)); m_LoopsElapsed = 0; } }
-            if (!(A = SoloArg).empty()) { unsigned long long R = 0; int On = 0; if (std::sscanf(A.c_str(), "%llu %d", &R, &On) == 2) { if (On) m_TLTransport.m_Solo.insert(R); else m_TLTransport.m_Solo.erase(R); } }
+            if (!(A = SoloArg).empty()) { unsigned long long R = 0; int On = 0; if (xanimation::Scan(A.c_str(), "%llu %d", &R, &On) == 2) { if (On) m_TLTransport.m_Solo.insert(R); else m_TLTransport.m_Solo.erase(R); } }
             if (!Fold.empty()) m_TLView.m_Folded.insert(std::strtoull(Fold.c_str(), nullptr, 10));
             if (!Unfold.empty()) m_TLView.m_Folded.erase(std::strtoull(Unfold.c_str(), nullptr, 10));
-            if (!(A = FrameArg).empty()) { double a = 0, b = 0; if (std::sscanf(A.c_str(), "%lf %lf", &a, &b) == 2) { m_TLView.m_View.Frame(tl::tick(a * tl_tps_v), tl::tick(b * tl_tps_v)); m_TLView.m_bFramed = true; } }
+            if (!(A = FrameArg).empty()) { double a = 0, b = 0; if (xanimation::Scan(A.c_str(), "%lf %lf", &a, &b) == 2) { m_TLView.m_View.Frame(tl::tick(a * tl_tps_v), tl::tick(b * tl_tps_v)); m_TLView.m_bFramed = true; } }
             std::vector<tl::row_desc> Rows; TLRowsOf(Rows);
             const auto& V = m_TLView.m_View;
             std::string Sel; for (const auto& r : m_TLView.m_Selection) Sel += std::format("{}:{} ", r.m_Row, r.m_Item);
@@ -3020,7 +3020,7 @@ namespace xanim_package_editor
             if (!Move.empty())
             {
                 char Bone[128] = {}; float d[3] = {};
-                if (std::sscanf(Move.c_str(), "%127s %f %f %f", Bone, &d[0], &d[1], &d[2]) != 4) return "SuggestPose: -Move is \"Bone dx dy dz\" (centimetres)";
+                if (xanimation::Scan(Move.c_str(), "%127s %f %f %f", Bone, &d[0], &d[1], &d[2]) != 4) return "SuggestPose: -Move is \"Bone dx dy dz\" (centimetres)";
                 iMoved = Handle(Bone);
                 if (iMoved < 0) return std::format("SuggestPose: no bone or handle '{}'", Bone);
                 Target = Solver.WorldPosition(iMoved) + xmath::fvec3(d[0], d[1], d[2]) * 0.01f;
@@ -3352,7 +3352,7 @@ namespace xanim_package_editor
                 Tk.m_Start = xanim_package_layers::ToTick(std::max(0.0, Ta)); Tk.m_End = xanim_package_layers::ToTick(Tb);
                 Tk.m_Offset = xanim_package_layers::ToTick(T0);
                 Tk.m_Why = Chunks.size() > 1 ? std::format("{} (window {} of {}, stitched)", Why, ci + 1, Chunks.size()) : Why;
-                if (std::FILE* fp = _wfopen((Dir / (xstrtool::To(Name) + L".take.txt")).c_str(), L"wb"))
+                if (std::FILE* fp = xanimation::OpenW((Dir / (xstrtool::To(Name) + L".take.txt")).c_str(), L"wb"))
                 {
                     const auto T = std::format("prompt: {}\nseed: {}\nsteps: {}\nframes: {} at 30 fps (frame 0 = clip {:.3f} s)\nkeys made: clip {:.3f} .. {:.3f} s\nclip: {}\nwhy: {}\n"
                         , Tk.m_Prompt, Tk.m_Seed, Tk.m_Steps, n, T0, Ta, Tb, pOv->m_OriginalName, Tk.m_Why);
@@ -5559,12 +5559,12 @@ namespace xanim_package_editor
             if (std::string Goal; xeditor::cmd_util::GetArg(m_Parser, m_hE, Goal))
             {
                 float G[4]{};
-                if (std::sscanf(Goal.c_str(), "%f %f %f %f", &G[0], &G[1], &G[2], &G[3]) != 4) return "KimodoGenerate: -Goal wants \"x z from to\" (metres, seconds)";
+                if (xanimation::Scan(Goal.c_str(), "%f %f %f %f", &G[0], &G[1], &G[2], &G[3]) != 4) return "KimodoGenerate: -Goal wants \"x z from to\" (metres, seconds)";
                 return S.KimodoGenerate(Prompt, Seconds, iSeed, nullptr, 0, G);
             }
             if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Path))
             {
-                if (std::sscanf(Path.c_str(), "%f %f", &Vx, &Vz) != 2) return "KimodoGenerate: -Path wants \"vx vz\" (metres per second)";
+                if (xanimation::Scan(Path.c_str(), "%f %f", &Vx, &Vz) != 2) return "KimodoGenerate: -Path wants \"vx vz\" (metres per second)";
                 bPath = true;
             }
             return S.KimodoGenerate(Prompt, Seconds, iSeed, bPath ? &Vx : nullptr, Vz);
@@ -5596,12 +5596,12 @@ namespace xanim_package_editor
             xeditor::cmd_util::GetArg(m_Parser, m_hE, Off);
             double Secs = 0; float D[3] = {};
             if (std::from_chars(Time.data(), Time.data() + Time.size(), Secs).ec != std::errc() || Secs < 0) return "PoseKey: -Time is seconds (>= 0)";
-            if (!Turn.empty() && std::sscanf(Turn.c_str(), "%f %f %f", &D[0], &D[1], &D[2]) != 3) return "PoseKey: -Turn is \"x y z\" degrees";
+            if (!Turn.empty() && xanimation::Scan(Turn.c_str(), "%f %f %f", &D[0], &D[1], &D[2]) != 3) return "PoseKey: -Turn is \"x y z\" degrees";
             constexpr float R = 3.14159265358979f / 180.0f;
             const xmath::fquat Q(xmath::radian3(xmath::radian{ D[0] * R }, xmath::radian{ D[1] * R }, xmath::radian{ D[2] * R }));
             std::string MoveArg; xeditor::cmd_util::GetArg(m_Parser, m_hF, MoveArg);
             xmath::fvec3 Mv(0, 0, 0);
-            if (!MoveArg.empty() && std::sscanf(MoveArg.c_str(), "%f %f %f", &Mv.m_X, &Mv.m_Y, &Mv.m_Z) != 3) return "PoseKey: -Move is \"x y z\"";
+            if (!MoveArg.empty() && xanimation::Scan(MoveArg.c_str(), "%f %f %f", &Mv.m_X, &Mv.m_Y, &Mv.m_Z) != 3) return "PoseKey: -Move is \"x y z\"";
             return S.PoseKey(iL, Bone, Secs, Q, Off == "1" || Off == "true", MoveArg.empty() ? nullptr : &Mv);
         }
         case kind::layer_mask:
@@ -5686,7 +5686,7 @@ namespace xanim_package_editor
         case kind::pose_rotate:
         {
             std::string Bn, Tn, Tm; xmath::fvec3 Td(0, 0, 0); double T = S.m_TimeSeconds;
-            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Bn) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Tn) || std::sscanf(Tn.c_str(), "%f %f %f", &Td.m_X, &Td.m_Y, &Td.m_Z) != 3) return "PoseRotate: -Bone name -Turn \"x y z\"";
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Bn) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Tn) || xanimation::Scan(Tn.c_str(), "%f %f %f", &Td.m_X, &Td.m_Y, &Td.m_Z) != 3) return "PoseRotate: -Bone name -Turn \"x y z\"";
             if (xeditor::cmd_util::GetArg(m_Parser, m_hC, Tm) && (std::from_chars(Tm.data(), Tm.data() + Tm.size(), T).ec != std::errc() || T < 0)) return "PoseRotate: -Time is seconds";
             return S.PoseRotate(Bn, Td, T);
         }
@@ -5706,7 +5706,7 @@ namespace xanim_package_editor
         case kind::pose_drag:
         {
             std::string Eff, Mv, Pins, Only, Time, Commit; xmath::fvec3 M(0, 0, 0);
-            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Eff) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Mv) || std::sscanf(Mv.c_str(), "%f %f %f", &M.m_X, &M.m_Y, &M.m_Z) != 3) return "PoseDrag: -Effector name -Move \"dx dy dz\" (cm)";
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Eff) || !xeditor::cmd_util::GetArg(m_Parser, m_hB, Mv) || xanimation::Scan(Mv.c_str(), "%f %f %f", &M.m_X, &M.m_Y, &M.m_Z) != 3) return "PoseDrag: -Effector name -Move \"dx dy dz\" (cm)";
             xeditor::cmd_util::GetArg(m_Parser, m_hC, Pins); xeditor::cmd_util::GetArg(m_Parser, m_hD, Only); xeditor::cmd_util::GetArg(m_Parser, m_hF, Commit);
             double T = S.m_TimeSeconds;
             if (xeditor::cmd_util::GetArg(m_Parser, m_hE, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "PoseDrag: -Time is seconds";
@@ -5728,7 +5728,7 @@ namespace xanim_package_editor
             xeditor::cmd_util::GetArg(m_Parser, m_hA, Eff);
             if (xeditor::cmd_util::GetArg(m_Parser, m_hB, Time) && (std::from_chars(Time.data(), Time.data() + Time.size(), T).ec != std::errc() || T < 0)) return "IkKey: -Time is seconds";
             xmath::fvec3 P; const bool bPos = xeditor::cmd_util::GetArg(m_Parser, m_hC, Pos);
-            if (bPos && std::sscanf(Pos.c_str(), "%f %f %f", &P.m_X, &P.m_Y, &P.m_Z) != 3) return "IkKey: -Pos \"x y z\"";
+            if (bPos && xanimation::Scan(Pos.c_str(), "%f %f %f", &P.m_X, &P.m_Y, &P.m_Z) != 3) return "IkKey: -Pos \"x y z\"";
             int PinState = -1; if (xeditor::cmd_util::GetArg(m_Parser, m_hD, Pin)) PinState = (Pin == "1" || Pin == "true") ? 1 : 0;
             xeditor::cmd_util::GetArg(m_Parser, m_hE, Rot); xeditor::cmd_util::GetArg(m_Parser, m_hF, Del);
             if (std::string Probe; xeditor::cmd_util::GetArg(m_Parser, m_hG, Probe) && (Probe == "1" || Probe == "true")) return S.HandleProbe(Eff, T);

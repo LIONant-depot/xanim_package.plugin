@@ -1,3 +1,4 @@
+#include "dependencies/xAnimation/source/xanimation_env.h"      // (xanimation::Env: std::getenv without MSVC's C4996)
 #include "xanim_package.h"
 #include "xanim_package_xgpu_rsc_loader.h"
 
@@ -27,7 +28,7 @@ xresource::loader< xrsc::anim_package_type_guid_v >::data_type* xresource::loade
         return nullptr;
     }
     // the raw keys (the editors read them; the runtime samples the compressed tracks): XLION_ANIM_NO_KEYS=1 leaves them on disk, as a game would
-    static const bool bNoKeys = [] { const char* e = std::getenv("XLION_ANIM_NO_KEYS"); return e && *e == '1'; }();
+    static const bool bNoKeys = [] { const char* e = xanimation::Env("XLION_ANIM_NO_KEYS"); return e && *e == '1'; }();
     if (!bNoKeys) xanim_package::LoadKeys(*pPackage, Path);
 
     return pPackage;
