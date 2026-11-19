@@ -80,11 +80,13 @@ namespace xanim_package_editor
             case kind::seek:        m_hA = m_Parser.addOption("Time",   "Seconds from the clip start", true, 1); break;
             case kind::set_speed:   m_hA = m_Parser.addOption("Index",  "Playback speed step (0.25x .. 3x)", true, 1); break;
             case kind::kimodo_generate:
-                m_hA = m_Parser.addOption("Prompt",  "What the motion is, in words", true, 1);
+                m_hA = m_Parser.addOption("Prompt",  "What the motion is, in words (or -Video)", false, 1);
                 m_hB = m_Parser.addOption("Seconds", "Length in seconds (default 5)", false, 1);
                 m_hC = m_Parser.addOption("Seed",    "Seed (default 1): another seed, another take", false, 1);
                 m_hD = m_Parser.addOption("Path",    "\"vx vz\" metres per second: the root goes straight at this velocity (+Z ahead, +X to the left) while facing ahead the whole take - strafes, a backward walk (Kimodo's root path + heading constraints)", false, 1);
                 m_hE = m_Parser.addOption("Goal",    "\"x z from to\": the root stays where it starts until 'from' seconds and is at (x, z) metres (+Z ahead, +X to the left) from 'to' on, facing ahead the whole take - a step or a stagger that ends where it must (recovery clips, R68)", false, 1);
+                m_hF = m_Parser.addOption("Video",   "A video file instead of a prompt: the motion of its main person (xmocap capture; -Start s, -Seconds s of it)", false, 1);
+                m_hG = m_Parser.addOption("Start",   "With -Video: where in the video the take starts, seconds (default 0)", false, 1);
                 break;
             case kind::kimodo_accept: m_hA = m_Parser.addOption("Name", "The clip's file name (default: from the prompt)", false, 1); break;
             case kind::layer_add:
@@ -311,6 +313,9 @@ namespace xanim_package_editor
             float                                       m_Time = 0.0f;
             bool                                        m_bPlaying = true;
             char                                        m_Prompt[1024] = "A person walks forward.";
+            bool                                        m_bVideo = false;       // E42: the source is a video (xmocap) instead of text
+            char                                        m_Video[512] = "";
+            float                                       m_VideoStart = 0.0f;
             char                                        m_Name[128] = "";
             float                                       m_Seconds = 5.0f;
             int                                         m_Seed = 1;
@@ -408,7 +413,7 @@ namespace xanim_package_editor
             , m_SetSpeed  (m_Undo, *this, playback_cmd::kind::set_speed,   "SetSpeed",   "Sets the playback speed step (0 = 0.25x, 3 = 1x, 7 = 3x). Usage: SetSpeed -Index step")
             , m_Info      (m_Undo, *this, playback_cmd::kind::info,        "PlaybackInfo","The selected clip, the time and whether it plays. Usage: PlaybackInfo")
             , m_ListClips (m_Undo, *this, playback_cmd::kind::list_clips,  "ListClips",  "Every clip with its options and whether it is compiled. Usage: ListClips")
-            , m_KimodoGenerate(m_Undo, *this, playback_cmd::kind::kimodo_generate, "KimodoGenerate", "Generates a motion from text with Kimodo; it previews until KimodoAccept or KimodoDiscard. Usage: KimodoGenerate -Prompt \"A person jumps.\" [-Seconds 5] [-Seed 1]")
+            , m_KimodoGenerate(m_Undo, *this, playback_cmd::kind::kimodo_generate, "KimodoGenerate", "Generates a motion from text with Kimodo, or captures a video's main person (-Video, xmocap); it previews until KimodoAccept or KimodoDiscard. Usage: KimodoGenerate -Prompt \"A person jumps.\" [-Seconds 5] [-Seed 1] | KimodoGenerate -Video clip.mp4 [-Start 0] [-Seconds 5]")
             , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName]")
             , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved). Usage: KimodoDiscard")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
@@ -2142,6 +2147,30 @@ namespace xanim_package_editor
             m_K.m_PromptUsed = Prompt; m_K.m_SecondsUsed = Seconds; m_K.m_SeedUsed = Seed;
             m_K.m_Status = "generating..."; m_K.m_bStatusError = false;
             return "KimodoGenerate: started";
+        }
+
+        // E42 gate E: a video's main person as the take - xmocap capture (decode, detect + track, keypoints, body features, motion) as the
+        // same kind of job, writing the same SOMA77 BVH Kimodo writes; the preview, the retarget and Accept are Kimodo's. Models: XMOCAP_MODELS
+        std::string KimodoCapture(const std::string& Video, float Start, float Seconds) noexcept
+        {
+            if (auto* pWhy = KimodoWhyNot()) return std::string("KimodoCapture: ") + pWhy;
+            if (m_K.m_Job.m_bRunning) return "KimodoCapture: a generation is already running";
+            const auto Exe = kimodo::FindMocapExe();
+            if (Exe.empty()) return "KimodoCapture: xmocap.exe not found (build dependencies/xmocap, or set XMOCAP_EXE)";
+            const std::wstring V = xstrtool::To(Video);
+            if (!std::filesystem::exists(V)) return "KimodoCapture: no such video: " + Video;
+            std::string Err;
+            if (!KimodoResolveSkeleton(Err)) return "KimodoCapture: " + Err;
+            Seconds = std::clamp(Seconds, 0.5f, 60.0f);
+            static int s_Count = 0;
+            std::filesystem::create_directories(m_Document.m_TempDir);
+            const auto Stem = std::format(L"{}\\xmocap_{}_{}", m_Document.m_TempDir, GetCurrentProcessId(), ++s_Count);
+            std::wstring Args = std::format(L"capture --video \"{}\" --start {} --duration {} --bvh \"{}.bvh\"", V, Start, Seconds, Stem);
+            if (const std::wstring M = xanimation::EnvW(L"XMOCAP_MODELS"); !M.empty()) Args += std::format(L" --models \"{}\"", M);    // (first: the job adds Kimodo's)
+            if (!m_K.m_Job.StartArgs(Exe, Args, Stem + L".bvh", Stem + L".log", Err)) return "KimodoCapture: " + Err;
+            m_K.m_PromptUsed = "Video " + std::filesystem::path(V).stem().string(); m_K.m_SecondsUsed = Seconds; m_K.m_SeedUsed = 0;
+            m_K.m_Status = "capturing the video..."; m_K.m_bStatusError = false;
+            return "KimodoCapture: started";
         }
 
         // Once a frame: a finished generation becomes the preview
@@ -5298,6 +5327,19 @@ namespace xanim_package_editor
 
             const bool bBusy = m_K.m_Job.m_bRunning;
             ImGui::BeginDisabled(bBusy);
+            if (ImGui::RadioButton("Text", !m_K.m_bVideo)) m_K.m_bVideo = false;
+            ImGui::SameLine(); if (ImGui::RadioButton("Video", m_K.m_bVideo)) m_K.m_bVideo = true;
+            if (ImGui::IsItemHovered()) xeditor::hint::Text("The motion of the main person in a video file (any format Windows plays), captured on this PC");
+            if (m_K.m_bVideo)
+            {
+                ImGui::SetNextItemWidth(-FLT_MIN); ImGui::InputTextWithHint("##video", "a video file: D:\\clips\\dance.mp4", m_K.m_Video, sizeof(m_K.m_Video));
+                ImGui::SetNextItemWidth(120.0f); ImGui::InputFloat("Start", &m_K.m_VideoStart, 0.5f, 5.0f, "%.1f s");
+                ImGui::SameLine(); ImGui::SetNextItemWidth(120.0f); ImGui::SliderFloat("Seconds", &m_K.m_Seconds, 1.0f, 60.0f, "%.1f");
+                if (ImGui::Button(m_K.m_bPreview ? "Capture again" : "Capture"))
+                    if (auto R = KimodoCapture(m_K.m_Video, std::max(0.0f, m_K.m_VideoStart), m_K.m_Seconds); R != "KimodoCapture: started") { m_K.m_Status = R; m_K.m_bStatusError = true; }
+            }
+            else
+            {
             ImGui::InputTextMultiline("##prompt", m_K.m_Prompt, sizeof(m_K.m_Prompt), ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 4));
             if (ImGui::IsItemHovered()) xeditor::hint::Text("What the motion is, in words: \"A person jumps over an obstacle.\"");
             ImGui::SetNextItemWidth(120.0f); ImGui::SliderFloat("Seconds", &m_K.m_Seconds, 1.0f, 20.0f, "%.1f");
@@ -5307,6 +5349,7 @@ namespace xanim_package_editor
             {
                 if (m_K.m_bPreview && m_K.m_Seed == m_K.m_SeedUsed && m_K.m_PromptUsed == m_K.m_Prompt) ++m_K.m_Seed;       // "again" with nothing changed: the next take
                 if (auto R = KimodoGenerate(m_K.m_Prompt, m_K.m_Seconds, m_K.m_Seed); R != "KimodoGenerate: started") { m_K.m_Status = R; m_K.m_bStatusError = true; }
+            }
             }
             ImGui::EndDisabled();
             if (bBusy)
@@ -5884,7 +5927,13 @@ namespace xanim_package_editor
         case kind::kimodo_generate:
         {
             std::string Prompt, Secs = "5", Seed = "1";
-            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Prompt)) return "KimodoGenerate: -Prompt is required";
+            if (std::string Video, Start = "0"; xeditor::cmd_util::GetArg(m_Parser, m_hF, Video))
+            {
+                xeditor::cmd_util::GetArg(m_Parser, m_hG, Start); xeditor::cmd_util::GetArg(m_Parser, m_hB, Secs);
+                float s0 = 0, sec = 5; std::from_chars(Start.data(), Start.data() + Start.size(), s0); std::from_chars(Secs.data(), Secs.data() + Secs.size(), sec);
+                return S.KimodoCapture(Video, s0, sec);
+            }
+            if (!xeditor::cmd_util::GetArg(m_Parser, m_hA, Prompt)) return "KimodoGenerate: -Prompt (or -Video) is required";
             xeditor::cmd_util::GetArg(m_Parser, m_hB, Secs); xeditor::cmd_util::GetArg(m_Parser, m_hC, Seed);
             float Seconds = 5.0f; int iSeed = 1;
             std::from_chars(Secs.data(), Secs.data() + Secs.size(), Seconds); std::from_chars(Seed.data(), Seed.data() + Seed.size(), iSeed);

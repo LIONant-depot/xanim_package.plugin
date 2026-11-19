@@ -154,6 +154,17 @@ namespace xanim_package_editor::kimodo
         return {};
     }
 
+    // E42 gate E: xmocap (a video -> a SOMA77 take, the same rig as Kimodo's): XMOCAP_EXE, else dependencies/xmocap/build/<gpu>/Release
+    inline std::wstring FindMocapExe() noexcept
+    {
+        if (std::wstring E = xanimation::EnvW(L"XMOCAP_EXE"); !E.empty()) return E;
+        wchar_t Buf[MAX_PATH]; GetModuleFileNameW(nullptr, Buf, MAX_PATH);
+        for (auto Dir = std::filesystem::path(Buf).parent_path(); !Dir.empty() && Dir != Dir.root_path(); Dir = Dir.parent_path())
+            for (const wchar_t* B : { L"cuda", L"vulkan", L"cpu" })
+                if (auto P = Dir / L"dependencies" / L"xmocap" / L"build" / B / L"Release" / L"xmocap.exe"; std::filesystem::exists(P)) return P.wstring();
+        return {};
+    }
+
     struct job
     {
         PROCESS_INFORMATION     m_PI{};
