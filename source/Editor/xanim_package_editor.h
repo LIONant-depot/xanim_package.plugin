@@ -16,6 +16,8 @@
 #include "plugins/xgeom_skin.plugin/source/Editor/xgeom_skin_editor_under.h"     // the skin under the bones (shared with the Ragdoll editor)
 #include "plugins/xgeom_skin.plugin/source/xgeom_skin_xgpu_runtime.h"
 #include "plugins/xanim_package.plugin/source/xanim_package.h"
+#include <commdlg.h>                                                    // (the video Browse... dialog)
+#pragma comment( lib, "comdlg32.lib" )
 #include "plugins/xanim_package.plugin/source/xanim_package_descriptor.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.h"
 #include "plugins/xanim_package.plugin/source/xanim_package_xgpu_rsc_loader.cpp"        // the resource loader: compiled once, in the host's translation unit
@@ -5358,7 +5360,17 @@ namespace xanim_package_editor
             if (ImGui::IsItemHovered()) xeditor::hint::Text("The motion of the main person in a video file (any format Windows plays), captured on this PC");
             if (m_K.m_bVideo)
             {
-                ImGui::SetNextItemWidth(-FLT_MIN); ImGui::InputTextWithHint("##video", "a video file: D:\\clips\\dance.mp4", m_K.m_Video, sizeof(m_K.m_Video));
+                if (ImGui::Button("Browse..."))         // (the system's open dialog: the same as the material graph's file parameters)
+                {
+                    wchar_t Buffer[MAX_PATH] = { 0 };
+                    OPENFILENAMEW Ofn = { 0 };
+                    Ofn.lStructSize = sizeof(Ofn);
+                    Ofn.lpstrFilter = L"Videos\0*.mp4;*.mov;*.m4v;*.avi;*.wmv;*.mkv\0All files\0*.*\0";
+                    Ofn.lpstrFile = Buffer; Ofn.nMaxFile = MAX_PATH;
+                    Ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+                    if (GetOpenFileNameW(&Ofn)) std::snprintf(m_K.m_Video, sizeof(m_K.m_Video), "%s", xstrtool::To(std::wstring(Buffer)).c_str());
+                }
+                ImGui::SameLine(); ImGui::SetNextItemWidth(-FLT_MIN); ImGui::InputTextWithHint("##video", "a video file: D:\\clips\\dance.mp4", m_K.m_Video, sizeof(m_K.m_Video));
                 ImGui::SetNextItemWidth(120.0f); ImGui::InputFloat("Start", &m_K.m_VideoStart, 0.5f, 5.0f, "%.1f s");
                 ImGui::SameLine(); ImGui::SetNextItemWidth(120.0f); ImGui::SliderFloat("Seconds", &m_K.m_Seconds, 1.0f, 60.0f, "%.1f");
                 if (ImGui::Button(m_K.m_bPreview ? "Capture again" : "Capture"))
