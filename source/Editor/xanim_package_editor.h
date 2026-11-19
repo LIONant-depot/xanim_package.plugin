@@ -90,7 +90,10 @@ namespace xanim_package_editor
                 m_hF = m_Parser.addOption("Video",   "A video file instead of a prompt: the motion of its main person (xmocap capture; -Start s, -Seconds s of it)", false, 1);
                 m_hG = m_Parser.addOption("Start",   "With -Video: where in the video the take starts, seconds (default 0)", false, 1);
                 break;
-            case kind::kimodo_accept: m_hA = m_Parser.addOption("Name", "The clip's file name (default: from the prompt)", false, 1); break;
+            case kind::kimodo_accept:
+                m_hA = m_Parser.addOption("Name",  "The clip's file name (default: from the prompt)", false, 1);
+                m_hB = m_Parser.addOption("Layer", "1: the take becomes a layer of the selected clip at the playhead (a Kimodo layer whose take it is; one undo step) instead of a clip of its own", false, 1);
+                break;
             case kind::layer_add:
                 m_hA = m_Parser.addOption("Source", "The import source's key (its path, as ListClips shows it); not for -Kind Pose", false, 1);
                 m_hB = m_Parser.addOption("Clip",   "The clip there (its original name); not for -Kind Pose", false, 1);
@@ -419,7 +422,7 @@ namespace xanim_package_editor
             , m_Info      (m_Undo, *this, playback_cmd::kind::info,        "PlaybackInfo","The selected clip, the time and whether it plays. Usage: PlaybackInfo")
             , m_ListClips (m_Undo, *this, playback_cmd::kind::list_clips,  "ListClips",  "Every clip with its options and whether it is compiled. Usage: ListClips")
             , m_KimodoGenerate(m_Undo, *this, playback_cmd::kind::kimodo_generate, "KimodoGenerate", "Generates a motion from text with Kimodo, or captures a video's main person (-Video, xmocap); it previews until KimodoAccept or KimodoDiscard. Usage: KimodoGenerate -Prompt \"A person jumps.\" [-Seconds 5] [-Seed 1] | KimodoGenerate -Video clip.mp4 [-Start 0] [-Seconds 5]")
-            , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName]")
+            , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName] [-Layer 1] (-Layer 1: a layer of the selected clip at the playhead instead of a clip)")
             , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved), or stops a generation or video capture still running (the Cancel button). Usage: KimodoDiscard")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
@@ -5298,6 +5301,56 @@ namespace xanim_package_editor
         }
 
         // The preview goes into the assets: the .bvh (+ .kimodo.txt) in the Kimodo folder, an import source entry, the descriptor saved and compiled
+        // E42 gate E: the previewed take (a video capture or a prompt's motion) as a LAYER of the selected clip at the playhead: saved as
+        // KimodoAccept saves it, a layer source (not a clip of its own), and a Kimodo layer whose accepted take it is - one undo step
+        std::string KimodoAcceptLayer(std::string Name) noexcept
+        {
+            auto* pDesc = Desc(); auto* pOv = SelectedOv();
+            if (!m_K.m_bPreview || !pDesc) return "KimodoAccept: nothing to accept (generate first)";
+            if (!pOv) return "KimodoAccept: -Layer 1 needs a selected clip (SelectClip)";
+            if (Name.empty()) Name = m_K.m_Name;
+            Name = SafeFileName(Name);
+            const std::wstring Folder = pDesc->m_Kimodo.m_Folder;
+            const auto Dir = ProjectPath() / Folder;
+            std::error_code Ec; std::filesystem::create_directories(Dir, Ec);
+            std::wstring File = xstrtool::To(Name) + L".bvh";
+            for (int i = 2; std::filesystem::exists(Dir / File); ++i) File = std::format(L"{}_{}.bvh", xstrtool::To(Name), i);
+            std::filesystem::copy_file(m_K.m_Job.m_Bvh, Dir / File, Ec);
+            if (Ec) return "KimodoAccept: could not write " + (Dir / File).string() + ": " + Ec.message();
+            {
+                std::ofstream Info(Dir / (std::filesystem::path(File).stem().wstring() + L".kimodo.txt"));
+                Info << "generator: " << (m_K.m_SeedUsed == 0 && m_K.m_PromptUsed.starts_with("Video ") ? "xmocap capture" : "NVIDIA Kimodo (Kimodo-SOMA-RP-v1.2) through xkimodo")
+                     << "\nprompt: " << m_K.m_PromptUsed << "\nseconds: " << m_K.m_SecondsUsed << "\nseed: " << m_K.m_SeedUsed << "\nfor: a layer of clip '" << pOv->m_Name << "'\n";
+            }
+            const auto Rel = Folder + L"\\" + File;
+            const auto Stem = xstrtool::To(std::filesystem::path(File).stem().wstring());
+            const double Sec = m_K.m_Preview.m_nFrames > 0 && m_K.m_Preview.m_FrameTime > 0 ? m_K.m_Preview.m_nFrames * m_K.m_Preview.m_FrameTime : m_K.m_SecondsUsed;
+            const auto T0 = std::int64_t(std::llround(std::max(0.0, double(m_TimeSeconds)) * 6000.0)), T1 = T0 + std::int64_t(std::llround(Sec * 6000.0));
+            const int n = int(pOv->m_Layers.size());
+            const auto Prompt = m_K.m_PromptUsed; const int Seed = m_K.m_SeedUsed;
+            const auto E = DirectOneStep(std::format("Accept '{}' as a layer", Stem), [&](desc& D) -> std::string
+            {
+                auto& S = D.m_ImportSources.emplace_back();
+                S.m_Kind = xanim_package_desc::import_kind::DIFFERENT_SKELETON_ASSET; S.m_Path = Rel; S.m_Retarget = D.m_Kimodo.m_Retarget;
+                auto& Cl = S.m_Clips.emplace_back(); Cl.m_OriginalName = "Motion"; Cl.m_Name = Stem; Cl.m_bDelete = true;       // a layer's source, not an output clip
+                auto& L = SelectedOv()->m_Layers.emplace_back();
+                L.m_Id = NextLayerId(D); L.m_Name = Stem; L.m_Kind = xanim_package_desc::layer_kind::KIMODO; L.m_Mode = xanim_package_desc::layer_mode::OVERRIDE;
+                L.m_Start = T0; L.m_End = T1; L.m_Prompt = Prompt; L.m_Seed = Seed; L.m_Seconds = float(Sec); L.m_Steps = 0;
+                L.m_bRotation = true; L.m_bPosition = true;
+                L.m_SourceKey = Rel; L.m_SourceClip = "Motion"; L.m_TrimIn = 0; L.m_TrimOut = -1; L.m_Rate = 1.0; L.m_bReverse = false;
+                L.m_AcceptedSig = KimodoReqSig(L);
+                return {};
+            });
+            if (!E.empty()) return "KimodoAccept: " + E;
+            m_iLayer = n;
+            (void)m_Undo.Query("Save");
+            (void)m_Undo.Query("Compile");
+            KimodoDiscard();
+            m_K.m_bStatusError = false;
+            m_K.m_Status = std::format("saved {} as layer {} '{}' of clip '{}', {:.2f} .. {:.2f} s; one undo step; the package is compiling", xstrtool::To(Rel), n, Stem, pOv->m_Name, T0 / 6000.0, T1 / 6000.0);
+            return "KimodoAccept: " + m_K.m_Status;
+        }
+
         std::string KimodoAccept(std::string Name) noexcept
         {
             auto* pDesc = Desc();
@@ -5430,6 +5483,10 @@ namespace xanim_package_editor
                 if (ImGui::IsItemHovered()) xeditor::hint::Text("The clip's file name in %s", xstrtool::To(Desc()->m_Kimodo.m_Folder).c_str());
                 if (ImGui::Button("Accept")) { m_K.m_Status = KimodoAccept(m_K.m_Name); }
                 if (ImGui::IsItemHovered()) xeditor::hint::Text("Saves it in the Kimodo folder, adds it to this package (Retarget: Kimodo/Retarget) and compiles");
+                ImGui::SameLine(); ImGui::BeginDisabled(!SelectedOv());
+                if (ImGui::Button("Accept as layer")) { m_K.m_Status = KimodoAcceptLayer(m_K.m_Name); }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text(SelectedOv() ? "A layer of the selected clip at the playhead whose take this is (one undo step)" : "Select a clip first");
                 ImGui::SameLine(); if (ImGui::Button("Discard")) { KimodoDiscard(); m_K.m_Status = "discarded"; m_K.m_bStatusError = false; }
             }
             if (!m_K.m_Status.empty())
@@ -6007,8 +6064,8 @@ namespace xanim_package_editor
         }
         case kind::kimodo_accept:
         {
-            std::string Name; xeditor::cmd_util::GetArg(m_Parser, m_hA, Name);
-            return S.KimodoAccept(Name);
+            std::string Name, Layer; xeditor::cmd_util::GetArg(m_Parser, m_hA, Name); xeditor::cmd_util::GetArg(m_Parser, m_hB, Layer);
+            return (Layer == "1" || Layer == "true") ? S.KimodoAcceptLayer(Name) : S.KimodoAccept(Name);
         }
         case kind::kimodo_discard: return S.KimodoDiscard() ? "KimodoDiscard: cancelled the running generation" : "KimodoDiscard: discarded";
         case kind::layer_add:
