@@ -316,6 +316,9 @@ namespace xanim_package_editor
             bool                                        m_bVideo = false;       // E42: the source is a video (xmocap) instead of text
             char                                        m_Video[512] = "";
             float                                       m_VideoStart = 0.0f;
+            std::wstring                                m_VideoFramesPath;      // the capture's small frames (xmocap --frames-rgba), shown beside the preview
+            std::vector<std::unique_ptr<xgpu::texture>> m_VideoTex;             // one per 30 fps frame
+            int                                         m_VideoW = 0, m_VideoH = 0;
             char                                        m_Name[128] = "";
             float                                       m_Seconds = 5.0f;
             int                                         m_Seed = 1;
@@ -2145,6 +2148,7 @@ namespace xanim_package_editor
             }
             else if (!m_K.m_Job.Start(Exe, m_Document.m_TempDir, Prompt, Seconds, Seed, Err)) return "KimodoGenerate: " + Err;
             m_K.m_PromptUsed = Prompt; m_K.m_SecondsUsed = Seconds; m_K.m_SeedUsed = Seed;
+            m_K.m_VideoFramesPath.clear(); m_K.m_VideoTex.clear();
             m_K.m_Status = "generating..."; m_K.m_bStatusError = false;
             return "KimodoGenerate: started";
         }
@@ -2165,12 +2169,33 @@ namespace xanim_package_editor
             static int s_Count = 0;
             std::filesystem::create_directories(m_Document.m_TempDir);
             const auto Stem = std::format(L"{}\\xmocap_{}_{}", m_Document.m_TempDir, GetCurrentProcessId(), ++s_Count);
-            std::wstring Args = std::format(L"capture --video \"{}\" --start {} --duration {} --bvh \"{}.bvh\"", V, Start, Seconds, Stem);
+            std::wstring Args = std::format(L"capture --video \"{}\" --start {} --duration {} --bvh \"{}.bvh\" --frames-rgba \"{}.frames\"", V, Start, Seconds, Stem, Stem);
+            m_K.m_VideoFramesPath = Stem + L".frames"; m_K.m_VideoTex.clear();
             if (const std::wstring M = xanimation::EnvW(L"XMOCAP_MODELS"); !M.empty()) Args += std::format(L" --models \"{}\"", M);    // (first: the job adds Kimodo's)
             if (!m_K.m_Job.StartArgs(Exe, Args, Stem + L".bvh", Stem + L".log", Err)) return "KimodoCapture: " + Err;
             m_K.m_PromptUsed = "Video " + std::filesystem::path(V).stem().string(); m_K.m_SecondsUsed = Seconds; m_K.m_SeedUsed = 0;
             m_K.m_Status = "capturing the video..."; m_K.m_bStatusError = false;
             return "KimodoCapture: started";
+        }
+
+        // a video capture's small frames into textures (one per 30 fps frame): the preview shows the video in sync beside the take
+        void KimodoLoadVideoFrames() noexcept
+        {
+            m_K.m_VideoTex.clear(); m_K.m_VideoW = m_K.m_VideoH = 0;
+            if (m_K.m_VideoFramesPath.empty() || !m_pDevice) return;
+            std::ifstream f(m_K.m_VideoFramesPath, std::ios::binary);
+            std::int32_t hdr[3] = {};
+            if (!f.read((char*)hdr, sizeof(hdr)) || hdr[0] <= 0 || hdr[1] <= 0 || hdr[2] <= 0 || hdr[2] > 100000) return;
+            std::vector<std::uint8_t> px(std::size_t(hdr[0]) * hdr[1] * 4);
+            for (int i = 0; i < hdr[2] && f.read((char*)px.data(), std::streamsize(px.size())); ++i)
+            {
+                xbitmap Bm; Bm.CreateBitmap(std::uint32_t(hdr[0]), std::uint32_t(hdr[1]));
+                std::memcpy(Bm.getMip<xcolori>(0).data(), px.data(), px.size());
+                auto T = std::make_unique<xgpu::texture>();
+                if (xgpu::tools::bitmap::Create(*T, *m_pDevice, Bm)) break;
+                m_K.m_VideoTex.push_back(std::move(T));
+            }
+            m_K.m_VideoW = hdr[0]; m_K.m_VideoH = hdr[1];
         }
 
         // Once a frame: a finished generation becomes the preview
@@ -2192,6 +2217,7 @@ namespace xanim_package_editor
             for (int v : m_K.m_BoneToJoint) Missing += v < 0;
             if (Missing) { m_K.m_bStatusError = true; m_K.m_Status = std::format("the SOMA skeleton has {} bones the generated motion does not (is the Retarget's Source Kimodo's skeleton?)", Missing); return; }
             m_K.m_Preview = std::move(B); m_K.m_bPreview = true; m_K.m_Time = 0.0f; m_K.m_bPlaying = true;
+            KimodoLoadVideoFrames();
             std::snprintf(m_K.m_Name, sizeof(m_K.m_Name), "%s", kimodo::NameFromPrompt(m_K.m_PromptUsed).c_str());
             m_K.m_RetargetError.clear();
             if (!KimodoRetargetPreview(m_K.m_RetargetError)) m_K.m_Baked.clear();
@@ -5313,7 +5339,7 @@ namespace xanim_package_editor
 
         void KimodoDiscard() noexcept
         {
-            m_K.m_bPreview = false; m_K.m_Preview = {};
+            m_K.m_bPreview = false; m_K.m_Preview = {}; m_K.m_VideoTex.clear();
             std::error_code Ec;
             if (!m_K.m_Job.m_Bvh.empty()) std::filesystem::remove(m_K.m_Job.m_Bvh, Ec);
         }
@@ -5361,6 +5387,13 @@ namespace xanim_package_editor
             if (m_K.m_bPreview)
             {
                 ImGui::Separator();
+                if (!m_K.m_VideoTex.empty())        // the source video in sync with the preview (its frame at the preview's time)
+                {
+                    const int i = std::clamp(int(m_K.m_Time * 30.0f), 0, int(m_K.m_VideoTex.size()) - 1);
+                    const float w = std::min(ImGui::GetContentRegionAvail().x, 320.0f);
+                    ImGui::Image((ImTextureRef)(void*)m_K.m_VideoTex[std::size_t(i)].get(), ImVec2(w, w * m_K.m_VideoH / std::max(1, m_K.m_VideoW)));
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text("The video, at the preview's time: compare the captured motion with it");
+                }
                 ImGui::TextWrapped("Previewing (not in the assets): \"%s\", %.1f s, seed %d", m_K.m_PromptUsed.c_str(), m_K.m_Preview.m_nFrames * m_K.m_Preview.m_FrameTime, m_K.m_SeedUsed);
                 if (m_K.m_Baked.empty())
                 {
@@ -6246,6 +6279,7 @@ namespace xanim_package_editor
                 Text += S.m_K.m_Baked.empty() ? std::format("preview on: Kimodo's skeleton ({})\n", S.m_K.m_RetargetError)
                                               : std::format("preview on: {}\n", S.m_K.m_bShowSource ? "Kimodo's skeleton (Show Kimodo's skeleton is on)" : "this package's skeleton (retargeted)");
             }
+            if (!S.m_K.m_VideoTex.empty()) Text += std::format("video frames shown beside the preview: {} ({}x{})\n", S.m_K.m_VideoTex.size(), S.m_K.m_VideoW, S.m_K.m_VideoH);
             Text += std::format("status: {}{}\n", S.m_K.m_bStatusError ? "ERROR " : "", S.m_K.m_Status);
             if (auto* pWhy = S.KimodoWhyNot()) Text += std::format("not ready: {}\n", pWhy);
             if (pDesc) Text += std::format("retarget: {:016X}  folder: {}\n", pDesc->m_Kimodo.m_Retarget.m_Instance.m_Value, xstrtool::To(pDesc->m_Kimodo.m_Folder));
