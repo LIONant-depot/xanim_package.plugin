@@ -420,7 +420,7 @@ namespace xanim_package_editor
             , m_ListClips (m_Undo, *this, playback_cmd::kind::list_clips,  "ListClips",  "Every clip with its options and whether it is compiled. Usage: ListClips")
             , m_KimodoGenerate(m_Undo, *this, playback_cmd::kind::kimodo_generate, "KimodoGenerate", "Generates a motion from text with Kimodo, or captures a video's main person (-Video, xmocap); it previews until KimodoAccept or KimodoDiscard. Usage: KimodoGenerate -Prompt \"A person jumps.\" [-Seconds 5] [-Seed 1] | KimodoGenerate -Video clip.mp4 [-Start 0] [-Seconds 5]")
             , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName]")
-            , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved). Usage: KimodoDiscard")
+            , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved), or stops a generation or video capture still running (the Cancel button). Usage: KimodoDiscard")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -2206,7 +2206,8 @@ namespace xanim_package_editor
             bool Ok = false; std::string Msg;
             if (!m_K.m_Job.Poll(Ok, Msg)) return;
             m_K.m_bStatusError = !Ok;
-            m_K.m_Status = Msg.empty() ? (Ok ? "done" : "xkimodo failed (no message)") : Msg;
+            if (!Ok && Msg.size() > 600) Msg = "..." + Msg.substr(Msg.size() - 600);     // (the end of the log says why)
+            m_K.m_Status = Msg.empty() ? (Ok ? "done" : "the generation failed (no message)") : Msg;
             if (!Ok) return;
             kimodo::bvh B; std::string Err;
             if (!B.Load(m_K.m_Job.m_Bvh, Err)) { m_K.m_bStatusError = true; m_K.m_Status = "the generated BVH could not be read: " + Err; return; }
@@ -5339,11 +5340,18 @@ namespace xanim_package_editor
             return "KimodoAccept: " + m_K.m_Status;
         }
 
-        void KimodoDiscard() noexcept
+        // drops the preview, and a generation or capture still running (E42 gate E: the console's way to Cancel); its temp files go too.
+        // true: a running job was stopped
+        bool KimodoDiscard() noexcept
         {
+            const bool bRunning = m_K.m_Job.m_bRunning;
+            m_K.m_Job.Cancel();
             m_K.m_bPreview = false; m_K.m_Preview = {}; m_K.m_VideoTex.clear();
             std::error_code Ec;
             if (!m_K.m_Job.m_Bvh.empty()) std::filesystem::remove(m_K.m_Job.m_Bvh, Ec);
+            if (!m_K.m_VideoFramesPath.empty()) std::filesystem::remove(m_K.m_VideoFramesPath, Ec);
+            if (bRunning) { m_K.m_Status = "cancelled"; m_K.m_bStatusError = false; }
+            return bRunning;
         }
 
         void RenderKimodo() noexcept
@@ -5393,7 +5401,7 @@ namespace xanim_package_editor
             if (bBusy)
             {
                 ImGui::SameLine(); ImGui::Text("generating... %.0f s", kimodo::job::Now() - m_K.m_Job.m_StartTime);
-                ImGui::SameLine(); if (ImGui::Button("Cancel")) { m_K.m_Job.Cancel(); m_K.m_Status = "cancelled"; }
+                ImGui::SameLine(); if (ImGui::Button("Cancel")) KimodoDiscard();
             }
 
             if (m_K.m_bPreview)
@@ -6002,7 +6010,7 @@ namespace xanim_package_editor
             std::string Name; xeditor::cmd_util::GetArg(m_Parser, m_hA, Name);
             return S.KimodoAccept(Name);
         }
-        case kind::kimodo_discard: S.KimodoDiscard(); return "KimodoDiscard: discarded";
+        case kind::kimodo_discard: return S.KimodoDiscard() ? "KimodoDiscard: cancelled the running generation" : "KimodoDiscard: discarded";
         case kind::layer_add:
         {
             std::string Src, Clip, Name, Kind;
