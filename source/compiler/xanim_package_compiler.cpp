@@ -544,13 +544,20 @@ namespace xanim_package_compiler
                                 // (moved back below the root: the root's child on the hips' chain. Moving the root itself left the root bone a
                                 // clip's travel away from the character - skin weighted to it stretched there: C70, the 'wrong-way shadow' wedge)
                                 const int iBack = Chain.size() >= 2 ? Chain[Chain.size() - 2] : iSkelRoot;
+                                // (2026-11-20: the hips' frame-0 offset from the root is taken out too - Kimodo Walk / Jog / Turn clips start with the hips
+                                // 0.24-1.37 m off the root, kept for the whole clip: the character turned about a point a metre from its body and every
+                                // match into those clips teleported the hips. Root motion stays the travel; the pose moves by travel + that offset.)
+                                const auto R0 = AllKeyFrames[KeyFrameBase + iSkelRoot].m_Position;
+                                const xmath::fvec3 Off0(H0.m_X - R0.m_X, 0, H0.m_Z - R0.m_Z);
+                                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the hips start {:.2f} units off the root (x {:.2f}, z {:.2f}): taken out of the pose", CompiledName, Off0.Length(), Off0.m_X, Off0.m_Z));
                                 for (int f = 0; f < OutFrames; ++f)
                                 {
                                     AllRootMotion[RootMotionBase + f] = Travel[f];
+                                    const auto Mv = Travel[f] + Off0;
                                     auto& K = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iBack];
-                                    if (iBack == iSkelRoot) { K.m_Position -= Travel[f]; continue; }
+                                    if (iBack == iSkelRoot) { K.m_Position -= Mv; continue; }
                                     const auto& R = AllKeyFrames[KeyFrameBase + static_cast<std::size_t>(f) * nSkelBones + iSkelRoot];
-                                    const auto L = R.m_Rotation.ConjugateCopy() * Travel[f];      // (into the root's frame; Chain ends at the root)
+                                    const auto L = R.m_Rotation.ConjugateCopy() * Mv;      // (into the root's frame; Chain ends at the root)
                                     K.m_Position -= xmath::fvec3(L.m_X / R.m_Scale.m_X, L.m_Y / R.m_Scale.m_Y, L.m_Z / R.m_Scale.m_Z);
                                 }
                                 Out.m_LoopDisplacement = Travel[OutFrames - 1];
