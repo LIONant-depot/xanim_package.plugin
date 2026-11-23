@@ -694,6 +694,10 @@ namespace xanim_package_compiler
                 const auto Rom = xanimation::LoopRangeOfMotionDeg(Keys, nSkelBones);
                 std::vector<float> Budget(static_cast<std::size_t>(nSkelBones));
                 for (int b = 0; b < nSkelBones; ++b) Budget[static_cast<std::size_t>(b)] = xanimation::LoopBudgetDeg(Roles[static_cast<std::size_t>(b)], Rom[static_cast<std::size_t>(b)]);
+                // experiment knobs (C127 phase 2, Fable's call before they become rules): the pelvis budget (fraction of the height) and the coupled
+                // solve's half window (seconds); defaults = the contract's 1 % and 0.105 s
+                static const float s_Pelvis = [] { const char* e = xanimation::Env("XLION_LOOP_PELVIS"); return e ? float(std::atof(e)) : 0.01f; }();
+                static const float s_SolveWin = [] { const char* e = xanimation::Env("XLION_LOOP_SOLVE_S"); return e ? float(std::atof(e)) : 0.105f; }();
                 std::vector<xmath::fvec3> RMv(static_cast<std::size_t>(OutFrames)); std::vector<float> RTv(static_cast<std::size_t>(OutFrames));
                 for (int f = 0; f < OutFrames; ++f) { RMv[static_cast<std::size_t>(f)] = RMf(f); RTv[static_cast<std::size_t>(f)] = RTf(f); }
                 // a clip without root motion passes no track (a walk in place is then read against its belt, N1)
@@ -756,17 +760,34 @@ namespace xanim_package_compiler
                         xanimation::loop_lock Lk;
                         for (int it = 0; it < 3; ++it) { xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips); Lk = xanimation::LockLoopFeet(SV, Rig, RestP, Src, Closed, nSkelBones, FinalFPS, Sp3(Rs), Sp1(Ts), Sp3(Rc), Sp1(Tc)); }
                         xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips);
-                        const auto E = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, Closed, nSkelBones, Budget);
-                        const bool bPelvis = E.m_HipsPos > 0.01f * Now.m_H;      // (the pelvis budget: 1 % of the body's height)
-                        const bool bReach = Lk.m_Miss > 0.001f * Now.m_H;        // (a leg that cannot reach its anchor: a failed candidate, never a stretched bone)
+                        auto E = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, Closed, nSkelBones, Budget);
+                        bool bPelvis = E.m_HipsPos > s_Pelvis * Now.m_H;      // (the pelvis budget: 1 % of the body's height)
+                        bool bReach = Lk.m_Miss > 0.001f * Now.m_H;        // (a leg that cannot reach its anchor: a failed candidate, never a stretched bone)
                         const bool bRoot = RootMove > 0.01f * Now.m_H || RootTurn > 0.035f;
                         const std::string Bone = E.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(E.m_Bone)].m_Name : std::string("-");
                         const float Base = E.m_Bone >= 0 ? xanimation::LoopEditBudgetDeg(Roles[static_cast<std::size_t>(E.m_Bone)]) : 0.0f, Range = E.m_Bone >= 0 ? Rom[static_cast<std::size_t>(E.m_Bone)] : 0.0f;
                         const std::string Edit = std::format("edit {:.1f} deg at '{}' (budget {:.1f} = max({:.0f}, 12 % of its {:.0f} deg range))", E.m_Deg, Bone, E.m_Budget, Base, Range);
-                        const auto G = (E.m_bOver || bPelvis || bReach || bRoot) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, Closed, Keys, nSkelBones, FinalFPS, Sp3(Rc), Sp1(Tc), Sp3(Rs), Sp1(Ts));
+                        auto G = (E.m_bOver || bPelvis || bReach || bRoot) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, Closed, Keys, nSkelBones, FinalFPS, Sp3(Rc), Sp1(Tc), Sp3(Rs), Sp1(Ts));
+                        // phase 2: when closure + lock fail, the coupled solve (contact and seam together, CoupledLoopSolve) on the same cut, judged by
+                        // the same gates; a solve that ends on one of its bounds is refused
+                        std::string Coupled;
+                        if ((E.m_bOver || bPelvis || bReach || !G.m_bPass) && !bRoot && !bIdle)
+                        {
+                            std::vector<xmath::transform3> C2(Src.begin(), Src.end());
+                            xanimation::CloseLoopSeam(C2, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips);
+                            const auto Sol = xanimation::CoupledLoopSolve(SV, Rig, RestP, Src, C2, nSkelBones, FinalFPS, Sp3(Rs), Sp1(Ts), Sp3(Rc), Sp1(Tc), 1.4f * s_Pelvis, s_SolveWin);
+                            const auto E2 = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, C2, nSkelBones, Budget);
+                            const bool bP2 = E2.m_HipsPos > s_Pelvis * Now.m_H;
+                            const auto G2 = (Sol.m_bBound || E2.m_bOver || bP2) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, C2, Keys, nSkelBones, FinalFPS, Sp3(Rc), Sp1(Tc), Sp3(Rs), Sp1(Ts));
+                            const std::string B2 = E2.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(E2.m_Bone)].m_Name : std::string("-");
+                            Coupled = std::format(" [coupled solve: {} iterations, contact {:.1f} mm, pelvis {:.1f} cm, edit {:.1f} deg at '{}' (budget {:.1f}): {}]", Sol.m_Iter, Sol.m_Contact * 1000.0f, Sol.m_Pelvis * 100.0f, E2.m_Deg, B2, E2.m_Budget
+                                , Sol.m_bBound ? "it ends on a bound" : E2.m_bOver ? "an edit past its budget" : bP2 ? "the pelvis past 1 % of the height" : G2.m_bPass ? "gates pass" : G2.m_pWhy);
+                            if (!Sol.m_bBound && !E2.m_bOver && !bP2 && G2.m_bPass) { Closed.swap(C2); E = E2; G = G2; bPelvis = false; bReach = false; }
+                        }
                         Why += std::format("{} {} {}..{} ({:.2f} s): {}", Why.empty() ? "" : ";", c == 0 ? "the whole range" : "cut", Cd.m_First, Cd.m_End, float(n) / FinalFPS
                             , E.m_bOver ? "an " + Edit + " past it" : bReach ? std::format("a planted foot cannot reach its anchor ({:.1f} mm short)", Lk.m_Miss * 1000.0f) : bRoot ? std::format("closing the root's path moves it {:.1f} cm / {:.1f} deg, past 1 % of the height / 2 deg", RootMove * 100.0f, RootTurn * 57.29578f) : bPelvis ? std::format("the pelvis moved {:.1f} cm, past 1 % of the height ({:.1f})", E.m_HipsPos * 100.0f, Now.m_H) : G.m_bPass ? Edit + ", gates pass"
                             : std::string(G.m_pWhy) + std::format(" (toe drift {:.1f} mm, skate {:.3f} -> {:.3f}, step change {:.2f} / own p99 {:.2f})", G.m_ToeDrift * 1000.0f, G.m_SkateBefore, G.m_SkateAfter, G.m_Acc, G.m_AccP99));
+                        Why += Coupled;
                         // the pick: the whole range when it passes; an in-place clip (an idle) then the LONGEST passing cut - its performance (breath,
                         // weight shifts) kept, a shorter one only when every longer one fails; a moving clip the least edited one
                         const float Rank = bIdle ? -float(n) : E.m_Deg / std::max(E.m_Budget, 1e-3f);
