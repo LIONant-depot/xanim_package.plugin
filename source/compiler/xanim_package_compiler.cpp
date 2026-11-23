@@ -767,8 +767,13 @@ namespace xanim_package_compiler
                         Why += std::format("{} {} {}..{} ({:.2f} s): {}", Why.empty() ? "" : ";", c == 0 ? "the whole range" : "cut", Cd.m_First, Cd.m_End, float(n) / FinalFPS
                             , E.m_bOver ? "an " + Edit + " past it" : bReach ? std::format("a planted foot cannot reach its anchor ({:.1f} mm short)", Lk.m_Miss * 1000.0f) : bRoot ? std::format("closing the root's path moves it {:.1f} cm / {:.1f} deg, past 1 % of the height / 2 deg", RootMove * 100.0f, RootTurn * 57.29578f) : bPelvis ? std::format("the pelvis moved {:.1f} cm, past 1 % of the height ({:.1f})", E.m_HipsPos * 100.0f, Now.m_H) : G.m_bPass ? Edit + ", gates pass"
                             : std::string(G.m_pWhy) + std::format(" (toe drift {:.1f} mm, skate {:.3f} -> {:.3f}, step change {:.2f} / own p99 {:.2f})", G.m_ToeDrift * 1000.0f, G.m_SkateBefore, G.m_SkateAfter, G.m_Acc, G.m_AccP99));
-                        if (E.m_bOver || bPelvis || bReach || bRoot || !G.m_bPass || E.m_Deg / std::max(E.m_Budget, 1e-3f) >= BestRatio) continue;
-                        BestRatio = E.m_Deg / std::max(E.m_Budget, 1e-3f); iBest = c; BestKeys.swap(Closed); BestRM.swap(Rc); BestRT.swap(Tc); BestEdit = E; BestGate = G;
+                        // the pick: the whole range when it passes; an in-place clip (an idle) then the LONGEST passing cut - its performance (breath,
+                        // weight shifts) kept, a shorter one only when every longer one fails; a moving clip the least edited one
+                        const float Rank = bIdle ? -float(n) : E.m_Deg / std::max(E.m_Budget, 1e-3f);
+                        // (an in-place cut shorter than half the clip is not taken: it would throw away most of the performance - Fable 2026-11-23)
+                        if (bIdle && 2 * n < OutFrames - 1) { Why += " (shorter than half the clip: not taken for an in-place clip)"; continue; }
+                        if (E.m_bOver || bPelvis || bReach || bRoot || !G.m_bPass || Rank >= BestRatio) continue;
+                        BestRatio = Rank; iBest = c; BestKeys.swap(Closed); BestRM.swap(Rc); BestRT.swap(Tc); BestEdit = E; BestGate = G;
                         if (c == 0) break;                                       // (the artist's range passes: it is kept)
                     }
                     if (iBest < 0) Row("REFUSED", Why.empty() ? std::string("no full support-to-support cycle") : Why);
