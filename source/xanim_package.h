@@ -30,7 +30,8 @@ namespace xanim_package
         std::int32_t        m_nFrames           {0};
         bool                m_bLoop             {false};
         root_motion_mode    m_RootMotionMode    {root_motion_mode::NONE};
-        xmath::fvec3        m_LoopDisplacement  {};     // = last frame's root-motion delta (zero if NONE)
+        xmath::fvec3        m_LoopDisplacement  {};     // a loop: the root's travel over one pass (where the next pass starts, in this pass's start frame); else the last frame's root motion (zero if NONE)
+        float               m_LoopTurn          {0};    // a loop: the root's turn over one pass (radians about +Y; the next pass starts turned by it); else 0 (C127)
 
         std::uint32_t       m_iFirstKeyFrame    {0};    // offset into anim_package::m_pKeyFrame; this clip's block is m_nFrames*anim_package::m_nBones entries, frame-major: [iFrame*m_nBones+iBone]
         std::uint32_t       m_iFirstRootMotion  {0};    // offset into anim_package::m_pRootMotion; only meaningful if m_RootMotionMode != NONE
@@ -61,7 +62,7 @@ namespace xanim_package
 
     struct anim_package
     {
-        inline static constexpr auto xserializer_version_v = 6;     // 2: events; 3: clip traits; 4: root turn; 5: compressed clips; 6: the raw keys in a sidecar
+        inline static constexpr auto xserializer_version_v = 7;     // 2: events; 3: clip traits; 4: root turn; 5: compressed clips; 6: the raw keys in a sidecar; 7: seamless loops (a loop's frames exclude the next pass's first; m_LoopTurn)
 
                                         anim_package    (void)                          noexcept = default;
         inline                         anim_package    (xserializer::stream& Stream)    noexcept;
@@ -291,6 +292,7 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Clip.m_LoopDisplacement.m_X))
             || (Err = Stream.Serialize(Clip.m_LoopDisplacement.m_Y))
             || (Err = Stream.Serialize(Clip.m_LoopDisplacement.m_Z))
+            || (Err = Stream.Serialize(Clip.m_LoopTurn))
             || (Err = Stream.Serialize(Clip.m_iFirstKeyFrame))
             || (Err = Stream.Serialize(Clip.m_iFirstRootMotion))
             || (Err = Stream.Serialize(Clip.m_iFirstEvent))
