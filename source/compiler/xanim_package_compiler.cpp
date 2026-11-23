@@ -244,6 +244,7 @@ namespace xanim_package_compiler
         // every raw clip's skeleton frames (the layers' sources and bases), made once per compile and written for the editor (LayerSources.bin)
         std::vector<xanim_package_layers::source_frames> m_SourceFrames;
         std::vector<float>                               m_RootTurn;
+        std::string                                      m_LoopReport;      // C127: one row per Loop clip (LoopReport.txt next to the log)
         std::vector<xmath::transform3>                   m_SidecarKeys;  // K5 step 2: the raw keys, written next to the package (<package>.keys)     // parallel to the package's root motion: the root's turn about +Y per frame (radians)
         const xanim_package_layers::source_frames* FindSourceFrames(const std::wstring& Key, const std::string& Clip) const
         {
@@ -702,11 +703,15 @@ namespace xanim_package_compiler
                 // and turn under D) no larger than one frame of the clip's own, the feet's plant equal
                 const bool bValidNow = Now.m_bValid && Now.m_PosError < 0.006f * Now.m_H && Now.m_VelError <= Now.m_VelInside && Now.m_AngVelError <= Now.m_AngVelInside
                                      && Now.m_RootVelError <= 0.1f * Now.m_H && Now.m_RootTurnError <= 0.35f && Now.m_bContacts;
+                auto Row = [&](const char* pVerdict, const std::string& What) { m_LoopReport += std::format("{}\t{}\t{}\t{:.1f}\t{:.0f}\t{}\n", CompiledName, pVerdict, OutFrames, Now.m_PosError * 1000.0f, Now.m_AngVelError, What); };
                 if (!Now.m_bValid)
+                {
                     LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': Loop: REFUSED - {}: it compiles as it is (its last frame taken as the next pass's first)", CompiledName, OutFrames < 3 ? "fewer than 3 frames" : "no legs to find its cycle by"));
+                    Row("REFUSED", OutFrames < 3 ? "fewer than 3 frames" : "no legs");
+                }
                 else if (bValidNow)
                 {
-                    Bake = 1;
+                    Bake = 1; Row("ALREADY VALID", std::format("frames 0..{} kept, the last dropped; root {:.3f} units/s, {:.0f} deg/s at the seam", OutFrames - 2, Now.m_RootVelError, Now.m_RootTurnError * 57.29578f));
                     LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': Loop: ALREADY VALID (seam {:.1f} mm, {:.0f} deg-per-s against its own {:.0f}, root {:.3f} units-per-s / {:.0f} deg-per-s): frames 0..{} (its last, the next pass's first, dropped)"
                         , CompiledName, Now.m_PosError * 1000.0f, Now.m_AngVelError, Now.m_AngVelInside, Now.m_RootVelError, Now.m_RootTurnError * 57.29578f, OutFrames - 2));
                 }
@@ -736,20 +741,28 @@ namespace xanim_package_compiler
                             Rc[static_cast<std::size_t>(f)] = xmath::fvec3(d.m_X * c0 + d.m_Z * s0, d.m_Y, -d.m_X * s0 + d.m_Z * c0); Tc[static_cast<std::size_t>(f)] = RTf(Cd.m_First + f) - T0;
                         }
                         if (bIdle) for (int f = 0; f <= n; ++f) { const float u = float(f) / float(n); Rc[static_cast<std::size_t>(f)] = Rc[static_cast<std::size_t>(f)] - Rc[static_cast<std::size_t>(n)] * u; Tc[static_cast<std::size_t>(f)] -= Tc[static_cast<std::size_t>(n)] * u; }
-                        auto E = xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, Budget, &SV, Rig.m_Hips);
+                        // closure and foot lock alternated on the stitched seam (the lock pulls each planted foot to one anchor from both sides;
+                        // the closure then ties the boundary again), ending on the closure: the seam's pose and velocity exact, the gates judge the rest
+                        const auto Rs = Rc; const auto Ts = Tc;
                         xanimation::CloseLoopTrack(Rc, Tc, FinalFPS);           // (the root's travel and turn steps closed under D too)
+                        xanimation::loop_lock Lk;
+                        for (int it = 0; it < 3; ++it) { xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips); Lk = xanimation::LockLoopFeet(SV, Rig, RestP, Src, Closed, nSkelBones, FinalFPS, Rs, Ts, Rc, Tc); }
+                        xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips);
+                        const auto E = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, Closed, nSkelBones, Budget);
                         const bool bPelvis = E.m_HipsPos > 0.01f * Now.m_H;      // (the pelvis budget: 1 % of the body's height)
+                        const bool bReach = Lk.m_Miss > 0.001f * Now.m_H;        // (a leg that cannot reach its anchor: a failed candidate, never a stretched bone)
                         const std::string Bone = E.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(E.m_Bone)].m_Name : std::string("-");
                         const float Base = E.m_Bone >= 0 ? xanimation::LoopEditBudgetDeg(Roles[static_cast<std::size_t>(E.m_Bone)]) : 0.0f, Range = E.m_Bone >= 0 ? Rom[static_cast<std::size_t>(E.m_Bone)] : 0.0f;
                         const std::string Edit = std::format("edit {:.1f} deg at '{}' (budget {:.1f} = max({:.0f}, 12 % of its {:.0f} deg range))", E.m_Deg, Bone, E.m_Budget, Base, Range);
-                        const auto G = (E.m_bOver || bPelvis) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, Closed, Keys, nSkelBones, FinalFPS, Rc, Tc);
+                        const auto G = (E.m_bOver || bPelvis || bReach) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, Closed, Keys, nSkelBones, FinalFPS, Rc, Tc);
                         Why += std::format("{} {} {}..{} ({:.2f} s): {}", Why.empty() ? "" : ";", c == 0 ? "the whole range" : "cut", Cd.m_First, Cd.m_End, float(n) / FinalFPS
-                            , E.m_bOver ? "an " + Edit + " past it" : bPelvis ? std::format("the pelvis moved {:.1f} cm, past 1 % of the height ({:.1f})", E.m_HipsPos * 100.0f, Now.m_H) : G.m_bPass ? Edit + ", gates pass"
+                            , E.m_bOver ? "an " + Edit + " past it" : bReach ? std::format("a planted foot cannot reach its anchor ({:.1f} mm short)", Lk.m_Miss * 1000.0f) : bPelvis ? std::format("the pelvis moved {:.1f} cm, past 1 % of the height ({:.1f})", E.m_HipsPos * 100.0f, Now.m_H) : G.m_bPass ? Edit + ", gates pass"
                             : std::string(G.m_pWhy) + std::format(" (toe drift {:.1f} mm, skate {:.3f} -> {:.3f}, step change {:.2f} / own p99 {:.2f})", G.m_ToeDrift * 1000.0f, G.m_SkateBefore, G.m_SkateAfter, G.m_Acc, G.m_AccP99));
-                        if (E.m_bOver || bPelvis || !G.m_bPass || E.m_Deg / std::max(E.m_Budget, 1e-3f) >= BestRatio) continue;
+                        if (E.m_bOver || bPelvis || bReach || !G.m_bPass || E.m_Deg / std::max(E.m_Budget, 1e-3f) >= BestRatio) continue;
                         BestRatio = E.m_Deg / std::max(E.m_Budget, 1e-3f); iBest = c; BestKeys.swap(Closed); BestRM.swap(Rc); BestRT.swap(Tc); BestEdit = E; BestGate = G;
                         if (c == 0) break;                                       // (the artist's range passes: it is kept)
                     }
+                    if (iBest < 0) Row("REFUSED", Why.empty() ? std::string("no full support-to-support cycle") : Why);
                     if (iBest < 0)
                         LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': Loop: REFUSED - seam {:.1f} mm / {:.0f} deg-per-s as cut, and no candidate passes:{} - it compiles as it is", CompiledName, Now.m_PosError * 1000.0f, Now.m_AngVelError, Why.empty() ? std::string(" no full support-to-support cycle (a stationary hold, or a foot that never lifts and replants)") : " " + Why));
                     else
@@ -763,6 +776,9 @@ namespace xanim_package_compiler
                         if (bRT) { m_RootTurn.resize(RB + static_cast<std::size_t>(n + 1)); std::copy(BestRT.begin(), BestRT.end(), m_RootTurn.begin() + static_cast<std::ptrdiff_t>(RB)); }
                         Out.m_LoopDisplacement = bRM ? BestRM.back() : xmath::fvec3::fromZero(); Out.m_LoopTurn = BestRT.back();
                         First = Cd.m_First;
+                        Row(bIdle ? "REPAIRED (in place)" : "REPAIRED", std::format("source frames {}..{} of {} -> {} frames, T {:.3f} s; D {:.3f} units, {:.1f} deg; left to close {:.1f} mm; edit {:.1f} deg at {} (budget {:.1f}); toe drift {:.1f} mm; skate {:.3f} -> {:.3f}"
+                            , OldStart + Cd.m_First, OldStart + Cd.m_End, OldFrames, n, float(n) / FinalFPS, std::sqrt(BestRM.back().m_X * BestRM.back().m_X + BestRM.back().m_Z * BestRM.back().m_Z), BestRT.back() * 57.29578f
+                            , Cd.m_PosError * 1000.0f, BestEdit.m_Deg, BestEdit.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(BestEdit.m_Bone)].m_Name : std::string("-"), BestEdit.m_Budget, BestGate.m_ToeDrift * 1000.0f, BestGate.m_SkateBefore, BestGate.m_SkateAfter));
                         StartFrame = OldStart + Cd.m_First; OutFrames = n + 1; Out.m_nFrames = OutFrames;
                         LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': Loop: REPAIRED{} - seam {:.1f} mm / {:.0f} deg-per-s as cut; the cycle: frames {}..{} of the clip's {} (now {} frames, T {:.2f} s), D: travel {:.3f}, turn {:.1f} deg; "
                             "left to close {:.1f} mm / {:.0f} deg-per-s; {}; toe drift {:.1f} mm, skate {:.3f} -> {:.3f}; candidates: {}"
@@ -1181,7 +1197,7 @@ namespace xanim_package_compiler
             std::vector<std::string>               Names;
             std::vector<xmath::transform3>          AllKeyFrames;
             std::vector<xmath::fvec3>               AllRootMotion;
-            m_RootTurn.clear();
+            m_RootTurn.clear(); m_LoopReport.clear();
             std::vector<xanim_package::event>       AllEvents;
 
             // every raw clip on this skeleton first (retargeted or folded): a clip's layers may take any other clip of the package as their source
@@ -1233,6 +1249,13 @@ namespace xanim_package_compiler
                 return xerr::create_f<state, "No clips survived import/ignore - nothing to compile">();
 
             if (auto Err = CheckClipNameCollisions(Clips, Names); Err) return Err;
+            // C127: the loop report (one row per clip marked Loop: clip, verdict, frames as cut, seam as cut mm / deg-per-s, what was done or why not)
+            if (!m_LoopReport.empty())
+            {
+                const std::string Txt = "clip\tverdict\tframes\tseam mm\tseam deg/s\twhat\n" + m_LoopReport;
+                if (std::FILE* f = xanimation::OpenW(std::format(L"{}\\LoopReport.txt", m_ResourceLogPath).c_str(), L"wb")) { std::fwrite(Txt.data(), 1, Txt.size(), f); std::fclose(f); }
+                else LogMessage(xresource_pipeline::msg_type::WARNING, "LoopReport.txt could not be written");
+            }
 
             m_FinalPackage.m_nClips = static_cast<std::uint16_t>(Clips.size());
             // zeroed, then field by field: the file's bytes follow from the content only (xserializer copies a struct's raw bytes before its
