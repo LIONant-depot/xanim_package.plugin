@@ -697,6 +697,7 @@ namespace xanim_package_compiler
                 // experiment knobs (C127 phase 2, Fable's call before they become rules): the pelvis budget (fraction of the height) and the coupled
                 // solve's half window (seconds); defaults = the contract's 1 % and 0.105 s
                 static const float s_Pelvis = [] { const char* e = xanimation::Env("XLION_LOOP_PELVIS"); return e ? float(std::atof(e)) : 0.01f; }();
+                static const float s_Win = [] { const char* e = xanimation::Env("XLION_LOOP_WINDOW"); return e ? float(std::atof(e)) : 0.3f; }();     // (the two-sided closure's window each side, s)
                 static const float s_SolveWin = [] { const char* e = xanimation::Env("XLION_LOOP_SOLVE_S"); return e ? float(std::atof(e)) : 0.105f; }();
                 std::vector<xmath::fvec3> RMv(static_cast<std::size_t>(OutFrames)); std::vector<float> RTv(static_cast<std::size_t>(OutFrames));
                 for (int f = 0; f < OutFrames; ++f) { RMv[static_cast<std::size_t>(f)] = RMf(f); RTv[static_cast<std::size_t>(f)] = RTf(f); }
@@ -726,76 +727,105 @@ namespace xanim_package_compiler
                 {
                     // the candidates: the artist's whole range first (kept when it passes: no silent shortening), then the found cycles
                     xanimation::loop_seam Whole = Now; Whole.m_First = 0; Whole.m_End = OutFrames - 1;
-                    auto Found = xanimation::FindLoopSeams(SV, Rig, RestP, Keys, nSkelBones, FinalFPS, false, 0.48f, 1.55f, RMs, RTs);
+                    auto Found = xanimation::FindLoopSeams(SV, Rig, RestP, Keys, nSkelBones, FinalFPS, false, 0.48f, 1.55f, RMs, RTs, 20);      // (20 diverse cuts, ranked by the repair's result)
                     const bool bIdle = Found.empty() && xanimation::FeetPlantedThroughout(SV, Rig, RestP, Keys, nSkelBones, FinalFPS, RMs, RTs);
                     if (bIdle) Found = xanimation::FindLoopSeams(SV, Rig, RestP, Keys, nSkelBones, FinalFPS, true, 1.0f, 1.55f, RMs, RTs);
                     std::vector<xanimation::loop_seam> Cands{ Whole };
                     for (const auto& c : Found) if (c.m_First != 0 || c.m_End != OutFrames - 1) Cands.push_back(c);
                     std::string Why; int iBest = -1; float BestRatio = 1e30f;
-                    std::vector<xmath::transform3> BestKeys; std::vector<xmath::fvec3> BestRM; std::vector<float> BestRT; xanimation::loop_edit BestEdit; xanimation::loop_gate BestGate;
+                    std::vector<xmath::transform3> BestKeys; std::vector<xmath::fvec3> BestRM; std::vector<float> BestRT; xanimation::loop_edit BestEdit; xanimation::loop_gate BestGate; bool BestMarginal = false; float BestWin = 0;
                     for (int c = 0; c < static_cast<int>(Cands.size()); ++c)
                     {
                         const auto& Cd = Cands[static_cast<std::size_t>(c)];
                         const int n = Cd.m_End - Cd.m_First;
                         const std::span<const xmath::transform3> Src(Keys.data() + static_cast<std::size_t>(Cd.m_First) * nSkelBones, static_cast<std::size_t>(n + 1) * nSkelBones);
-                        std::vector<xmath::transform3> Closed(Src.begin(), Src.end());
                         // the cycle's root motion from its first frame (in its frame); the idle path: D = I (the drift over the cycle taken out evenly)
-                        std::vector<xmath::fvec3> Rc(static_cast<std::size_t>(n + 1)); std::vector<float> Tc(static_cast<std::size_t>(n + 1));
+                        std::vector<xmath::fvec3> Rs(static_cast<std::size_t>(n + 1)); std::vector<float> Ts(static_cast<std::size_t>(n + 1));
                         const float T0 = RTf(Cd.m_First), c0 = std::cos(-T0), s0 = std::sin(-T0);
                         for (int f = 0; f <= n; ++f)
                         {
                             const auto d = RMf(Cd.m_First + f) - RMf(Cd.m_First);
-                            Rc[static_cast<std::size_t>(f)] = xmath::fvec3(d.m_X * c0 + d.m_Z * s0, d.m_Y, -d.m_X * s0 + d.m_Z * c0); Tc[static_cast<std::size_t>(f)] = RTf(Cd.m_First + f) - T0;
+                            Rs[static_cast<std::size_t>(f)] = xmath::fvec3(d.m_X * c0 + d.m_Z * s0, d.m_Y, -d.m_X * s0 + d.m_Z * c0); Ts[static_cast<std::size_t>(f)] = RTf(Cd.m_First + f) - T0;
                         }
-                        if (bIdle) for (int f = 0; f <= n; ++f) { const float u = float(f) / float(n); Rc[static_cast<std::size_t>(f)] = Rc[static_cast<std::size_t>(f)] - Rc[static_cast<std::size_t>(n)] * u; Tc[static_cast<std::size_t>(f)] -= Tc[static_cast<std::size_t>(n)] * u; }
-                        // closure and foot lock alternated on the stitched seam (the lock pulls each planted foot to one anchor from both sides;
-                        // the closure then ties the boundary again), ending on the closure: the seam's pose and velocity exact, the gates judge the rest
-                        const auto Rs = Rc; const auto Ts = Tc;
-                        xanimation::CloseLoopTrack(Rc, Tc, FinalFPS);           // (the root's travel and turn steps closed under D too)
-                        float RootMove = 0, RootTurn = 0;                       // (what that did to the root's path: budgeted like the pelvis, 1 % of the height / 2 deg)
-                        for (int f = 0; f <= n; ++f) { RootMove = std::max(RootMove, (Rc[static_cast<std::size_t>(f)] - Rs[static_cast<std::size_t>(f)]).Length()); RootTurn = std::max(RootTurn, std::fabs(Tc[static_cast<std::size_t>(f)] - Ts[static_cast<std::size_t>(f)])); }
+                        if (bIdle) for (int f = 0; f <= n; ++f) { const float u = float(f) / float(n); Rs[static_cast<std::size_t>(f)] = Rs[static_cast<std::size_t>(f)] - Rs[static_cast<std::size_t>(n)] * u; Ts[static_cast<std::size_t>(f)] -= Ts[static_cast<std::size_t>(n)] * u; }
                         const bool bTracks = bRM || bRT;
                         auto Sp3 = [&](const std::vector<xmath::fvec3>& v) { return bTracks ? std::span<const xmath::fvec3>(v) : std::span<const xmath::fvec3>{}; };
                         auto Sp1 = [&](const std::vector<float>& v) { return bTracks ? std::span<const float>(v) : std::span<const float>{}; };
-                        xanimation::loop_lock Lk;
-                        for (int it = 0; it < 3; ++it) { xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips); Lk = xanimation::LockLoopFeet(SV, Rig, RestP, Src, Closed, nSkelBones, FinalFPS, Sp3(Rs), Sp1(Ts), Sp3(Rc), Sp1(Tc)); }
-                        xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips);
-                        auto E = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, Closed, nSkelBones, Budget);
-                        bool bPelvis = E.m_HipsPos > s_Pelvis * Now.m_H;      // (the pelvis budget: 1 % of the body's height)
-                        bool bReach = Lk.m_Miss > 0.001f * Now.m_H;        // (a leg that cannot reach its anchor: a failed candidate, never a stretched bone)
-                        const bool bRoot = RootMove > 0.01f * Now.m_H || RootTurn > 0.035f;
-                        const std::string Bone = E.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(E.m_Bone)].m_Name : std::string("-");
-                        const float Base = E.m_Bone >= 0 ? xanimation::LoopEditBudgetDeg(Roles[static_cast<std::size_t>(E.m_Bone)]) : 0.0f, Range = E.m_Bone >= 0 ? Rom[static_cast<std::size_t>(E.m_Bone)] : 0.0f;
-                        const std::string Edit = std::format("edit {:.1f} deg at '{}' (budget {:.1f} = max({:.0f}, 12 % of its {:.0f} deg range))", E.m_Deg, Bone, E.m_Budget, Base, Range);
-                        auto G = (E.m_bOver || bPelvis || bReach || bRoot) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, Closed, Keys, nSkelBones, FinalFPS, Sp3(Rc), Sp1(Tc), Sp3(Rs), Sp1(Ts));
-                        // phase 2: when closure + lock fail, the coupled solve (contact and seam together, CoupledLoopSolve) on the same cut, judged by
-                        // the same gates; a solve that ends on one of its bounds is refused
-                        std::string Coupled;
-                        if ((E.m_bOver || bPelvis || bReach || !G.m_bPass) && !bRoot && !bIdle)
+                        // one repair of the cut with a closure window: closure (two-sided) and foot lock alternated, ending on the closure; when that
+                        // fails, the coupled solve (the best few cuts by seam score); judged by the edits and the gates
+                        struct attempt { std::vector<xmath::transform3> m_Keys; std::vector<xmath::fvec3> m_RM; std::vector<float> m_RT; xanimation::loop_edit m_E; xanimation::loop_gate m_G;
+                                         bool m_bPelvis = false, m_bReach = false, m_bRoot = false, m_bOk = false, m_bMarginal = false; float m_Win = 0, m_Ratio = 1e30f; std::string m_Why; };
+                        auto Try = [&](float Win)
                         {
-                            std::vector<xmath::transform3> C2(Src.begin(), Src.end());
-                            xanimation::CloseLoopSeam(C2, nSkelBones, FinalFPS, 0.15f, {}, &SV, Rig.m_Hips);
-                            const auto Sol = xanimation::CoupledLoopSolve(SV, Rig, RestP, Src, C2, nSkelBones, FinalFPS, Sp3(Rs), Sp1(Ts), Sp3(Rc), Sp1(Tc), 1.4f * s_Pelvis, s_SolveWin);
-                            const auto E2 = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, C2, nSkelBones, Budget);
-                            const bool bP2 = E2.m_HipsPos > s_Pelvis * Now.m_H;
-                            const auto G2 = (Sol.m_bBound || E2.m_bOver || bP2) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, C2, Keys, nSkelBones, FinalFPS, Sp3(Rc), Sp1(Tc), Sp3(Rs), Sp1(Ts));
-                            const std::string B2 = E2.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(E2.m_Bone)].m_Name : std::string("-");
-                            Coupled = std::format(" [coupled solve: {} iterations, contact {:.1f} mm, pelvis {:.1f} cm, edit {:.1f} deg at '{}' (budget {:.1f}): {}]", Sol.m_Iter, Sol.m_Contact * 1000.0f, Sol.m_Pelvis * 100.0f, E2.m_Deg, B2, E2.m_Budget
-                                , Sol.m_bBound ? "it ends on a bound" : E2.m_bOver ? "an edit past its budget" : bP2 ? "the pelvis past 1 % of the height" : G2.m_bPass ? "gates pass" : G2.m_pWhy);
-                            if (!Sol.m_bBound && !E2.m_bOver && !bP2 && G2.m_bPass) { Closed.swap(C2); E = E2; G = G2; bPelvis = false; bReach = false; }
+                            attempt A; A.m_Win = Win; A.m_Keys.assign(Src.begin(), Src.end()); A.m_RM = Rs; A.m_RT = Ts;
+                            xanimation::CloseLoopTrackTwoSided(A.m_RM, A.m_RT, FinalFPS, Win);
+                            float RootMove = 0, RootTurn = 0;
+                            for (int f = 0; f <= n; ++f) { RootMove = std::max(RootMove, (A.m_RM[static_cast<std::size_t>(f)] - Rs[static_cast<std::size_t>(f)]).Length()); RootTurn = std::max(RootTurn, std::fabs(A.m_RT[static_cast<std::size_t>(f)] - Ts[static_cast<std::size_t>(f)])); }
+                            xanimation::loop_lock Lk;
+                            static const int s_Lock = [] { const char* e = xanimation::Env("XLION_LOOP_LOCK"); return e ? std::atoi(e) : 1; }();      // (diagnosis: 0 = no foot lock)
+                            for (int it = 0; it < 3; ++it) { xanimation::CloseLoopSeamTwoSided(A.m_Keys, nSkelBones, FinalFPS, Win, {}, &SV, Rig.m_Hips); if (!s_Lock) break; Lk = xanimation::LockLoopFeet(SV, Rig, RestP, Src, A.m_Keys, nSkelBones, FinalFPS, Sp3(Rs), Sp1(Ts), Sp3(A.m_RM), Sp1(A.m_RT), Win); }
+                            xanimation::CloseLoopSeamTwoSided(A.m_Keys, nSkelBones, FinalFPS, Win, {}, &SV, Rig.m_Hips);
+                            A.m_E = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, A.m_Keys, nSkelBones, Budget);
+                            A.m_bPelvis = A.m_E.m_HipsPos > s_Pelvis * Now.m_H; A.m_bReach = Lk.m_Miss > 0.001f * Now.m_H; A.m_bRoot = RootMove > 0.01f * Now.m_H || RootTurn > 0.035f;
+                            // REPAIRED (MARGINAL): exactly one budget past by at most 20 % and everything else passing (Fable 2026-11-23)
+                            auto Marginal = [&](const xanimation::loop_edit& E) { return E.m_bOver && E.m_nOver == 1 && E.m_Deg <= 1.2f * E.m_Budget; };
+                            const bool bEditOk = !A.m_E.m_bOver || Marginal(A.m_E);
+                            A.m_G = (!bEditOk || A.m_bPelvis || A.m_bReach || A.m_bRoot) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, A.m_Keys, Keys, nSkelBones, FinalFPS, Sp3(A.m_RM), Sp1(A.m_RT), Sp3(Rs), Sp1(Ts), Win);
+                            std::string Coupled;
+                            if ((!bEditOk || A.m_E.m_bOver || A.m_bPelvis || A.m_bReach || !A.m_G.m_bPass) && !A.m_bRoot && !bIdle && c <= 3)
+                            {
+                                std::vector<xmath::transform3> C2(Src.begin(), Src.end());
+                                xanimation::CloseLoopSeamTwoSided(C2, nSkelBones, FinalFPS, Win, {}, &SV, Rig.m_Hips);
+                                for (std::size_t f = 0; f < C2.size() / static_cast<std::size_t>(nSkelBones); ++f)          // (the legs back to the source: the solve owns them)
+                                    for (const auto& Lg : Rig.m_Legs) for (int bb : { Lg.m_Thigh, Lg.m_Calf, Lg.m_Foot })
+                                        C2[f * nSkelBones + static_cast<std::size_t>(bb)].m_Rotation = Src[f * nSkelBones + static_cast<std::size_t>(bb)].m_Rotation;
+                                const auto Sol = xanimation::CoupledLoopSolve(SV, Rig, RestP, Src, C2, nSkelBones, FinalFPS, Sp3(Rs), Sp1(Ts), Sp3(A.m_RM), Sp1(A.m_RT), 1.4f * s_Pelvis, s_SolveWin);
+                                const auto E2 = xanimation::LoopEditAgainstSource(SV, Rig.m_Hips, Src, C2, nSkelBones, Budget);
+                                const bool bP2 = E2.m_HipsPos > s_Pelvis * Now.m_H, bE2 = !E2.m_bOver || Marginal(E2);
+                                const auto G2 = (Sol.m_bBound || !bE2 || bP2) ? xanimation::loop_gate{} : xanimation::GateLoop(SV, Rig, RestP, Src, C2, Keys, nSkelBones, FinalFPS, Sp3(A.m_RM), Sp1(A.m_RT), Sp3(Rs), Sp1(Ts), Win);
+                                const std::string B2 = E2.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(E2.m_Bone)].m_Name : std::string("-");
+                                Coupled = std::format(" [coupled solve: {} iterations, contact {:.1f} mm, pelvis {:.1f} cm, edit {:.1f} deg at '{}' (budget {:.1f}): {}]", Sol.m_Iter, Sol.m_Contact * 1000.0f, Sol.m_Pelvis * 100.0f, E2.m_Deg, B2, E2.m_Budget
+                                    , Sol.m_bBound ? "it ends on a bound" : !bE2 ? "an edit past its budget" : bP2 ? "the pelvis past 1 % of the height" : G2.m_bPass ? "gates pass" : G2.m_pWhy);
+                                const float R1 = A.m_E.m_Deg / std::max(A.m_E.m_Budget, 1e-3f), R2 = E2.m_Deg / std::max(E2.m_Budget, 1e-3f);
+                                const bool bFirstOk = bEditOk && !A.m_bPelvis && !A.m_bReach && A.m_G.m_bPass;
+                                if (!Sol.m_bBound && bE2 && !bP2 && G2.m_bPass && (!bFirstOk || R2 < R1)) { A.m_Keys.swap(C2); A.m_E = E2; A.m_G = G2; A.m_bPelvis = false; A.m_bReach = false; }
+                            }
+                            A.m_bMarginal = A.m_E.m_bOver;
+                            A.m_bOk = (!A.m_E.m_bOver || Marginal(A.m_E)) && !A.m_bPelvis && !A.m_bReach && !A.m_bRoot && A.m_G.m_bPass;
+                            A.m_Ratio = A.m_E.m_Deg / std::max(A.m_E.m_Budget, 1e-3f);
+                            const std::string Bone = A.m_E.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(A.m_E.m_Bone)].m_Name : std::string("-");
+                            const float Base = A.m_E.m_Bone >= 0 ? xanimation::LoopEditBudgetDeg(Roles[static_cast<std::size_t>(A.m_E.m_Bone)]) : 0.0f, Range = A.m_E.m_Bone >= 0 ? Rom[static_cast<std::size_t>(A.m_E.m_Bone)] : 0.0f;
+                            const std::string Edit = std::format("edit {:.1f} deg at '{}' (budget {:.1f} = max({:.0f}, 12 % of its {:.0f} deg range){})", A.m_E.m_Deg, Bone, A.m_E.m_Budget, Base, Range
+                                , A.m_E.m_bOver ? std::format(", {} bone(s) over, by {:.0f} %", A.m_E.m_nOver, 100.0f * (A.m_E.m_Deg / A.m_E.m_Budget - 1.0f)) : std::string());
+                            A.m_Why = std::format("window {:.2f} s: {}", Win
+                                , A.m_bOk ? Edit + (A.m_bMarginal ? ", MARGINAL" : "") + ", gates pass"
+                                : (A.m_E.m_bOver && !Marginal(A.m_E)) ? "an " + Edit + " past it" : A.m_bReach ? std::format("a planted foot cannot reach its anchor ({:.1f} mm short)", Lk.m_Miss * 1000.0f)
+                                : A.m_bRoot ? std::format("closing the root's path moves it {:.1f} cm / {:.1f} deg, past 1 % of the height / 2 deg", RootMove * 100.0f, RootTurn * 57.29578f)
+                                : A.m_bPelvis ? std::format("the pelvis moved {:.1f} cm, past 1 % of the height ({:.1f})", A.m_E.m_HipsPos * 100.0f, Now.m_H)
+                                : std::string(A.m_G.m_pWhy) + std::format(" (toe drift {:.1f} mm, slide +{:.1f} mm, peak skate {:.3f} -> {:.3f}, step change {:.2f} / own p99 {:.2f})", A.m_G.m_ToeDrift * 1000.0f, A.m_G.m_Slide * 1000.0f, A.m_G.m_SkateBefore, A.m_G.m_SkateAfter, A.m_G.m_Acc, A.m_G.m_AccP99))
+                                + std::format(" [lock pull {:.1f} mm]", Lk.m_Pull * 1000.0f) + Coupled;
+                            return A;
+                        };
+                        // the windows tried (each side of the seam), the best by final quality: a passing one first, then the smallest edit for its budget
+                        static const float s_WinKnob = [] { const char* e = xanimation::Env("XLION_LOOP_WINDOW"); return e ? float(std::atof(e)) : 0.0f; }();
+                        std::vector<float> Wins = s_WinKnob > 0 ? std::vector<float>{ s_WinKnob } : std::vector<float>{ 0.15f, 0.3f, 0.5f };
+                        attempt Best; bool bHave = false; std::string Tried;
+                        for (const float Win : Wins)
+                        {
+                            auto A = Try(Win);
+                            Tried += (Tried.empty() ? "" : " | ") + A.m_Why;
+                            if (!bHave || (A.m_bOk && !Best.m_bOk) || (A.m_bOk == Best.m_bOk && A.m_Ratio < Best.m_Ratio)) { Best = std::move(A); bHave = true; }
                         }
-                        Why += std::format("{} {} {}..{} ({:.2f} s): {}", Why.empty() ? "" : ";", c == 0 ? "the whole range" : "cut", Cd.m_First, Cd.m_End, float(n) / FinalFPS
-                            , E.m_bOver ? "an " + Edit + " past it" : bReach ? std::format("a planted foot cannot reach its anchor ({:.1f} mm short)", Lk.m_Miss * 1000.0f) : bRoot ? std::format("closing the root's path moves it {:.1f} cm / {:.1f} deg, past 1 % of the height / 2 deg", RootMove * 100.0f, RootTurn * 57.29578f) : bPelvis ? std::format("the pelvis moved {:.1f} cm, past 1 % of the height ({:.1f})", E.m_HipsPos * 100.0f, Now.m_H) : G.m_bPass ? Edit + ", gates pass"
-                            : std::string(G.m_pWhy) + std::format(" (toe drift {:.1f} mm, skate {:.3f} -> {:.3f}, step change {:.2f} / own p99 {:.2f})", G.m_ToeDrift * 1000.0f, G.m_SkateBefore, G.m_SkateAfter, G.m_Acc, G.m_AccP99));
-                        Why += Coupled;
+                        Why += std::format("{} {} {}..{} ({:.2f} s): {}", Why.empty() ? "" : ";", c == 0 ? "the whole range" : "cut", Cd.m_First, Cd.m_End, float(n) / FinalFPS, Tried);
                         // the pick: the whole range when it passes; an in-place clip (an idle) then the LONGEST passing cut - its performance (breath,
-                        // weight shifts) kept, a shorter one only when every longer one fails; a moving clip the least edited one
-                        const float Rank = bIdle ? -float(n) : E.m_Deg / std::max(E.m_Budget, 1e-3f);
+                        // weight shifts) kept, a shorter one only when every longer one fails; a moving clip the least edited one (a MARGINAL one only
+                        // when no cut passes cleanly)
+                        const float Rank = bIdle ? -float(n) : Best.m_Ratio;
                         // (an in-place cut shorter than half the clip is not taken: it would throw away most of the performance - Fable 2026-11-23)
                         if (bIdle && 2 * n < OutFrames - 1) { Why += " (shorter than half the clip: not taken for an in-place clip)"; continue; }
-                        if (E.m_bOver || bPelvis || bReach || bRoot || !G.m_bPass || Rank >= BestRatio) continue;
-                        BestRatio = Rank; iBest = c; BestKeys.swap(Closed); BestRM.swap(Rc); BestRT.swap(Tc); BestEdit = E; BestGate = G;
-                        if (c == 0) break;                                       // (the artist's range passes: it is kept)
+                        if (!Best.m_bOk || Rank >= BestRatio) continue;
+                        BestRatio = Rank; iBest = c; BestKeys.swap(Best.m_Keys); BestRM.swap(Best.m_RM); BestRT.swap(Best.m_RT); BestEdit = Best.m_E; BestGate = Best.m_G; BestMarginal = Best.m_bMarginal; BestWin = Best.m_Win;
+                        if (c == 0 && !Best.m_bMarginal) break;                  // (the artist's range passes: it is kept)
                     }
                     if (iBest < 0) Row("REFUSED", Why.empty() ? std::string("no full support-to-support cycle") : Why);
                     if (iBest < 0)
@@ -811,14 +841,14 @@ namespace xanim_package_compiler
                         if (bRT) { m_RootTurn.resize(RB + static_cast<std::size_t>(n + 1)); std::copy(BestRT.begin(), BestRT.end(), m_RootTurn.begin() + static_cast<std::ptrdiff_t>(RB)); }
                         Out.m_LoopDisplacement = bRM ? BestRM.back() : xmath::fvec3::fromZero(); Out.m_LoopTurn = BestRT.back();
                         First = Cd.m_First;
-                        Row(bIdle ? "REPAIRED (in place)" : "REPAIRED", std::format("source frames {}..{} of {} -> {} frames, T {:.3f} s; D {:.3f} units, {:.1f} deg; seam after {:.1f} mm; edit {:.1f} deg at {} (budget {:.1f}); toe drift {:.1f} mm; skate {:.3f} -> {:.3f}"
+                        Row(BestMarginal ? (bIdle ? "REPAIRED (MARGINAL, in place)" : "REPAIRED (MARGINAL)") : bIdle ? "REPAIRED (in place)" : "REPAIRED", std::format("source frames {}..{} of {} -> {} frames, T {:.3f} s; D {:.3f} units, {:.1f} deg; seam after {:.1f} mm; edit {:.1f} deg at {} (budget {:.1f}); toe drift {:.1f} mm; slide +{:.1f} mm; peak skate {:.3f} -> {:.3f}"
                             , OldStart + Cd.m_First, OldStart + Cd.m_End, OldFrames, n, float(n) / FinalFPS, std::sqrt(BestRM.back().m_X * BestRM.back().m_X + BestRM.back().m_Z * BestRM.back().m_Z), BestRT.back() * 57.29578f
                             , xanimation::MeasureLoopSeam(SV, Rig, RestP, BestKeys, nSkelBones, FinalFPS, bRM || bRT ? std::span<const xmath::fvec3>(BestRM) : std::span<const xmath::fvec3>{}, bRM || bRT ? std::span<const float>(BestRT) : std::span<const float>{}).m_PosError * 1000.0f
-                            , BestEdit.m_Deg, BestEdit.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(BestEdit.m_Bone)].m_Name : std::string("-"), BestEdit.m_Budget, BestGate.m_ToeDrift * 1000.0f, BestGate.m_SkateBefore, BestGate.m_SkateAfter));
+                            , BestEdit.m_Deg, BestEdit.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(BestEdit.m_Bone)].m_Name : std::string("-"), BestEdit.m_Budget, BestGate.m_ToeDrift * 1000.0f, BestGate.m_Slide * 1000.0f, BestGate.m_SkateBefore, BestGate.m_SkateAfter));
                         StartFrame = OldStart + Cd.m_First; OutFrames = n + 1; Out.m_nFrames = OutFrames;
-                        LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': Loop: REPAIRED{} - seam {:.1f} mm / {:.0f} deg-per-s as cut; the cycle: frames {}..{} of the clip's {} (now {} frames, T {:.2f} s), D: travel {:.3f}, turn {:.1f} deg; "
+                        LogMessage(BestMarginal ? xresource_pipeline::msg_type::WARNING : xresource_pipeline::msg_type::INFO, std::format("Clip '{}': Loop: REPAIRED{}{} - seam {:.1f} mm / {:.0f} deg-per-s as cut; the cycle: frames {}..{} of the clip's {} (now {} frames, T {:.2f} s), D: travel {:.3f}, turn {:.1f} deg; "
                             "left to close {:.1f} mm / {:.0f} deg-per-s; {}; toe drift {:.1f} mm, skate {:.3f} -> {:.3f}; candidates: {}"
-                            , CompiledName, bIdle ? " (in place, D = I)" : "", Now.m_PosError * 1000.0f, Now.m_AngVelError, OldStart + Cd.m_First, OldStart + Cd.m_End, OldFrames, n, float(n) / FinalFPS
+                            , CompiledName, BestMarginal ? std::format(" (MARGINAL: '{}' {:.1f} deg past its {:.1f} - an artist should look)", BestEdit.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(BestEdit.m_Bone)].m_Name : std::string("-"), BestEdit.m_Deg, BestEdit.m_Budget) : std::string(), bIdle ? " (in place, D = I)" : "", Now.m_PosError * 1000.0f, Now.m_AngVelError, OldStart + Cd.m_First, OldStart + Cd.m_End, OldFrames, n, float(n) / FinalFPS
                             , std::sqrt(Out.m_LoopDisplacement.m_X * Out.m_LoopDisplacement.m_X + Out.m_LoopDisplacement.m_Z * Out.m_LoopDisplacement.m_Z), Out.m_LoopTurn * 57.29578f
                             , Cd.m_PosError * 1000.0f, Cd.m_AngVelError, std::format("the largest edit {:.1f} deg at '{}' (budget {:.1f})", BestEdit.m_Deg, BestEdit.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(BestEdit.m_Bone)].m_Name : std::string("-"), BestEdit.m_Budget)
                             , BestGate.m_ToeDrift * 1000.0f, BestGate.m_SkateBefore, BestGate.m_SkateAfter, Why));
