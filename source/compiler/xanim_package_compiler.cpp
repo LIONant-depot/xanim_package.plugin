@@ -305,9 +305,9 @@ namespace xanim_package_compiler
 
             // Trim bounds are frame indices directly in the FINAL (post-resample) domain - no unit
             // conversion needed, just clamp into range.
-            const int StartFrame = (TrimStartFrame < 0) ? 0 : std::clamp(TrimStartFrame, 0, ResampledFrameCount - 1);
+            int StartFrame = (TrimStartFrame < 0) ? 0 : std::clamp(TrimStartFrame, 0, ResampledFrameCount - 1);
             const int EndFrame   = (TrimEndFrame   < 0) ? (ResampledFrameCount - 1) : std::clamp(TrimEndFrame, StartFrame, ResampledFrameCount - 1);
-            const int OutFrames  = EndFrame - StartFrame + 1;
+            int OutFrames  = EndFrame - StartFrame + 1;
 
             Out.m_NameHash        = xstrtool::CRC32(CompiledName);
             Out.m_FPS             = FinalFPS;
@@ -317,33 +317,6 @@ namespace xanim_package_compiler
             Out.m_iFirstKeyFrame  = static_cast<std::uint32_t>(AllKeyFrames.size());
             Out.m_iFirstRootMotion = static_cast<std::uint32_t>(AllRootMotion.size());
             Out.m_LoopDisplacement = xmath::fvec3::fromZero();
-
-            // the clip's events (T5): composition ticks (the source's time) -> the compiled clip's seconds; what the trim cuts is dropped, an
-            // interval is clipped to the clip; sorted by time (the runtime's crossing walk reads them in order)
-            if (pAllEvents && pOv)
-            {
-                Out.m_iFirstEvent = static_cast<std::uint32_t>(pAllEvents->size());
-                const double T0 = double(StartFrame) / FinalFPS, Len = double(OutFrames - 1) / FinalFPS;
-                std::vector<xanim_package::event> Ev;
-                for (const auto& E : pOv->m_Events)
-                {
-                    double A = double(E.m_Tick) / 6000.0 - T0, B = E.m_EndTick >= E.m_Tick ? double(E.m_EndTick) / 6000.0 - T0 : A;
-                    if (B < 0 || A > Len + 1e-6) { LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': event '{}' is outside the trimmed clip: dropped", CompiledName, E.m_Name)); continue; }
-                    A = std::clamp(A, 0.0, Len); B = std::clamp(B, A, Len);
-                    xanim_package::event R{};
-                    R.m_NameHash = xstrtool::CRC32(E.m_Name); R.m_Kind = E.m_Kind; R.m_Time = float(A); R.m_Duration = E.m_EndTick >= E.m_Tick ? float(B - A) : 0.0f;
-                    R.m_iBone = -1;
-                    if (!E.m_Bone.empty())
-                    {
-                        for (int s = 0; s < static_cast<int>(ResolvedBones.size()); ++s) if (ResolvedBones[s].m_Name == E.m_Bone) { R.m_iBone = static_cast<std::int16_t>(s); break; }
-                        if (R.m_iBone < 0) LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': event '{}' names bone '{}', which the skeleton does not have", CompiledName, E.m_Name, E.m_Bone));
-                    }
-                    Ev.push_back(R);
-                }
-                std::stable_sort(Ev.begin(), Ev.end(), [](const auto& a, const auto& b) { return a.m_Time < b.m_Time; });
-                Out.m_nEvents = static_cast<std::uint32_t>(Ev.size());
-                pAllEvents->insert(pAllEvents->end(), Ev.begin(), Ev.end());
-            }
 
             // Map each skeleton bone (by name) to its raw-clip bone slot, if any - a small, one-time,
             // compile-time lookup, not a runtime cost.
@@ -433,6 +406,84 @@ namespace xanim_package_compiler
                 ApplyToRoot("PostTransform", Manifest.m_PostTransformScale, Manifest.m_PostTransformRotationDeg, Manifest.m_PostTransformTranslation);
                 ApplyToRoot("PreTransform", Manifest.m_PreTransformScale, Manifest.m_PreTransformRotationDeg, Manifest.m_PreTransformTranslation);
             }
+            // C127 (Tomas 2026-11-23: a clip marked Loop loops cleanly by itself unless it already does; the loop-baking brief's phase 1): every
+            // Loop clip gets a verdict in this log. ALREADY VALID - its first and last frames match (pose, the velocity step no larger than its
+            // own, the feet's plant): its last frame is the next pass's first and is dropped. Else the best real recurrence (FindLoopSeam: a
+            // full same-side support cycle) is cut out with its end frame kept for now - the root's travel and turn there are one pass's
+            // (m_LoopDisplacement, m_LoopTurn) - and once the root motion is out of the pose the seam is closed (CloseLoopSeam, ~0.15 s) and
+            // that frame dropped: REPAIRED, or REFUSED when the closure would edit a bone past its budget (the clip then keeps its cut frames
+            // with the old wrap). No cycle at all: REFUSED, the clip compiles as it did.
+            int LoopBake = 0;                       // 0: as it was, 1: drop the last frame, 2: close the seam and drop it
+            std::vector<float> LoopBudget;          // per bone, degrees (xanimation::LoopEditBudgetDeg by body role)
+            std::vector<std::int32_t> LoopParents; int LoopHips = -1;      // (the closure closes the hips with the bones above them)
+            std::string LoopWhat;                   // the REPAIRED line's first half, finished after the closure
+            if (bLoop && OutFrames >= 3)
+            {
+                std::vector<std::string_view> Names(static_cast<std::size_t>(nSkelBones)); std::vector<std::int32_t> Par(static_cast<std::size_t>(nSkelBones)); xanimation::pose RestP; RestP.resize(nSkelBones);
+                for (int b = 0; b < nSkelBones; ++b)
+                {
+                    Names[b] = ResolvedBones[b].m_Name; Par[b] = ResolvedBones[b].m_iParent;
+                    RestP.m_Position[b] = ResolvedBones[b].m_RestPosition; RestP.m_Scale[b] = ResolvedBones[b].m_RestScale;
+                    RestP.m_Rotation[b] = xmath::fquat(ResolvedBones[b].m_RestRotX, ResolvedBones[b].m_RestRotY, ResolvedBones[b].m_RestRotZ, ResolvedBones[b].m_RestRotW).NormalizeSafeCopy();
+                }
+                const xanimation::skeleton_view SV{ Par };
+                const auto Roles = xanimation::BodyRoles(SV, Names, RestP);
+                const auto Rig = xanimation::FindWarpRig(SV, Roles);
+                LoopBudget.resize(static_cast<std::size_t>(nSkelBones)); LoopParents = Par; LoopHips = Rig.m_Hips;
+                for (int b = 0; b < nSkelBones; ++b) LoopBudget[static_cast<std::size_t>(b)] = xanimation::LoopEditBudgetDeg(Roles[static_cast<std::size_t>(b)]);
+                const std::span<const xmath::transform3> Keys(AllKeyFrames.data() + KeyFrameBase, static_cast<std::size_t>(OutFrames) * nSkelBones);
+                const auto Now = xanimation::MeasureLoopSeam(SV, Rig, RestP, Keys, nSkelBones, FinalFPS);
+                if (!Now.m_bValid)
+                    LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': Loop: REFUSED - no legs to find its cycle by: it compiles as it is (its last frame taken as the next pass's first)", CompiledName));
+                else if (Now.m_PosError < 0.01f && Now.m_VelError <= Now.m_VelInside && Now.m_AngVelError <= Now.m_AngVelInside && Now.m_bContacts)
+                {
+                    LoopBake = 1;
+                    LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': Loop: ALREADY VALID (seam {:.1f} mm, {:.0f} deg-per-s against its own {:.0f}): its last frame is the next pass's first", CompiledName, Now.m_PosError * 1000.0f, Now.m_AngVelError, Now.m_AngVelInside));
+                }
+                else if (const auto Seam = xanimation::FindLoopSeam(SV, Rig, RestP, Keys, nSkelBones, FinalFPS); Seam.m_bValid)
+                {
+                    LoopBake = 2;
+                    if (Seam.m_First > 0 || Seam.m_End < OutFrames - 1)
+                    {
+                        AllKeyFrames.erase(AllKeyFrames.begin() + static_cast<std::ptrdiff_t>(KeyFrameBase + static_cast<std::size_t>(Seam.m_End + 1) * nSkelBones), AllKeyFrames.end());
+                        AllKeyFrames.erase(AllKeyFrames.begin() + static_cast<std::ptrdiff_t>(KeyFrameBase), AllKeyFrames.begin() + static_cast<std::ptrdiff_t>(KeyFrameBase + static_cast<std::size_t>(Seam.m_First) * nSkelBones));
+                        StartFrame += Seam.m_First; OutFrames = Seam.m_End - Seam.m_First + 1; Out.m_nFrames = OutFrames;
+                    }
+                    LoopWhat = std::format("Clip '{}': Loop: REPAIRED - seam {:.1f} mm / {:.0f} deg-per-s as cut; the cycle frames {}..{} ({:.2f} s, closed on leg {}'s support) left {:.1f} mm / {:.0f} deg-per-s to close"
+                        , CompiledName, Now.m_PosError * 1000.0f, Now.m_AngVelError, Seam.m_First, Seam.m_End, float(Seam.m_End - Seam.m_First) / FinalFPS
+                        , Seam.m_Foot, Seam.m_PosError * 1000.0f, Seam.m_AngVelError);
+                }
+                else
+                    LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': Loop: REFUSED - no full support-to-support cycle of 0.48-1.55 s (a stationary hold, or a foot that never lifts and replants; seam as it is {:.1f} mm / {:.0f} deg-per-s): it compiles as it is", CompiledName, Now.m_PosError * 1000.0f, Now.m_AngVelError));
+            }
+
+            // the clip's events (T5): composition ticks (the source's time) -> the compiled clip's seconds; what the trim cuts is dropped, an
+            // interval is clipped to the clip; sorted by time (the runtime's crossing walk reads them in order)
+            if (pAllEvents && pOv)
+            {
+                Out.m_iFirstEvent = static_cast<std::uint32_t>(pAllEvents->size());
+                const double T0 = double(StartFrame) / FinalFPS, Len = double(OutFrames - 1) / FinalFPS;
+                std::vector<xanim_package::event> Ev;
+                for (const auto& E : pOv->m_Events)
+                {
+                    double A = double(E.m_Tick) / 6000.0 - T0, B = E.m_EndTick >= E.m_Tick ? double(E.m_EndTick) / 6000.0 - T0 : A;
+                    if (B < 0 || A > Len + 1e-6) { LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': event '{}' is outside the trimmed clip: dropped", CompiledName, E.m_Name)); continue; }
+                    A = std::clamp(A, 0.0, Len); B = std::clamp(B, A, Len);
+                    xanim_package::event R{};
+                    R.m_NameHash = xstrtool::CRC32(E.m_Name); R.m_Kind = E.m_Kind; R.m_Time = float(A); R.m_Duration = E.m_EndTick >= E.m_Tick ? float(B - A) : 0.0f;
+                    R.m_iBone = -1;
+                    if (!E.m_Bone.empty())
+                    {
+                        for (int s = 0; s < static_cast<int>(ResolvedBones.size()); ++s) if (ResolvedBones[s].m_Name == E.m_Bone) { R.m_iBone = static_cast<std::int16_t>(s); break; }
+                        if (R.m_iBone < 0) LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': event '{}' names bone '{}', which the skeleton does not have", CompiledName, E.m_Name, E.m_Bone));
+                    }
+                    Ev.push_back(R);
+                }
+                std::stable_sort(Ev.begin(), Ev.end(), [](const auto& a, const auto& b) { return a.m_Time < b.m_Time; });
+                Out.m_nEvents = static_cast<std::uint32_t>(Ev.size());
+                pAllEvents->insert(pAllEvents->end(), Ev.begin(), Ev.end());
+            }
+
             if (bHaveAnimatedRoot)
             {
                 // where the clip puts the root on its first frame, next to where the frozen pose has it: the two agree when the skeleton, its frozen pose and its animations are in the same space
@@ -627,10 +678,10 @@ namespace xanim_package_compiler
                             for (int k = a; k <= b; ++k) { const double y = Yaw[static_cast<std::size_t>(k)]; n += 1; sx += k; sy += y; sxx += double(k) * k; sxy += k * y; }
                             const double d = n * sxx - sx * sx, m = d > 1e-9 ? (n * sxy - sx * sy) / d : 0.0; return std::pair{ m, (sy - m * sx) / n }; };
                         const auto L0 = Line(0, std::min(N - 1, 2 * H)), L1 = Line(std::max(0, N - 1 - 2 * H), N - 1);
-                        // a loop goes round instead (frame N is frame 0 one pass on: the seam's pose twist then matches - a line there left the
+                        // a loop goes round instead (frame N-1 is frame 0 one pass on: the seam's pose twist then matches - a line there left the
                         // TurnLeft loop's hips 15-18 m/s off at every wrap)
                         auto At = [&](int k) {
-                            if (bLoop) { const int q = int(std::floor(double(k) / N)); return double(Yaw[static_cast<std::size_t>(k - q * N)]) + q * double(Yaw[static_cast<std::size_t>(N - 1)]); }
+                            if (bLoop && N > 1) { const int P = N - 1, q = int(std::floor(double(k) / P)); return double(Yaw[static_cast<std::size_t>(k - q * P)]) + q * double(Yaw[static_cast<std::size_t>(P)]); }      // (period N-1: the last frame is the next pass's first)
                             return k < 0 ? L0.first * k + L0.second : k >= N ? L1.first * k + L1.second : double(Yaw[static_cast<std::size_t>(k)]); };
                         std::vector<float> Sm(Yaw.size());
                         for (int f = 0; f < N; ++f) { double S = 0; for (int k = f - H; k <= f + H; ++k) S += At(k); Sm[static_cast<std::size_t>(f)] = float(S / double(2 * H + 1)); }
@@ -656,13 +707,39 @@ namespace xanim_package_compiler
                             K.m_Rotation = (Q * K.m_Rotation).NormalizeSafeCopy();
                             K.m_Position = Q * K.m_Position;
                         }
+                        if (bLoop) Out.m_LoopTurn = Yaw.back();          // (the turn at the next pass's first frame: one pass's turn)
                         LogMessage(xresource_pipeline::msg_type::INFO, std::format("Clip '{}': the root turn taken out of the pose: {:.1f} deg over the clip", CompiledName, Yaw.back() * 57.29578f));
                     }
                 }
             }
 
-            // Loop only flags the clip: the clip's frames are the source's, untouched. Wrapping from the last frame to the first is the player's job
-            // (a clip that does not end where it began is not made to: that would change every frame of it)
+            // C127: the seam closed in the pose (the root motion is out of it now), then the last frame - the next pass's first - dropped: the loop
+            // is frames 0..N-1 and the wrap N-1 -> 0 a real step (its travel and turn the pass's: m_LoopDisplacement, m_LoopTurn at that frame)
+            if (LoopBake == 2)
+            {
+                const std::span<xmath::transform3> Cyc(AllKeyFrames.data() + KeyFrameBase, static_cast<std::size_t>(OutFrames) * nSkelBones);
+                std::vector<xmath::transform3> Closed(Cyc.begin(), Cyc.end());
+                const xanimation::skeleton_view LSV{ LoopParents };
+                const auto E = xanimation::CloseLoopSeam(Closed, nSkelBones, FinalFPS, 0.15f, LoopBudget, &LSV, LoopHips);
+                const std::string Bone = E.m_Bone >= 0 ? ResolvedBones[static_cast<std::size_t>(E.m_Bone)].m_Name : std::string("-");
+                if (E.m_bOver)
+                {
+                    LoopBake = 0;
+                    LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': Loop: REFUSED - closing the seam edits '{}' by {:.1f} deg, past its {:.0f}: the cut frames stay as they are (its last frame taken as the next pass's first)", CompiledName, Bone, E.m_Deg, E.m_Budget));
+                }
+                else
+                {
+                    std::copy(Closed.begin(), Closed.end(), Cyc.begin());
+                    LogMessage(xresource_pipeline::msg_type::INFO, std::format("{}; closed over 0.15 s, the largest edit {:.1f} deg at '{}' (budget {:.0f})", LoopWhat, E.m_Deg, Bone, E.m_Budget));
+                }
+            }
+            if (LoopBake)
+            {
+                --OutFrames; Out.m_nFrames = OutFrames;
+                AllKeyFrames.resize(KeyFrameBase + static_cast<std::size_t>(OutFrames) * nSkelBones);
+                if (AllRootMotion.size() > Out.m_iFirstRootMotion) AllRootMotion.resize(Out.m_iFirstRootMotion + static_cast<std::size_t>(OutFrames));
+                if (m_RootTurn.size() > Out.m_iFirstRootMotion) m_RootTurn.resize(Out.m_iFirstRootMotion + static_cast<std::size_t>(OutFrames));
+            }
 
             return {};
         }
@@ -1110,7 +1187,7 @@ namespace xanim_package_compiler
             {
                 auto& D = m_FinalPackage.m_pClips[i]; const auto& S = Clips[i];
                 D.m_NameHash = S.m_NameHash; D.m_FPS = S.m_FPS; D.m_nFrames = S.m_nFrames; D.m_bLoop = S.m_bLoop; D.m_RootMotionMode = S.m_RootMotionMode;
-                D.m_LoopDisplacement.m_X = S.m_LoopDisplacement.m_X; D.m_LoopDisplacement.m_Y = S.m_LoopDisplacement.m_Y; D.m_LoopDisplacement.m_Z = S.m_LoopDisplacement.m_Z;
+                D.m_LoopDisplacement.m_X = S.m_LoopDisplacement.m_X; D.m_LoopDisplacement.m_Y = S.m_LoopDisplacement.m_Y; D.m_LoopDisplacement.m_Z = S.m_LoopDisplacement.m_Z; D.m_LoopTurn = S.m_LoopTurn;
                 D.m_iFirstKeyFrame = S.m_iFirstKeyFrame; D.m_iFirstRootMotion = S.m_iFirstRootMotion; D.m_iFirstEvent = S.m_iFirstEvent; D.m_nEvents = S.m_nEvents;
                 // what the clip does (soccer answer 4): measured on its final frames, with the travel its root motion took out
                 {
@@ -1195,7 +1272,7 @@ namespace xanim_package_compiler
                 auto F = [&](float v) { Mix(&v, sizeof(v)); };
                 std::uint64_t HClips, HKeys, HRoot;
                 H = 1469598103934665603ull;
-                for (const auto& C : Clips) { Mix(&C.m_NameHash, 4); Mix(&C.m_FPS, 4); Mix(&C.m_nFrames, 4); Mix(&C.m_bLoop, 1); Mix(&C.m_RootMotionMode, 1); F(C.m_LoopDisplacement.m_X); F(C.m_LoopDisplacement.m_Y); F(C.m_LoopDisplacement.m_Z); Mix(&C.m_iFirstKeyFrame, 4); Mix(&C.m_iFirstRootMotion, 4); }
+                for (const auto& C : Clips) { Mix(&C.m_NameHash, 4); Mix(&C.m_FPS, 4); Mix(&C.m_nFrames, 4); Mix(&C.m_bLoop, 1); Mix(&C.m_RootMotionMode, 1); F(C.m_LoopDisplacement.m_X); F(C.m_LoopDisplacement.m_Y); F(C.m_LoopDisplacement.m_Z); F(C.m_LoopTurn); Mix(&C.m_iFirstKeyFrame, 4); Mix(&C.m_iFirstRootMotion, 4); }
                 HClips = H; H = 1469598103934665603ull;
                 for (const auto& K : AllKeyFrames) { F(K.m_Scale.m_X); F(K.m_Scale.m_Y); F(K.m_Scale.m_Z); F(K.m_Rotation.m_X); F(K.m_Rotation.m_Y); F(K.m_Rotation.m_Z); F(K.m_Rotation.m_W); F(K.m_Position.m_X); F(K.m_Position.m_Y); F(K.m_Position.m_Z); }
                 HKeys = H; H = 1469598103934665603ull;
