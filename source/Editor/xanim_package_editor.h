@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -91,6 +91,11 @@ namespace xanim_package_editor
                 m_hF = m_Parser.addOption("Video",   "A video file instead of a prompt: the motion of its main person (xmocap capture; -Start s, -Seconds s of it)", false, 1);
                 m_hG = m_Parser.addOption("Start",   "With -Video: where in the video the take starts, seconds (default 0)", false, 1);
                 m_hH = m_Parser.addOption("Track",   "A file of rows \"t x z yaw\" (seconds, metres +Z ahead +X to the left, degrees +toward +X): the root follows this path AND faces this way, interpolated per frame - a pivot, a turn on the spot, a curve with its own facing (C132)", false, 1);
+                break;
+            case kind::kimodo_settings:
+                m_hA = m_Parser.addOption("Steps",    "Denoising steps (more: slower, can be cleaner; 0 = Kimodo's default)", false, 1);
+                m_hB = m_Parser.addOption("Guidance", "\"text constraint\": how strongly the take follows the prompt and the constraints (0 0 = Kimodo's default)", false, 1);
+                m_hC = m_Parser.addOption("NoPost",   "1: skip Kimodo's post-processing (foot clean-up); 0: keep it (default)", false, 1);
                 break;
             case kind::kimodo_accept:
                 m_hA = m_Parser.addOption("Name",  "The clip's file name (default: from the prompt)", false, 1);
@@ -285,7 +290,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -328,6 +333,11 @@ namespace xanim_package_editor
             int                                         m_VideoW = 0, m_VideoH = 0;
             char                                        m_Name[128] = "";
             float                                       m_Seconds = 5.0f;
+            int                                         m_Steps = 0;            // KimodoSettings (Advanced): 0 = Kimodo's default
+            float                                       m_CfgText = 0.0f, m_CfgConstraint = 0.0f;
+            bool                                        m_bNoPost = false;
+            void ApplySettings(void) { m_Job.m_Extra.clear(); if (m_Steps > 0) m_Job.m_Extra += std::format(L" --steps {}", m_Steps); if (m_CfgText > 0 || m_CfgConstraint > 0) m_Job.m_Extra += std::format(L" --cfg_text {:.3f} --cfg_constraint {:.3f}", m_CfgText, m_CfgConstraint); if (m_bNoPost) m_Job.m_Extra += L" --no-postprocess"; }
+            std::string SettingsText(void) const { return std::format("KimodoSettings: steps {}, guidance {:.2f} {:.2f}, post-processing {}", m_Steps > 0 ? std::to_string(m_Steps) : std::string("default"), m_CfgText, m_CfgConstraint, m_bNoPost ? "off" : "on"); }
             int                                         m_Seed = 1;
             std::string                                 m_PromptUsed;           // what the preview was made from
             float                                       m_SecondsUsed = 0.0f;
@@ -426,6 +436,7 @@ namespace xanim_package_editor
             , m_KimodoGenerate(m_Undo, *this, playback_cmd::kind::kimodo_generate, "KimodoGenerate", "Generates a motion from text with Kimodo, or captures a video's main person (-Video, xmocap); it previews until KimodoAccept or KimodoDiscard. Usage: KimodoGenerate -Prompt \"A person jumps.\" [-Seconds 5] [-Seed 1] | KimodoGenerate -Video clip.mp4 [-Start 0] [-Seconds 5]")
             , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName] [-Layer 1] (-Layer 1: a layer of the selected clip at the playhead instead of a clip)")
             , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved), or stops a generation or video capture still running (the Cancel button). Usage: KimodoDiscard")
+            , m_KimodoSettings(m_Undo, *this, playback_cmd::kind::kimodo_settings, "KimodoSettings", "Kimodo's advanced generation settings for every generation from this editor (not saved, not undo steps): denoising steps, guidance (text, constraint), post-processing. 0 = Kimodo's default. Usage: KimodoSettings [-Steps 50] [-Guidance \"2 2\"] [-NoPost 0|1] (no option: shows them)")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -5454,6 +5465,17 @@ namespace xanim_package_editor
             if (ImGui::IsItemHovered()) xeditor::hint::Text("What the motion is, in words: \"A person jumps over an obstacle.\"");
             ImGui::SetNextItemWidth(120.0f); ImGui::SliderFloat("Seconds", &m_K.m_Seconds, 1.0f, 20.0f, "%.1f");
             ImGui::SameLine(); ImGui::SetNextItemWidth(90.0f); ImGui::InputInt("Seed", &m_K.m_Seed);
+            if (ImGui::TreeNode("Advanced"))      // (UX language 0.5: advanced behind one explicit step; each change is the KimodoSettings command)
+            {
+                int Steps = m_K.m_Steps; float Cfg[2] = { m_K.m_CfgText, m_K.m_CfgConstraint }; bool NoPost = m_K.m_bNoPost;
+                ImGui::SetNextItemWidth(90.0f); if (ImGui::InputInt("Steps", &Steps)) xeditor::Run(m_Undo, std::format("KimodoSettings -Steps {}", std::clamp(Steps, 0, 1000)));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Denoising steps: more is slower and can be cleaner. 0 = Kimodo's default.");
+                ImGui::SetNextItemWidth(160.0f); if (ImGui::InputFloat2("Guidance (text, constraint)", Cfg, "%.2f")) xeditor::Run(m_Undo, std::format("KimodoSettings -Guidance \"{:.2f} {:.2f}\"", std::max(0.0f, Cfg[0]), std::max(0.0f, Cfg[1])));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How strongly the take follows the prompt and the constraints. 0 0 = Kimodo's default.");
+                if (ImGui::Checkbox("No post-processing", &NoPost)) xeditor::Run(m_Undo, std::format("KimodoSettings -NoPost {}", NoPost ? 1 : 0));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip Kimodo's foot clean-up (raw model output).");
+                ImGui::TreePop();
+            }
             if (ImGui::IsItemHovered()) xeditor::hint::Text("Another seed, another take of the same prompt");
             if (ImGui::Button(m_K.m_bPreview ? "Generate again" : "Generate"))
             {
@@ -6363,6 +6385,15 @@ namespace xanim_package_editor
             xeditor::cmd_util::GetArg(m_Parser, m_hA, T0); xeditor::cmd_util::GetArg(m_Parser, m_hB, T1); xeditor::cmd_util::GetArg(m_Parser, m_hC, T2);
             xeditor::cmd_util::GetArg(m_Parser, m_hD, T3); xeditor::cmd_util::GetArg(m_Parser, m_hE, T4);
             return S.TLInfo(T0, T1, T2, T3, T4);
+        }
+        case kind::kimodo_settings:
+        {
+            std::string V;
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hA, V)) { int n = 0; std::from_chars(V.data(), V.data() + V.size(), n); if (n < 0 || n > 1000) return "KimodoSettings: -Steps wants 0 (default) to 1000"; S.m_K.m_Steps = n; }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hB, V)) { float t = 0, c = 0; if (xanimation::Scan(V.c_str(), "%f %f", &t, &c) != 2 || t < 0 || c < 0) return "KimodoSettings: -Guidance wants \"text constraint\" (two numbers, 0 0 = default)"; S.m_K.m_CfgText = t; S.m_K.m_CfgConstraint = c; }
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hC, V)) S.m_K.m_bNoPost = V == "1";
+            S.m_K.ApplySettings();
+            return S.m_K.SettingsText();
         }
         case kind::kimodo_info:
         {

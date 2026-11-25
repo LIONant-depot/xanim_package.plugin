@@ -173,6 +173,7 @@ namespace xanim_package_editor::kimodo
         static double Now() noexcept { return double(GetTickCount64()) / 1000.0; }
         std::wstring            m_Bvh, m_Log;
 
+        std::wstring m_Extra;       // the user's generation settings as xkimodo flags (KimodoSettings), appended to every start
         bool Start(const std::wstring& Exe, const std::wstring& TempDir, const std::string& Prompt, float Seconds, int Seed, std::string& Error) noexcept
         {
             static int s_Count = 0;
@@ -184,7 +185,7 @@ namespace xanim_package_editor::kimodo
             std::wstring P = xstrtool::To(Prompt);
             for (auto& c : P) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
             std::wstring Cmd = std::format(L"\"{}\" gen --prompt \"{}\" --seconds {:.2f} --seed {} --bvh \"{}\"", Exe, P, Seconds, Seed, m_Bvh);
-            if (const std::wstring M = xanimation::EnvW(L"XKIMODO_MODELS"); !M.empty()) Cmd += std::format(L" --models \"{}\"", M);
+            if (const std::wstring M = xanimation::EnvW(L"XKIMODO_MODELS"); !M.empty()) Cmd += std::format(L" --models \"{}\"", M); Cmd += m_Extra;      // (KimodoSettings: --steps, --cfg_text/--cfg_constraint, --no-postprocess)
 
             SECURITY_ATTRIBUTES SA{ sizeof(SA), nullptr, TRUE };
             HANDLE hLog = CreateFileW(m_Log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &SA, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -203,7 +204,7 @@ namespace xanim_package_editor::kimodo
             m_Bvh = Bvh; m_Log = Log;
             std::error_code Ec; std::filesystem::remove(m_Bvh, Ec);
             std::wstring Cmd = std::format(L"\"{}\" {}", Exe, Args);
-            if (const std::wstring M = xanimation::EnvW(L"XKIMODO_MODELS"); !M.empty()) Cmd += std::format(L" --models \"{}\"", M);
+            if (const std::wstring M = xanimation::EnvW(L"XKIMODO_MODELS"); !M.empty()) Cmd += std::format(L" --models \"{}\"", M); Cmd += m_Extra;      // (KimodoSettings: --steps, --cfg_text/--cfg_constraint, --no-postprocess)
             SECURITY_ATTRIBUTES SA{ sizeof(SA), nullptr, TRUE };
             HANDLE hLog = CreateFileW(m_Log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &SA, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             STARTUPINFOW SI{ sizeof(SI) };
