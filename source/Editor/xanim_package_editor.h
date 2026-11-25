@@ -6,6 +6,7 @@
 // files are listed with their options (name, delete, loop, down sample, trim, root motion), edited in the table or through commands, all
 // undoable. A clip plays on the skeleton it is bound to, in a 3D view, with a transport bar and a timeline. Hosts include this header and open
 // editors through xeditor::open_resource_editors.
+#include <fstream>
 #include "source/Tools/Editor/xeditor_descriptor_editor.h"
 #include "source/Tools/Editor/xeditor_camera_toolbar.h"
 #include "source/Tools/Editor/xeditor_frame_recorder.h"      // Render video: the preview, frame by frame, to a video
@@ -89,6 +90,7 @@ namespace xanim_package_editor
                 m_hE = m_Parser.addOption("Goal",    "\"x z from to\": the root stays where it starts until 'from' seconds and is at (x, z) metres (+Z ahead, +X to the left) from 'to' on, facing ahead the whole take - a step or a stagger that ends where it must (recovery clips, R68)", false, 1);
                 m_hF = m_Parser.addOption("Video",   "A video file instead of a prompt: the motion of its main person (xmocap capture; -Start s, -Seconds s of it)", false, 1);
                 m_hG = m_Parser.addOption("Start",   "With -Video: where in the video the take starts, seconds (default 0)", false, 1);
+                m_hH = m_Parser.addOption("Track",   "A file of rows \"t x z yaw\" (seconds, metres +Z ahead +X to the left, degrees +toward +X): the root follows this path AND faces this way, interpolated per frame - a pivot, a turn on the spot, a curve with its own facing (C132)", false, 1);
                 break;
             case kind::kimodo_accept:
                 m_hA = m_Parser.addOption("Name",  "The clip's file name (default: from the prompt)", false, 1);
@@ -2118,7 +2120,7 @@ namespace xanim_package_editor
 
         // pVx (set): the root goes straight at (Vx, Vz) m/s facing ahead the whole take (Kimodo's root2d path + global heading on every
         // frame): a text-only "side-step" turned its body ~40 deg over 4 s (plan C72) - a strafe needs the path and the facing stated
-        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0, const float* pGoal = nullptr) noexcept
+        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0, const float* pGoal = nullptr, const std::vector<std::array<float, 4>>* pTrack = nullptr) noexcept
         {
             if (auto* pWhy = KimodoWhyNot()) return std::string("KimodoGenerate: ") + pWhy;
             if (m_K.m_Job.m_bRunning) return "KimodoGenerate: a generation is already running";
@@ -2127,7 +2129,7 @@ namespace xanim_package_editor
             std::string Err;
             if (!KimodoResolveSkeleton(Err)) return "KimodoGenerate: " + Err;
             Seconds = std::clamp(Seconds, 0.5f, 60.0f);
-            if (pVx || pGoal)
+            if (pVx || pGoal || (pTrack && !pTrack->empty()))
             {
                 static int s_Count = 0;
                 std::filesystem::create_directories(m_Document.m_TempDir);
@@ -2137,6 +2139,15 @@ namespace xanim_package_editor
                 for (int f = 0; f < N; ++f)
                 {
                     const float t = float(f) / 30.0f;
+                    if (pTrack && !pTrack->empty())       // (C132: path AND facing per frame, interpolated between the rows; past the ends: held)
+                    {
+                        const auto& Tk = *pTrack; std::size_t k = 0; while (k + 2 < Tk.size() && Tk[k + 1][0] <= t) ++k;
+                        const auto& A = Tk[k]; const auto& B = Tk[std::min(k + 1, Tk.size() - 1)];
+                        const float u = B[0] > A[0] ? std::clamp((t - A[0]) / (B[0] - A[0]), 0.0f, 1.0f) : 0.0f;
+                        const float Yaw = (A[3] + (B[3] - A[3]) * u) * 0.017453293f;
+                        Path.m_Frames.push_back(f); Path.m_Smooth.push_back({ A[1] + (B[1] - A[1]) * u, A[2] + (B[2] - A[2]) * u }); Path.m_Heading.push_back({ std::cos(Yaw), std::sin(Yaw) });
+                        continue;
+                    }
                     if (pGoal)          // (the goal: pinned at the start until from, at (x, z) from to; free in between - the motion decides the step)
                     {
                         if (t <= pGoal[2]) { Path.m_Frames.push_back(f); Path.m_Smooth.push_back({ 0.0f, 0.0f }); Path.m_Heading.push_back({ 1.0f, 0.0f }); }
@@ -6049,6 +6060,13 @@ namespace xanim_package_editor
             std::from_chars(Secs.data(), Secs.data() + Secs.size(), Seconds); std::from_chars(Seed.data(), Seed.data() + Seed.size(), iSeed);
             std::snprintf(S.m_K.m_Prompt, sizeof(S.m_K.m_Prompt), "%s", Prompt.c_str()); S.m_K.m_Seconds = Seconds; S.m_K.m_Seed = iSeed;
             std::string Path; float Vx = 0, Vz = 0; bool bPath = false;
+            if (std::string TrackFile; xeditor::cmd_util::GetArg(m_Parser, m_hH, TrackFile))
+            {
+                std::vector<std::array<float, 4>> Tk; std::ifstream In(TrackFile); std::array<float, 4> Row{};
+                while (In >> Row[0] >> Row[1] >> Row[2] >> Row[3]) Tk.push_back(Row);
+                if (Tk.empty()) return "KimodoGenerate: -Track wants a file of rows \"t x z yaw\": " + TrackFile;
+                return S.KimodoGenerate(Prompt, Seconds, iSeed, nullptr, 0, nullptr, &Tk);
+            }
             if (std::string Goal; xeditor::cmd_util::GetArg(m_Parser, m_hE, Goal))
             {
                 float G[4]{};
