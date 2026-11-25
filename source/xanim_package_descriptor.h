@@ -377,6 +377,7 @@ namespace xanim_package_desc
         std::string                       m_Name           = {};   // user-facing/compiled name - initialized to m_OriginalName when this entry is first created (see MergeWithDetails), freely renamable afterward; THIS gets CRC32'd into the compiled clip's name hash
         bool                              m_bDelete        = false;// excluded from the compiled output entirely - still visible in Details, so it can be re-enabled later
         bool                              m_bLoop          = false;
+        bool                              m_bMirrorable    = true;  // motion matching may also play it mirrored (the skeleton's mirror table: the other side for free); off for one-sided moves (a right-hand weapon swing)
         int                               m_DownsampleFPS  = 0;    // 0 = keep the imported rate (the importer always samples at 60fps) - lowering this (e.g. to 30) only ever trades quality for memory, never fixes anything; no upsampling, nothing to invent above the imported rate
         int                               m_TrimStartFrame = -1;   // frame index, in the FINAL (post-resample) domain; -1 = from the start
         int                               m_TrimEndFrame   = -1;   // frame index; -1 = to the end
@@ -390,6 +391,7 @@ namespace xanim_package_desc
         , obj_member<"Name",            &clip::m_Name >
         , obj_member<"Delete",          &clip::m_bDelete >
         , obj_member<"Loop",            &clip::m_bLoop >
+        , obj_member<"Mirrorable",      &clip::m_bMirrorable, member_help<"Motion matching may also play this clip mirrored (left and right swapped by the skeleton's mirror table), so one side covers both. Turn off for moves that must stay on one side">>
         , obj_member<"DownsampleFPS",   &clip::m_DownsampleFPS >
         , obj_member<"TrimStartFrame",  &clip::m_TrimStartFrame >
         , obj_member<"TrimEndFrame",    &clip::m_TrimEndFrame >

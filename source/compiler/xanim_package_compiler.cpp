@@ -429,6 +429,8 @@ namespace xanim_package_compiler
                     }
                     Ev.push_back(R);
                 }
+                if (!pOv->m_bMirrorable)      // (the clip's Mirrorable tick off: a "NoMirror" marker the runtime reads, as "NoMatch" - no format change)
+                { xanim_package::event R{}; R.m_NameHash = xstrtool::CRC32("NoMirror"); R.m_Kind = xanim_package::event_kind::MARKER; R.m_Time = 0; R.m_Duration = 0; R.m_iBone = -1; Ev.push_back(R); }
                 std::stable_sort(Ev.begin(), Ev.end(), [](const auto& a, const auto& b) { return a.m_Time < b.m_Time; });
                 Out.m_nEvents = static_cast<std::uint32_t>(Ev.size());
                 pAllEvents->insert(pAllEvents->end(), Ev.begin(), Ev.end());
