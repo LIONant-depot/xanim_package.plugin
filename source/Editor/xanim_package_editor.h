@@ -1517,6 +1517,34 @@ namespace xanim_package_editor
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The selected keys' interval to the next key: smooth (the layer's curve), linear or step (hold)");
             }
+            // Inbetweener: Regenerate between the two keys around the playhead, on the layer of the selected key (else the top Pose layer).
+            // The button runs the console command (AI and human drive the same action); candidates are listed, nothing is written until Accept.
+            {
+                auto* pOv = SelectedOv(); int iL = -1;
+                for (const auto& r : m_TLView.m_Selection) if (const auto It = m_TLRows.find(r.m_Row); It != m_TLRows.end() && It->second.m_iLayer >= 0) { iL = It->second.m_iLayer; break; }
+                if (pOv && iL < 0) for (int i = int(pOv->m_Layers.size()) - 1; i >= 0; --i) if (pOv->m_Layers[std::size_t(i)].m_Kind == xanim_package_desc::layer_kind::POSE) { iL = i; break; }
+                double A = -1, B = -1; const double T = m_TimeSeconds;
+                if (pOv && iL >= 0 && iL < int(pOv->m_Layers.size()))
+                    for (const auto& k : pOv->m_Layers[std::size_t(iL)].m_Keys)
+                    {
+                        const double t = double(k.m_Tick) / double(xanim_package_layers::ToTick(1.0));
+                        if (t <= T && t > A) A = t;
+                        if (t > T && (B < 0 || t < B)) B = t;
+                    }
+                const char* Why = iL < 0 ? "No Pose layer: add one (LayerAdd -Kind Pose) and key the two poses to keep" : (A < 0 || B < 0) ? "Put the playhead between two keys of the layer: the motion between them is regenerated" : (B - A < 0.2) ? "The two keys are closer than 0.2 s" : m_K.m_Job.m_bRunning ? "Kimodo is busy" : nullptr;
+                ImGui::SameLine(); ImGui::TextUnformatted("  ");
+                ImGui::SameLine(); ImGui::BeginDisabled(Why != nullptr);
+                if (ImGui::SmallButton("Regenerate between keys")) m_TLView.m_Reply = xeditor::Run(m_Undo, std::format("KimodoInbetween -Layer {} -From {:.4f} -To {:.4f} -Seeds \"1 2 3\"", iL, A, B));
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text(Why ? Why : "Kimodo regenerates the motion between the two keys around the playhead (both kept, nothing outside changes): three candidates, nothing written until you accept one. One undo step.");
+                for (int i = 0; i < int(m_IbCands.size()); ++i)
+                {
+                    if (m_IbCands[std::size_t(i)].m_After.empty()) continue;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(std::format("Accept {}##ib{}", i, i).c_str())) m_TLView.m_Reply = xeditor::Run(m_Undo, std::format("KimodoInbetweenAccept -Candidate {}", i));
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text(std::format("Writes candidate {} (seed {}): seams in {:.1f}, out {:.1f} deg/s per frame. One undo step.", i, m_IbCands[std::size_t(i)].m_Seed, m_IbCands[std::size_t(i)].m_SeamIn * 30.0f, m_IbCands[std::size_t(i)].m_SeamOut * 30.0f));
+                }
+            }
             tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height - ImGui::GetFrameHeightWithSpacing() });
             // C88 (3): the live edit scope on the timeline too - an amber band over the frames keying the preview would change
             if (const auto E = EditScope(); E.m_bOn)
