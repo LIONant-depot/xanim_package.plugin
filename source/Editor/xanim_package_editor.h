@@ -1610,6 +1610,18 @@ namespace xanim_package_editor
                     if (ImGui::IsItemHovered()) xeditor::hint::Text("%s", "Drops the candidates; the clip stays as it was");
                 }
                 if (!bStale) IbShow(Hover);      // (leaving the buttons puts the clip back)
+                if (auto* pSp = SelectedOv(); pSp && !pSp->m_SpaceWith.empty())      // (the motion-space slider: the selected loop blended with its SpaceWith loop - a preview, nothing written)
+                {
+                    ImGui::SameLine(); ImGui::TextUnformatted("  ");
+                    ImGui::SameLine(); bool bOn = m_SpaceW >= 0; if (ImGui::Checkbox("Space##sp", &bOn)) xeditor::Run(m_Undo, bOn ? "SpaceWeight -Weight 0.5" : "SpaceWeight -Weight -1");
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text("Preview the motion space: %s blended with %s (off: the clip as it is)", pSp->m_Name.c_str(), pSp->m_SpaceWith.c_str());
+                    if (m_SpaceW >= 0)
+                    {
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(120); float W = m_SpaceW;
+                        if (ImGui::SliderFloat("##spw", &W, 0.0f, 1.0f, "%.2f")) xeditor::Run(m_Undo, std::format("SpaceWeight -Weight {:.3f}", W));
+                        if (ImGui::IsItemHovered()) xeditor::hint::Text("0: %s, 1: %s - drag to see the blend at that weight", pSp->m_Name.c_str(), pSp->m_SpaceWith.c_str());
+                    }
+                }
             }
             tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height - ImGui::GetFrameHeightWithSpacing() });
             if (m_IbBand.first >= 0 && m_IbBand.second > m_IbBand.first)      // (Regenerate between keys: the span it works on, amber, as the edit scope)
@@ -6050,6 +6062,7 @@ namespace xanim_package_editor
             m_iSelectedDescriptorClip = iClip;
             auto* pPackage = Package();
             // A clip marked for delete, or edited since the last compile, has no compiled counterpart to play
+            m_SpaceW = -1; m_SpaceFrames.clear();      // (another clip: the motion-space preview is off)
             m_iSelectedClip = (pPackage && !Clips[iClip].m_bDelete) ? FindCompiledClip(*pPackage, Clips[iClip]) : -1;
             m_TimeSeconds   = 0.0f;
             m_LoopsElapsed  = 0;
