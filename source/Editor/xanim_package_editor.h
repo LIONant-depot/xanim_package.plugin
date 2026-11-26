@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, anchor_move, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, anchor_move, interaction_validate, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -82,6 +82,10 @@ namespace xanim_package_editor
             case kind::select_clip: m_hA = m_Parser.addOption("Source", "Import source index",       true, 1); m_hB = m_Parser.addOption("Clip", "Clip index in that source", true, 1); break;
             case kind::seek:        m_hA = m_Parser.addOption("Time",   "Seconds from the clip start", true, 1); break;
             case kind::set_speed:   m_hA = m_Parser.addOption("Index",  "Playback speed step (0.25x .. 3x)", true, 1); break;
+            case kind::interaction_validate:
+                m_hA = m_Parser.addOption("Prop", "The standing preview prop with the pivot", true, 1);
+                m_hB = m_Parser.addOption("From", "\"x z yaw\": the approach's start in the pivot's frame (as PrimitiveApproach -From)", true, 1);
+                break;
             case kind::anchor_move:
                 m_hA = m_Parser.addOption("Prop",   "The standing preview prop", true, 1);
                 m_hB = m_Parser.addOption("Anchor", "Its anchor's name", true, 1);
@@ -324,7 +328,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach, m_AnchorMove;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach, m_AnchorMove, m_InteractionValidate;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -476,6 +480,7 @@ namespace xanim_package_editor
             , m_KimodoInbetweenDiscard(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_discard, "KimodoInbetweenDiscard", "Drops the candidates of KimodoInbetween -Seeds; the clip stays as it was. Usage: KimodoInbetweenDiscard")
             , m_PrimitiveApproach(m_Undo, *this, playback_cmd::kind::primitive_approach, "PrimitiveApproach", "Smart Primitive: generates the approach into the selected clip's first frame from a start in the prop's interaction box (a Kimodo take, previewed; KimodoAccept keeps it). Usage: PrimitiveApproach -Prop Chair -From \"x z yaw\" [-Seconds s] [-Seed n] [-Prompt words]")
             , m_AnchorMove(m_Undo, *this, playback_cmd::kind::anchor_move, "AnchorMove", "Smart Primitive: moves a prop anchor in the prop's frame; every IK key bound to it (IkKey -Prop Chair/Seat) follows, in every clip. One undo step. Usage: AnchorMove -Prop Chair -Anchor Seat -Pos \"x y z\"")
+            , m_InteractionValidate(m_Undo, *this, playback_cmd::kind::interaction_validate, "InteractionValidate", "Smart Primitive gate: the approach on preview, placed at its start, against the selected clip across the join: alignment, continuity, the feet, clearance through the prop. Usage: InteractionValidate -Prop Chair -From \"x z yaw\"")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -2230,6 +2235,67 @@ namespace xanim_package_editor
         // prop's PIVOT frame. Generation space = the start placement (origin, facing +Z); the track goes straight to where the clip's first
         // frame stands (facing along the way, turning into its facing at the end) and that frame is a full-body constraint on the take's last
         // frame. ponytail: model space is taken as Kimodo's raw space / 100 (true for the Kimodo retargets here); a straight path.
+        // Smart Primitive v2 step 2, THE GATE: the Kimodo take on preview (an approach) placed at its start (-From, in the prop's pivot frame)
+        // against the selected clip (the interaction), measured on OUR skeleton across the join - never on the conditioning track. Each check
+        // says PASS/FAIL with the frame. Arrival Stop: the approach must arrive slow. ponytail: the prop is its box (or sphere/capsule bounds).
+        std::string InteractionValidate(const std::string& PropName, float Fx, float Fz, float FyawDeg) noexcept
+        {
+            auto* pDesc = Desc(); if (!pDesc) return "InteractionValidate: nothing loaded";
+            if (!m_K.m_bPreview || m_K.m_Preview.m_nFrames < 2) return "InteractionValidate: no approach on preview (PrimitiveApproach or KimodoGenerate first)";
+            const xanim_package_desc::preview_prop* pP = nullptr;
+            for (const auto& P : pDesc->m_PreviewProps) if (P.m_Name == PropName) pP = &P;
+            if (!pP || !pP->m_Bone.empty()) return std::format("InteractionValidate: no standing preview prop '{}'", PropName);
+            std::string Err; auto* pCtx = KimodoRetargetCtx(Err); if (!pCtx) return "InteractionValidate: " + Err;
+            if (!PoseRig(Err)) return "InteractionValidate: " + Err;
+            const std::vector<xmath::transform3>* pF = nullptr; int Fps = 30, n = 0;
+            if (!SuggestClipFrames(pF, Fps, n, Err) || n < 2) return "InteractionValidate: " + Err;
+            const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size());
+            // the approach on our skeleton at the start placement: FromKimodo with the start as Kimodo's frame (cm, raw space = model x 100)
+            kimodo_space KS; std::vector<kimodo::soma_pose> SP;
+            if (!ToKimodo(*pCtx, std::vector<xmath::transform3>(pF->begin(), pF->begin() + nB), 1, nB, KS, SP, Err)) return "InteractionValidate: " + Err;
+            const float Pyaw = pP->m_PivotYaw * 0.017453293f, cP = std::cos(Pyaw), sP = std::sin(Pyaw);
+            const float Px = pP->m_Offset.m_X + pP->m_PivotOffset.m_X, Pz = pP->m_Offset.m_Z + pP->m_PivotOffset.m_Z;
+            const float Sx = Px + cP * Fx + sP * Fz, Sz = Pz - sP * Fx + cP * Fz, Syaw = Pyaw + FyawDeg * 0.017453293f;
+            KS.m_Denorm = xanimation::details::AxisAngle(xmath::fvec3(0, 1, 0), Syaw); KS.m_Norm = KS.m_Denorm.ConjugateCopy(); KS.m_Origin = xmath::fvec3(Sx * 100.0f, 0, Sz * 100.0f);
+            const auto App = FromKimodo(*pCtx, m_K.m_Preview, KS, nB);
+            const int nA = m_K.m_Preview.m_nFrames;
+            // world positions per frame (our skeleton), the hips' heading
+            const auto& R = m_PT.m_Rig; xanimation::body_ik FK; FK.Setup(R.m_Par);
+            auto World = [&](const xmath::transform3* pT, std::vector<xmath::fvec3>& W, float* pHeading)
+            {
+                xanimation::pose Q; Q.resize(nB); for (int b = 0; b < nB; ++b) Q.set(b, pT[b]);
+                FK.ComputeWorld(Q); W.resize(nB); for (int b = 0; b < nB; ++b) W[b] = FK.WorldPosition(b);
+                if (pHeading) { kimodo_space K2; std::vector<kimodo::soma_pose> S2; std::string E2; std::vector<xmath::transform3> One(pT, pT + nB);
+                                if (ToKimodo(*pCtx, One, 1, nB, K2, S2, E2)) { const auto Fw = K2.m_Denorm * xmath::fvec3(0, 0, 1); *pHeading = std::atan2(Fw.m_X, Fw.m_Z); } }
+            };
+            const int iHips = R.Find("Hips"), iLF = R.Find("LeftFoot"), iRF = R.Find("RightFoot");
+            if (iHips < 0 || iLF < 0 || iRF < 0) return "InteractionValidate: the hips and feet were not recognized";
+            std::vector<xmath::fvec3> Ae, Ae1, Ie, Ie1; float Ha = 0, Hi = 0, Dummy = 0;
+            World(&App[std::size_t(nA - 1) * nB], Ae, &Ha); World(&App[std::size_t(nA - 2) * nB], Ae1, &Dummy);
+            World(&(*pF)[0], Ie, &Hi); World(&(*pF)[std::size_t(nB)], Ie1, &Dummy);
+            auto Flat = [](xmath::fvec3 v) { v.m_Y = 0; return v; };
+            const float dRoot = Flat(Ae[iHips] - Ie[iHips]).Length() * 100.0f;
+            float dYaw = std::abs(Ha - Hi) * 57.29578f; if (dYaw > 180) dYaw = 360 - dYaw;
+            const float vA = Flat(Ae[iHips] - Ae1[iHips]).Length() * 30.0f, vI = Flat(Ie1[iHips] - Ie[iHips]).Length() * float(Fps);
+            const float dLF = (Ae[iLF] - Ie[iLF]).Length() * 100.0f, dRF = (Ae[iRF] - Ie[iRF]).Length() * 100.0f;
+            // the prop's volume: before the join no bone may be inside it (its box half extents, or a sphere's/capsule's bounds)
+            const xmath::fvec3 Half = pP->m_Shape == xanim_package_desc::prop_shape::BOX ? pP->m_Size : xmath::fvec3(pP->m_Size.m_X, pP->m_Shape == xanim_package_desc::prop_shape::CAPSULE ? pP->m_Size.m_Y + pP->m_Size.m_X : pP->m_Size.m_X, pP->m_Size.m_X);
+            int FirstIn = -1, BoneIn = -1;
+            for (int f = 0; f < nA && FirstIn < 0; ++f)
+            {
+                std::vector<xmath::fvec3> W; World(&App[std::size_t(f) * nB], W, nullptr);
+                for (int b = 0; b < nB; ++b) { const auto d = W[b] - pP->m_Offset; if (std::abs(d.m_X) < Half.m_X && std::abs(d.m_Y) < Half.m_Y && std::abs(d.m_Z) < Half.m_Z) { FirstIn = f; BoneIn = b; break; } }
+            }
+            int nFail = 0; std::string Out;
+            auto Row = [&](bool bOk, const std::string& T) { nFail += !bOk; Out += std::format("  {} {}\n", bOk ? "PASS" : "FAIL", T); };
+            Row(dRoot <= 5.0f, std::format("alignment: the root {:.1f} cm from the interaction's first frame (5)", dRoot));
+            Row(dYaw <= 10.0f, std::format("alignment: heading {:.1f} deg off (10)", dYaw));
+            Row(vA <= 0.5f && std::abs(vA - vI) <= 0.4f, std::format("continuity (arrival Stop): the approach ends at {:.2f} m/s, the interaction starts at {:.2f} (end <= 0.5, difference <= 0.4)", vA, vI));
+            Row(dLF <= 5.0f && dRF <= 5.0f, std::format("contact: the feet {:.1f} / {:.1f} cm from where the interaction has them (5)", dLF, dRF));
+            Row(FirstIn < 0, FirstIn < 0 ? std::string("clearance: no bone inside the prop during the approach") : std::format("clearance: {} inside the prop at frame {} of {}", R.Name(BoneIn), FirstIn, nA));
+            return std::format("InteractionValidate: {} - entry ({:.2f}, {:.2f}, {:.0f} deg) of '{}', the approach's {} frames against the selected clip\n{}", nFail ? std::format("FAIL ({})", nFail) : std::string("PASS"), Fx, Fz, FyawDeg, PropName, nA, Out);
+        }
+
         std::string PrimitiveApproach(const std::string& PropName, float Fx, float Fz, float FyawDeg, float Seconds, int Seed, const std::string& Prompt) noexcept
         {
             auto* pDesc = Desc(); if (!pDesc) return "PrimitiveApproach: nothing loaded";
@@ -6792,6 +6858,13 @@ namespace xanim_package_editor
             return S.KimodoInbetweenAccept(i);
         }
         case kind::kimodo_inbetween_discard: return S.IbDiscard();
+        case kind::interaction_validate:
+        {
+            std::string Prop, From; float F[3]{};
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Prop); xeditor::cmd_util::GetArg(m_Parser, m_hB, From);
+            if (xanimation::Scan(From.c_str(), "%f %f %f", &F[0], &F[1], &F[2]) != 3) return "InteractionValidate: -From wants \"x z yaw\"";
+            return S.InteractionValidate(Prop, F[0], F[1], F[2]);
+        }
         case kind::anchor_move:
         {
             std::string Prop, Anchor, Pos; xmath::fvec3 P;
