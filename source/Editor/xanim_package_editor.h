@@ -1534,14 +1534,14 @@ namespace xanim_package_editor
                 const char* Why = iL < 0 ? "No Pose layer: add one (LayerAdd -Kind Pose) and key the two poses to keep" : (A < 0 || B < 0) ? "Put the playhead between two keys of the layer: the motion between them is regenerated" : (B - A < 0.2) ? "The two keys are closer than 0.2 s" : m_K.m_Job.m_bRunning ? "Kimodo is busy" : nullptr;
                 ImGui::SameLine(); ImGui::TextUnformatted("  ");
                 ImGui::SameLine(); ImGui::BeginDisabled(Why != nullptr);
-                if (ImGui::SmallButton("Regenerate between keys")) m_TLView.m_Reply = xeditor::Run(m_Undo, std::format("KimodoInbetween -Layer {} -From {:.4f} -To {:.4f} -Seeds \"1 2 3\"", iL, A, B));
+                if (ImGui::SmallButton("Regenerate between keys")) xeditor::Run(m_Undo, std::format("KimodoInbetween -Layer {} -From {:.4f} -To {:.4f} -Seeds \"1 2 3\"", iL, A, B));
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text("%s", Why ? Why : "Kimodo regenerates the motion between the two keys around the playhead (both kept, nothing outside changes): three candidates, nothing written until you accept one. One undo step.");
                 for (int i = 0; i < int(m_IbCands.size()); ++i)
                 {
                     if (m_IbCands[std::size_t(i)].m_After.empty()) continue;
                     ImGui::SameLine();
-                    if (ImGui::SmallButton(std::format("Accept {}##ib{}", i, i).c_str())) m_TLView.m_Reply = xeditor::Run(m_Undo, std::format("KimodoInbetweenAccept -Candidate {}", i));
+                    if (ImGui::SmallButton(std::format("Accept {}##ib{}", i, i).c_str())) xeditor::Run(m_Undo, std::format("KimodoInbetweenAccept -Candidate {}", i));
                     if (ImGui::IsItemHovered()) xeditor::hint::Text("Writes candidate %d (seed %d): seams in %.1f, out %.1f deg/s per frame. One undo step.", i, m_IbCands[std::size_t(i)].m_Seed, double(m_IbCands[std::size_t(i)].m_SeamIn * 30.0f), double(m_IbCands[std::size_t(i)].m_SeamOut * 30.0f));
                 }
             }
