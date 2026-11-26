@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -91,6 +91,12 @@ namespace xanim_package_editor
                 m_hF = m_Parser.addOption("Video",   "A video file instead of a prompt: the motion of its main person (xmocap capture; -Start s, -Seconds s of it)", false, 1);
                 m_hG = m_Parser.addOption("Start",   "With -Video: where in the video the take starts, seconds (default 0)", false, 1);
                 m_hH = m_Parser.addOption("Track",   "A file of rows \"t x z yaw\" (seconds, metres +Z ahead +X to the left, degrees +toward +X): the root follows this path AND faces this way, interpolated per frame - a pivot, a turn on the spot, a curve with its own facing (C132)", false, 1);
+                break;
+            case kind::kimodo_inbetween:
+                m_hA = m_Parser.addOption("Layer", "The Pose layer's index in the selected clip", true, 1);
+                m_hB = m_Parser.addOption("From",  "Seconds: the span's start (a key, kept)", true, 1);
+                m_hC = m_Parser.addOption("To",    "Seconds: the span's end (a key, kept)", true, 1);
+                m_hD = m_Parser.addOption("Seed",  "Seed (default 1): another seed, another in-between", false, 1);
                 break;
             case kind::kimodo_settings:
                 m_hA = m_Parser.addOption("Steps",    "Denoising steps (more: slower, can be cleaner; 0 = Kimodo's default)", false, 1);
@@ -290,7 +296,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -437,6 +443,7 @@ namespace xanim_package_editor
             , m_KimodoAccept  (m_Undo, *this, playback_cmd::kind::kimodo_accept,   "KimodoAccept",   "Saves the previewed Kimodo motion in the package's Kimodo folder and adds it as a source (undoable). Usage: KimodoAccept [-Name ClipName] [-Layer 1] (-Layer 1: a layer of the selected clip at the playhead instead of a clip)")
             , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved), or stops a generation or video capture still running (the Cancel button). Usage: KimodoDiscard")
             , m_KimodoSettings(m_Undo, *this, playback_cmd::kind::kimodo_settings, "KimodoSettings", "Kimodo's advanced generation settings for every generation from this editor (not saved, not undo steps): denoising steps, guidance (text, constraint), post-processing. 0 = Kimodo's default. Usage: KimodoSettings [-Steps 50] [-Guidance \"2 2\"] [-NoPost 0|1] (no option: shows them)")
+            , m_KimodoInbetween(m_Undo, *this, playback_cmd::kind::kimodo_inbetween, "KimodoInbetween", "Regenerates the motion BETWEEN two times of a Pose layer with Kimodo at fixed timing: both edges kept, the layer's keys inside kept, nothing outside the span changes; one undo step; a report of skate and acceleration before and after. Another seed: Ctrl+Z and again. Usage: KimodoInbetween -Layer n -From s -To s [-Seed 1]")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -3296,6 +3303,40 @@ namespace xanim_package_editor
         // a full-body constraint, kept exactly (never rewritten), and the blend meets it. The Kimodo window is stored as a take
         // (Cache\KimodoTakes\<package>\) and listed on the layer (provenance).
         int m_nPreservedFootFrames = 0;     // (C88 (2): the swing frames the last refine kept on the feet's own paths)
+        bool m_bInbetween = false;      // (KimodoInbetween running SuggestRefine: no anchor at the scope's centre)
+
+        // Inbetweener v2 step 1 (D:\LIONant\xLION_Docs\areas\animation\plans\inbetweener_design_v2_2026-11-26.md): Kimodo regenerates the
+        // motion BETWEEN two times of a Pose layer at fixed timing - Refine Motion over that span with both edges anchored (the poses there and
+        // beyond) and the middle free; every key of the layer inside the span is kept (an anchor); outside the span nothing changes; ONE undo
+        // step; the report gives the skate and acceleration before and after. Another seed: Ctrl+Z, then again with -Seed.
+        std::string KimodoInbetween(int iLayer, double From, double To, int Seed) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pDesc = Desc();
+            if (!pOv || !pDesc) return "KimodoInbetween: select a clip first";
+            if (iLayer < 0 || iLayer >= int(pOv->m_Layers.size())) return "KimodoInbetween: no such layer";
+            if (To - From < 0.2) return "KimodoInbetween: the span is shorter than 0.2 s - select two keys further apart";
+            std::string Err; auto* pCtx = KimodoRetargetCtx(Err); if (!pCtx) return "KimodoInbetween: " + Err;
+            const auto& Man = pDesc->m_ResolvedSkeletonBones.m_Bones; const int nB = int(Man.size());
+            std::vector<xmath::transform3> Own; { const std::vector<xmath::transform3>* pF = nullptr; int Fps = 30, n = 0; if (!SuggestClipFrames(pF, Fps, n, Err)) return "KimodoInbetween: " + Err; Own = *pF; }
+            const auto Keep = m_Suggest;
+            m_Suggest = {}; m_Suggest.m_Time = 0.5 * (From + To); m_Suggest.m_Owned.assign(std::size_t(nB), 0);
+            for (int t = 0; t < nB; ++t) m_Suggest.m_Owned[t] = t < int(pCtx->m_Mapping.m_Auto.m_Map.m_SourceOf.size()) && pCtx->m_Mapping.m_Auto.m_Map.m_SourceOf[t] >= 0;
+            {   // the hips (Kimodo's root drives their translation): by slot
+                std::vector<std::int32_t> Par(nB); std::vector<std::string> Names(nB); std::vector<std::string_view> V(nB); xanimation::pose Rest; Rest.resize(nB);
+                for (int b = 0; b < nB; ++b) { Par[b] = Man[b].m_iParent; Names[b] = Man[b].m_Name; Rest.m_Position[b] = Man[b].m_RestPosition; Rest.m_Scale[b] = Man[b].m_RestScale; Rest.m_Rotation[b] = xmath::fquat(Man[b].m_RestRotX, Man[b].m_RestRotY, Man[b].m_RestRotZ, Man[b].m_RestRotW).NormalizeSafeCopy(); }
+                for (int b = 0; b < nB; ++b) V[b] = Names[b];
+                const auto Sl = xanimation::details::BuildSlots(xanimation::skeleton_view{ Par }, V, Rest);
+                if (const auto It = Sl.m_Bones.find({ xanimation::bone_slot::HIPS, xanimation::bone_side::NONE }); It != Sl.m_Bones.end()) m_Suggest.m_iHips = It->second[0];
+            }
+            if (m_Suggest.m_iHips < 0) { m_Suggest = Keep; return "KimodoInbetween: the hips were not recognized from the bone names"; }
+            std::string Report;
+            m_bInbetween = true;
+            const auto R = DirectOneStep(std::format("In-between {:.2f}-{:.2f} s", From, To), [&](desc&) -> std::string
+            { return SuggestRefine(iLayer, Seed, 0.5 * (To - From), 0.5 * (To - From), std::format("in-between {:.2f}-{:.2f} s (seed {})", From, To, Seed), Own, Report, Err) ? std::string() : Err; });
+            m_bInbetween = false; m_Suggest = Keep;
+            return std::format("KimodoInbetween: {} {:.2f}-{:.2f} s, seed {}{}\n{}", R.empty() || R == "no change" ? "done" : R, From, To, Seed, R == "no change" ? " (no change)" : "", Report);
+        }
+
         bool SuggestRefine(int iLayer, int Seed, double Lo, double Hi, const std::string& Why, const std::vector<xmath::transform3>& Own, std::string& Report, std::string& Err) noexcept
         {
             using clock = std::chrono::steady_clock;
@@ -3333,7 +3374,7 @@ namespace xanim_package_editor
             const int W = Rl + Rh + 2 * Mg + 1, K = Mg + Rl, A = K - Rl, B = K + Rh;
             const double Key = m_Suggest.m_Time;
             // the layer's other keys inside the scope: anchors (kept, constrained, met by the blend)
-            std::set<std::int64_t> UserTicks; std::vector<int> Anchors = { A, K, B };
+            std::set<std::int64_t> UserTicks; std::vector<int> Anchors = m_bInbetween ? std::vector<int>{ A, B } : std::vector<int>{ A, K, B };     // (KimodoInbetween: the span's middle is free)
             for (const auto& k : pOv->m_Layers[iLayer].m_Keys)
             {
                 const int f = K + int(std::lround((double(k.m_Tick) / double(xanim_package_layers::ToTick(1.0)) - Key) * 30.0));
@@ -6385,6 +6426,15 @@ namespace xanim_package_editor
             xeditor::cmd_util::GetArg(m_Parser, m_hA, T0); xeditor::cmd_util::GetArg(m_Parser, m_hB, T1); xeditor::cmd_util::GetArg(m_Parser, m_hC, T2);
             xeditor::cmd_util::GetArg(m_Parser, m_hD, T3); xeditor::cmd_util::GetArg(m_Parser, m_hE, T4);
             return S.TLInfo(T0, T1, T2, T3, T4);
+        }
+        case kind::kimodo_inbetween:
+        {
+            std::string L, F, T, Sd = "1";
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, L); xeditor::cmd_util::GetArg(m_Parser, m_hB, F); xeditor::cmd_util::GetArg(m_Parser, m_hC, T); xeditor::cmd_util::GetArg(m_Parser, m_hD, Sd);
+            int iL = -1, iSeed = 1; float f0 = 0, f1 = 0;
+            std::from_chars(L.data(), L.data() + L.size(), iL); std::from_chars(Sd.data(), Sd.data() + Sd.size(), iSeed);
+            if (xanimation::Scan(F.c_str(), "%f", &f0) != 1 || xanimation::Scan(T.c_str(), "%f", &f1) != 1 || f1 <= f0) return "KimodoInbetween: -From and -To want seconds, From < To";
+            return S.KimodoInbetween(iL, f0, f1, iSeed);
         }
         case kind::kimodo_settings:
         {
