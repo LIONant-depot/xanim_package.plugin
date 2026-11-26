@@ -3339,9 +3339,9 @@ namespace xanim_package_editor
             xproperty::settings::context C;
             auto Snap = [&] { return xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C); };
             const auto Before = Snap();
-            const float Ref = std::max(SeamAt(0.5 * (From + To)), 0.0f);
+            const float Ref = std::max(SeamAt(0.5 * (From + To)), 0.0f), RefIn = std::max(SeamAt(From), 0.0f), RefOut = std::max(SeamAt(To), 0.0f);     // (the take's own at the edges: the fair yardstick)
             m_IbCands.clear(); m_IbFrom = From; m_IbTo = To; m_IbLayer = iLayer;
-            std::string Out = std::format("KimodoInbetween: {} candidate(s) for {:.2f}-{:.2f} s (nothing written; KimodoInbetweenAccept -Candidate i). Seam = the worst bone's jump in angular speed at the edge (deg/s per frame); inside the span before: {:.2f}\n", Seeds.size(), From, To, Ref * 30.0f);
+            std::string Out = std::format("KimodoInbetween: {} candidate(s) for {:.2f}-{:.2f} s (nothing written; KimodoInbetweenAccept -Candidate i). Seam = the worst bone's jump in angular speed at the edge (deg/s per frame); the take before at the edges: in {:.2f}, out {:.2f}\n", Seeds.size(), From, To, RefIn * 30.0f, RefOut * 30.0f);
             for (const int Seed : Seeds)
             {
                 const int UndoAt = m_Undo.GetUndoIndex();
@@ -3351,7 +3351,7 @@ namespace xanim_package_editor
                 while (m_Undo.GetUndoIndex() > UndoAt) m_Undo.Undo();      // (rolled back: a candidate is never written)
                 xproperty::ui::undo::ApplySnapshotFromString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), Before, C);
                 const bool bOk = !Cd.m_After.empty();
-                Out += std::format("  candidate {}: seed {} - {}{}\n", m_IbCands.size(), Seed, bOk ? std::format("seam in {:.2f}, out {:.2f} - {}", Cd.m_SeamIn * 30.0f, Cd.m_SeamOut * 30.0f, std::max(Cd.m_SeamIn, Cd.m_SeamOut) <= std::max(1.5f * Ref, Ref + 2.0f / 30.0f) ? "seams PASS" : "seams FAIL (over 1.5x the span's own)") : "FAILED: ", bOk ? "" : R);
+                Out += std::format("  candidate {}: seed {} - {}{}\n", m_IbCands.size(), Seed, bOk ? std::format("seam in {:.2f}, out {:.2f} - {}", Cd.m_SeamIn * 30.0f, Cd.m_SeamOut * 30.0f, Cd.m_SeamIn <= std::max(1.5f * RefIn, RefIn + 2.0f / 30.0f) && Cd.m_SeamOut <= std::max(1.5f * RefOut, RefOut + 2.0f / 30.0f) ? "seams PASS" : "seams FAIL (over 1.5x the take's own at that edge)") : "FAILED: ", bOk ? "" : R);
                 m_IbCands.push_back(std::move(Cd));
             }
             return Out;
