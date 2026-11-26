@@ -1284,6 +1284,7 @@ namespace xanim_package_compiler
 
             std::vector<xanim_package::clip>       Clips;
             std::vector<std::string>               Names;
+            std::vector<std::pair<std::string, int>> Spaces;      // (per compiled clip: its motion space partner by name, samples)
             std::vector<xmath::transform3>          AllKeyFrames;
             std::vector<xmath::fvec3>               AllRootMotion;
             m_RootTurn.clear(); m_LoopReport.clear();
@@ -1331,6 +1332,7 @@ namespace xanim_package_compiler
                 if (Skip) continue;
 
                 Names.push_back((pOv && !pOv->m_Name.empty()) ? pOv->m_Name : Raw.m_Anim.m_Name);
+                Spaces.push_back(pOv ? std::pair{ pOv->m_SpaceWith, pOv->m_SpaceSamples } : std::pair{ std::string(), 0 });
                 Clips.emplace_back(std::move(Compiled));
             }
 
@@ -1338,6 +1340,17 @@ namespace xanim_package_compiler
                 return xerr::create_f<state, "No clips survived import/ignore - nothing to compile">();
 
             if (auto Err = CheckClipNameCollisions(Clips, Names); Err) return Err;
+            for (std::size_t i = 0; i < Clips.size(); ++i)      // (motion spaces: the other loop by its compiled name; both must loop)
+            {
+                const auto& [With, n] = Spaces[i];
+                if (With.empty()) continue;
+                const auto It = std::find(Names.begin(), Names.end(), With);
+                if (It == Names.end()) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': SpaceWith '{}' is not a clip of this package - no motion space", Names[i], With)); continue; }
+                const auto j = std::size_t(It - Names.begin());
+                if (!Clips[i].m_bLoop || !Clips[j].m_bLoop || j == i) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': a motion space needs two different LOOPS ('{}' with '{}') - none", Names[i], Names[i], With)); continue; }
+                Clips[i].m_SpaceWith = std::int32_t(j); Clips[i].m_SpaceSamples = std::clamp(n, 2, 16);
+                LogMessage(xresource_pipeline::msg_type::INFO, std::format("Motion space: '{}' <-> '{}', {} samples", Names[i], With, Clips[i].m_SpaceSamples));
+            }
             // C127: the loop report (one row per clip marked Loop: clip, verdict, frames as cut, seam as cut mm / deg-per-s, what was done or why not)
             if (!m_LoopReport.empty())
             {
@@ -1357,6 +1370,7 @@ namespace xanim_package_compiler
                 D.m_NameHash = S.m_NameHash; D.m_FPS = S.m_FPS; D.m_nFrames = S.m_nFrames; D.m_bLoop = S.m_bLoop; D.m_RootMotionMode = S.m_RootMotionMode;
                 D.m_LoopDisplacement.m_X = S.m_LoopDisplacement.m_X; D.m_LoopDisplacement.m_Y = S.m_LoopDisplacement.m_Y; D.m_LoopDisplacement.m_Z = S.m_LoopDisplacement.m_Z; D.m_LoopTurn = S.m_LoopTurn;
                 D.m_iFirstKeyFrame = S.m_iFirstKeyFrame; D.m_iFirstRootMotion = S.m_iFirstRootMotion; D.m_iFirstEvent = S.m_iFirstEvent; D.m_nEvents = S.m_nEvents;
+                D.m_SpaceWith = S.m_SpaceWith; D.m_SpaceSamples = S.m_SpaceSamples;
                 // what the clip does (soccer answer 4): measured on its final frames, with the travel its root motion took out
                 {
                     const int nB = static_cast<int>(ResolvedBones.size());

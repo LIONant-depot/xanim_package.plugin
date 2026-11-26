@@ -446,6 +446,8 @@ namespace xanim_package_desc
         xanim_package::root_motion_mode   m_RootMotion     = xanim_package::root_motion_mode::NONE;
         std::vector<clip_layer>           m_Layers         = {};   // the layered edit mode: baked into this clip before its trim/downsample/root motion
         std::vector<clip_event>           m_Events         = {};   // markers, footsteps, contacts, sync points (T5)
+        std::string                       m_SpaceWith      = {};   // R165 phase 2: a MOTION SPACE between this loop and that loop (its compiled name): matching also plays them blended
+        int                               m_SpaceSamples   = 5;    // how many blends from this loop (0) to that one (1), ends included
 
         XPROPERTY_DEF
         ( "Clip", clip
@@ -460,6 +462,8 @@ namespace xanim_package_desc
         , obj_member<"RootMotion",      &clip::m_RootMotion, member_enum_span<root_motion_mode_v> >
         , obj_member<"Layers",          &clip::m_Layers >
         , obj_member<"Events",          &clip::m_Events >
+        , obj_member<"SpaceWith",       &clip::m_SpaceWith, member_help<"Motion space: another LOOP's name - motion matching also plays the two blended (footstep-aligned), at SpaceSamples weights; empty: none"> >
+        , obj_member<"SpaceSamples",    &clip::m_SpaceSamples, member_help<"Motion space: blends from this loop to the other, ends included (2 to 16)"> >
         )
     };
     XPROPERTY_REG(clip)

@@ -43,6 +43,10 @@ namespace xanim_package
         float               m_TurnRate          {0};    // degrees per second the facing turns (positive: to its left)
         float               m_LoopError         {0};    // degrees between the first and last frames' local rotations (small: it loops)
         float               m_Height            {0};    // the bones' centroid's mean height
+        // a MOTION SPACE (R165 phase 2): this loop blended with loop m_SpaceWith at m_SpaceSamples weights, footstep-aligned, as more matching
+        // entries (the game: xanimation::BlendLoops); -1: none
+        std::int32_t        m_SpaceWith         {-1};
+        std::int32_t        m_SpaceSamples      {0};
     };
 
     // What a marker on a clip's timeline is (T5): the runtime and the tools read the kind; the name is free text (hashed)
@@ -62,7 +66,7 @@ namespace xanim_package
 
     struct anim_package
     {
-        inline static constexpr auto xserializer_version_v = 7;     // 2: events; 3: clip traits; 4: root turn; 5: compressed clips; 6: the raw keys in a sidecar; 7: seamless loops (a loop's frames exclude the next pass's first; m_LoopTurn)
+        inline static constexpr auto xserializer_version_v = 8;     // 8: motion spaces (a clip's SpaceWith/SpaceSamples); 2: events; 3: clip traits; 4: root turn; 5: compressed clips; 6: the raw keys in a sidecar; 7: seamless loops (a loop's frames exclude the next pass's first; m_LoopTurn)
 
                                         anim_package    (void)                          noexcept = default;
         inline                         anim_package    (xserializer::stream& Stream)    noexcept;
@@ -299,6 +303,7 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Clip.m_nEvents))
             || (Err = Stream.Serialize(Clip.m_Speed)) || (Err = Stream.Serialize(Clip.m_Direction)) || (Err = Stream.Serialize(Clip.m_TurnRate))
             || (Err = Stream.Serialize(Clip.m_LoopError)) || (Err = Stream.Serialize(Clip.m_Height))
+            || (Err = Stream.Serialize(Clip.m_SpaceWith)) || (Err = Stream.Serialize(Clip.m_SpaceSamples))
             ;
         return Err;
     }
