@@ -3351,7 +3351,7 @@ namespace xanim_package_editor
                 while (m_Undo.GetUndoIndex() > UndoAt) m_Undo.Undo();      // (rolled back: a candidate is never written)
                 xproperty::ui::undo::ApplySnapshotFromString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), Before, C);
                 const bool bOk = !Cd.m_After.empty();
-                Out += std::format("  candidate {}: seed {} - {}{}\n", m_IbCands.size(), Seed, bOk ? std::format("seam in {:.2f}, out {:.2f}", Cd.m_SeamIn * 30.0f, Cd.m_SeamOut * 30.0f) : "FAILED: ", bOk ? "" : R);
+                Out += std::format("  candidate {}: seed {} - {}{}\n", m_IbCands.size(), Seed, bOk ? std::format("seam in {:.2f}, out {:.2f} - {}", Cd.m_SeamIn * 30.0f, Cd.m_SeamOut * 30.0f, std::max(Cd.m_SeamIn, Cd.m_SeamOut) <= std::max(1.5f * Ref, Ref + 2.0f / 30.0f) ? "seams PASS" : "seams FAIL (over 1.5x the span's own)") : "FAILED: ", bOk ? "" : R);
                 m_IbCands.push_back(std::move(Cd));
             }
             return Out;
@@ -3733,13 +3733,22 @@ namespace xanim_package_editor
                     }
             }
 
+            if (m_bInbetween)       // (Inbetweener: a seam budget INSIDE the span - the first and last 4 frames ease from the take as it plays to the
+                                    // generated motion, smoothstep; the entry seam was about twice the take's own without it, 2026-11-26)
+                for (int f = A + 1; f < B; ++f)
+                {
+                    constexpr int Kb = 4; const int d = std::min(f - A, B - f); if (d > Kb) continue;
+                    const float u = float(d) / float(Kb + 1), w = u * u * (3.0f - 2.0f * u);
+                    const auto Po = SamplePose(Accepted, FPS, nF, nB, Key + double(f - K) / 30.0);
+                    for (int b = 0; b < nB; ++b) { auto& O = Ref[std::size_t(f) * nB + b]; O.m_Rotation = xmath::fquat::Slerp(Po[b].m_Rotation, O.m_Rotation, w).NormalizeSafeCopy(); O.m_Position = Po[b].m_Position + (O.m_Position - Po[b].m_Position) * w; }
+                }
             float PinMax = 0; int nKeys = 0, nFrames = 0;
             for (int f = A; f <= B; f += Step)
             {
                 const double t = Key + double(f - K) / 30.0;
                 if (t < 0.0) continue;                                           // before the clip's start
                 const auto Tick = xanim_package_layers::ToTick(t);
-                if (f == K || UserTicks.count(Tick)) continue;                  // the accepted key and the user's keys stay as they are
+                if ((f == K && !m_bInbetween) || UserTicks.count(Tick)) continue;     // the accepted key and the user's keys stay as they are (an in-between has no key at its centre)
                 if (f == A || f == B)
                 {   // the edges: the motion as it plays there now (the layer joins it exactly)
                     for (int b = 0; b < nB; ++b) if (Owned[b] || b == iHips) { const auto& Wb = Win[std::size_t(f) * nB + b]; PutKey(Names[b], Tick, Wb.m_Rotation, b == iHips ? &Wb.m_Position : nullptr); ++nKeys; }
