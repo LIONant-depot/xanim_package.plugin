@@ -1515,7 +1515,7 @@ namespace xanim_package_editor
                     }
                 }
                 ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The selected keys' interval to the next key: smooth (the layer's curve), linear or step (hold)");
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text("%s", "The selected keys' interval to the next key: smooth (the layer's curve), linear or step (hold)");
             }
             // Inbetweener: Regenerate between the two keys around the playhead, on the layer of the selected key (else the top Pose layer).
             // The button runs the console command (AI and human drive the same action); candidates are listed, nothing is written until Accept.
@@ -1534,18 +1534,34 @@ namespace xanim_package_editor
                 const char* Why = iL < 0 ? "No Pose layer: add one (LayerAdd -Kind Pose) and key the two poses to keep" : (A < 0 || B < 0) ? "Put the playhead between two keys of the layer: the motion between them is regenerated" : (B - A < 0.2) ? "The two keys are closer than 0.2 s" : m_K.m_Job.m_bRunning ? "Kimodo is busy" : nullptr;
                 ImGui::SameLine(); ImGui::TextUnformatted("  ");
                 ImGui::SameLine(); ImGui::BeginDisabled(Why != nullptr);
-                if (ImGui::SmallButton("Regenerate between keys")) xeditor::Run(m_Undo, std::format("KimodoInbetween -Layer {} -From {:.4f} -To {:.4f} -Seeds \"1 2 3\"", iL, A, B));
+                if (ImGui::SmallButton("Regenerate between keys")) { const int s0 = m_IbNextSeed; m_IbNextSeed += 3; xeditor::Run(m_Undo, std::format("KimodoInbetween -Layer {} -From {:.4f} -To {:.4f} -Seeds \"{} {} {}\"", iL, A, B, s0, s0 + 1, s0 + 2)); }      // (new seeds each click)
+                const bool bHoverRegen = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+                m_IbBand = (bHoverRegen && A >= 0 && B > A) ? std::pair{ A, B } : !m_IbCands.empty() ? std::pair{ m_IbFrom, m_IbTo } : std::pair{ -1.0, -1.0 };     // (the span the action works on, shown on the timeline)
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text("%s", Why ? Why : "Kimodo regenerates the motion between the two keys around the playhead (both kept, nothing outside changes): three candidates, nothing written until you accept one. One undo step.");
+                const bool bStale = !m_IbCands.empty() && m_Undo.GetUndoIndex() != m_IbUndoAt;      // (the clip changed since the candidates were made)
                 for (int i = 0; i < int(m_IbCands.size()); ++i)
                 {
-                    if (m_IbCands[std::size_t(i)].m_After.empty()) continue;
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton(std::format("Accept {}##ib{}", i, i).c_str())) xeditor::Run(m_Undo, std::format("KimodoInbetweenAccept -Candidate {}", i));
-                    if (ImGui::IsItemHovered()) xeditor::hint::Text("Writes candidate %d (seed %d): seams in %.1f, out %.1f deg/s per frame. One undo step.", i, m_IbCands[std::size_t(i)].m_Seed, double(m_IbCands[std::size_t(i)].m_SeamIn * 30.0f), double(m_IbCands[std::size_t(i)].m_SeamOut * 30.0f));
+                    const auto& Cd = m_IbCands[std::size_t(i)];
+                    ImGui::SameLine(); ImGui::BeginDisabled(bStale || Cd.m_After.empty());
+                    if (ImGui::SmallButton(std::format("Use {}##ib{}", i + 1, i).c_str())) xeditor::Run(m_Undo, std::format("KimodoInbetweenAccept -Candidate {}", i));
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    {
+                        if (bStale) xeditor::hint::Text("%s", "These candidates are out of date: the clip changed after they were made. Regenerate between keys again.");
+                        else if (Cd.m_After.empty()) xeditor::hint::Text("Candidate %d failed: %s", i + 1, Cd.m_Report.c_str());
+                        else xeditor::hint::Text("Use candidate %d (seed %d). The jump in motion where it joins the clip: %.1f deg/s at the first key, %.1f deg/s at the second (the clip itself has %.1f and %.1f there). One undo step.", i + 1, Cd.m_Seed, double(Cd.m_SeamIn * 30.0f), double(Cd.m_SeamOut * 30.0f), double(Cd.m_SeamRef * 30.0f), double(Cd.m_SeamRef * 30.0f));
+                    }
                 }
             }
             tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height - ImGui::GetFrameHeightWithSpacing() });
+            if (m_IbBand.first >= 0 && m_IbBand.second > m_IbBand.first)      // (Regenerate between keys: the span it works on, amber, as the edit scope)
+            {
+                const auto& V = m_TLView.m_View; const auto& Bd = m_TLView.m_Body; auto* DL = ImGui::GetWindowDrawList();
+                const float x0 = Bd.Min.x + float(V.X(m_IbBand.first * double(tl_tps_v))), x1 = Bd.Min.x + float(V.X(m_IbBand.second * double(tl_tps_v)));
+                DL->PushClipRect(Bd.Min, Bd.Max, true); DL->AddRectFilled({ x0, Bd.Min.y }, { x1, Bd.Max.y }, IM_COL32(255, 170, 40, 40));
+                DL->AddLine({ x0, Bd.Min.y }, { x0, Bd.Max.y }, IM_COL32(255, 170, 40, 200), 1.5f); DL->AddLine({ x1, Bd.Min.y }, { x1, Bd.Max.y }, IM_COL32(255, 170, 40, 200), 1.5f); DL->PopClipRect();
+            }
             // C88 (3): the live edit scope on the timeline too - an amber band over the frames keying the preview would change
             if (const auto E = EditScope(); E.m_bOn)
             {
@@ -3347,7 +3363,8 @@ namespace xanim_package_editor
         // speed across the edge frame on the composed clip, deg/s per frame, next to the same measure inside the span before the edit).
         // KimodoInbetweenAccept writes one candidate as ONE undo step - refused when the document changed since (a stale candidate).
         struct inbetween_candidate { int m_Seed = 0; std::string m_Before, m_After, m_Report; float m_SeamIn = 0, m_SeamOut = 0, m_SeamRef = 0; };
-        std::vector<inbetween_candidate> m_IbCands; double m_IbFrom = 0, m_IbTo = 0; int m_IbLayer = -1;
+        std::pair<double, double> m_IbBand { -1.0, -1.0 };
+        std::vector<inbetween_candidate> m_IbCands; double m_IbFrom = 0, m_IbTo = 0; int m_IbLayer = -1; int m_IbUndoAt = -1; int m_IbNextSeed = 1;
         float SeamAt(double T) noexcept      // the worst bone's |second difference of rotation| at T, deg per frame^2 (x fps^2 = deg/s^2)
         {
             const std::vector<xmath::transform3>* pF = nullptr; int Fps = 30, n = 0; std::string E;
@@ -3382,6 +3399,7 @@ namespace xanim_package_editor
                 Out += std::format("  candidate {}: seed {} - {}{}\n", m_IbCands.size(), Seed, bOk ? std::format("seam in {:.2f}, out {:.2f} - {}", Cd.m_SeamIn * 30.0f, Cd.m_SeamOut * 30.0f, Cd.m_SeamIn <= std::max(1.5f * RefIn, RefIn + 2.0f / 30.0f) && Cd.m_SeamOut <= std::max(1.5f * RefOut, RefOut + 2.0f / 30.0f) ? "seams PASS" : "seams FAIL (over 1.5x the take's own at that edge)") : "FAILED: ", bOk ? "" : R);
                 m_IbCands.push_back(std::move(Cd));
             }
+            m_IbUndoAt = m_Undo.GetUndoIndex();
             return Out;
         }
         std::string KimodoInbetweenAccept(int i) noexcept
