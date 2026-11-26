@@ -118,6 +118,7 @@ namespace xanim_package_desc
         bool            m_bStep     = false;
         bool            m_bLinear   = false;
         float           m_AX = 0, m_AY = 0, m_AZ = 0;           // the handle in the bone's frame (palm, sole)
+        std::string     m_Anchor    = {};                       // "Prop/Anchor": the target follows that prop anchor (AnchorMove rewrites it); empty: free
 
         XPROPERTY_DEF
         ( "IkKey", layer_ik_key
@@ -130,6 +131,7 @@ namespace xanim_package_desc
         , obj_member<"Step",     &layer_ik_key::m_bStep >
         , obj_member<"Linear",   &layer_ik_key::m_bLinear >
         , obj_member<"AX", &layer_ik_key::m_AX >, obj_member<"AY", &layer_ik_key::m_AY >, obj_member<"AZ", &layer_ik_key::m_AZ >
+        , obj_member<"Anchor", &layer_ik_key::m_Anchor, member_help<"Prop/Anchor this target is bound to (IkKey -Prop Chair/Seat); AnchorMove keeps it on the anchor"> >
         )
     };
     XPROPERTY_REG(layer_ik_key)
@@ -348,6 +350,21 @@ namespace xanim_package_desc
 
     // A prop in the preview (editor only, never compiled): a ball, a bat, a chair - a simple shape held by a bone (Bone: the hand) or standing
     // in the scene (Bone empty), so the animator sees what the motion is about (soccer: the ball at the foot). Model units, the bone's frame.
+    // Smart Primitive v2: a named point on a prop in the prop's own frame (Seat, LeftArmrest): contacts bind to it, not to the prop's centre
+    struct prop_anchor
+    {
+        std::string     m_Name     = "Seat";
+        xmath::fvec3    m_Position = xmath::fvec3(0, 0, 0);
+        float           m_Yaw      = 0;     // degrees about up (a hand's or the hips' facing there)
+        XPROPERTY_DEF
+        ( "Anchor", prop_anchor
+        , obj_member<"Name", &prop_anchor::m_Name >
+        , obj_member<"Position", &prop_anchor::m_Position, member_help<"In the prop's frame (model units)"> >
+        , obj_member<"Yaw", &prop_anchor::m_Yaw, member_help<"Degrees about up"> >
+        )
+    };
+    XPROPERTY_REG(prop_anchor)
+
     struct preview_prop
     {
         std::string     m_Name    = "Ball";
@@ -360,6 +377,7 @@ namespace xanim_package_desc
         float           m_PivotYaw    = 0;                              // degrees about up: the way the character faces at the pivot
         xmath::fvec3    m_BoxCenter   = xmath::fvec3(0, 0, 0);          // in the pivot's frame
         xmath::fvec3    m_BoxHalf     = xmath::fvec3(0, 0, 0);          // half extents; zero = no interaction box
+        std::vector<prop_anchor> m_Anchors = {};                       // named contact points (IkKey -Prop Name/Anchor)
 
         XPROPERTY_DEF
         ( "Prop", preview_prop
@@ -371,7 +389,8 @@ namespace xanim_package_desc
         , obj_member<"PivotOffset", &preview_prop::m_PivotOffset, member_help<"Smart Primitive: the pivot the interaction is authored against, from the prop (its frame)"> >
         , obj_member<"PivotYaw", &preview_prop::m_PivotYaw, member_help<"Smart Primitive: degrees about up, the way the character faces at the pivot (the arrow)"> >
         , obj_member<"BoxCenter", &preview_prop::m_BoxCenter, member_help<"Smart Primitive: the interaction box's centre in the pivot's frame: where an approach may start"> >
-        , obj_member<"BoxHalf", &preview_prop::m_BoxHalf, member_help<"Smart Primitive: the interaction box's half extents; zero: no box"> >
+        , obj_member<"BoxHalf", &preview_prop::m_BoxHalf, member_help<"Smart Primitive: the authoring envelope's half extents (where an approach may be ASKED; proven entries are separate); zero: none"> >
+        , obj_member<"Anchors", &preview_prop::m_Anchors, member_help<"Named contact points in the prop's frame (Seat, LeftArmrest): IkKey -Prop Chair/Seat binds a target to one"> >
         )
     };
     XPROPERTY_REG(preview_prop)

@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, anchor_move, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -82,6 +82,11 @@ namespace xanim_package_editor
             case kind::select_clip: m_hA = m_Parser.addOption("Source", "Import source index",       true, 1); m_hB = m_Parser.addOption("Clip", "Clip index in that source", true, 1); break;
             case kind::seek:        m_hA = m_Parser.addOption("Time",   "Seconds from the clip start", true, 1); break;
             case kind::set_speed:   m_hA = m_Parser.addOption("Index",  "Playback speed step (0.25x .. 3x)", true, 1); break;
+            case kind::anchor_move:
+                m_hA = m_Parser.addOption("Prop",   "The standing preview prop", true, 1);
+                m_hB = m_Parser.addOption("Anchor", "Its anchor's name", true, 1);
+                m_hC = m_Parser.addOption("Pos",    "\"x y z\" the anchor's new place in the prop's frame", true, 1);
+                break;
             case kind::primitive_approach:
                 m_hA = m_Parser.addOption("Prop",    "The preview prop with the pivot (and the interaction box)", true, 1);
                 m_hB = m_Parser.addOption("From",    "\"x z yaw\": where the character starts, metres and degrees in the PIVOT's frame (+Z: the pivot's facing)", true, 1);
@@ -319,7 +324,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach, m_AnchorMove;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -470,6 +475,7 @@ namespace xanim_package_editor
             , m_KimodoInbetweenAccept(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_accept, "KimodoInbetweenAccept", "Writes one candidate of KimodoInbetween -Seeds as one undo step; refused when the clip changed since (stale). Usage: KimodoInbetweenAccept [-Candidate 0]")
             , m_KimodoInbetweenDiscard(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_discard, "KimodoInbetweenDiscard", "Drops the candidates of KimodoInbetween -Seeds; the clip stays as it was. Usage: KimodoInbetweenDiscard")
             , m_PrimitiveApproach(m_Undo, *this, playback_cmd::kind::primitive_approach, "PrimitiveApproach", "Smart Primitive: generates the approach into the selected clip's first frame from a start in the prop's interaction box (a Kimodo take, previewed; KimodoAccept keeps it). Usage: PrimitiveApproach -Prop Chair -From \"x z yaw\" [-Seconds s] [-Seed n] [-Prompt words]")
+            , m_AnchorMove(m_Undo, *this, playback_cmd::kind::anchor_move, "AnchorMove", "Smart Primitive: moves a prop anchor in the prop's frame; every IK key bound to it (IkKey -Prop Chair/Seat) follows, in every clip. One undo step. Usage: AnchorMove -Prop Chair -Anchor Seat -Pos \"x y z\"")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -4711,7 +4717,7 @@ namespace xanim_package_editor
 
         // An effector's IK key on the top Pose layer at a time: the handle's target (default: where it is now), its rotation (Rot), pinned or not
         // (default: the handle's pin state in the Pose tool). Replaces a key of that effector at that tick. One undo step.
-        std::string IkKey(const std::string& Effector, double Seconds, const xmath::fvec3* pPos, int PinState, bool bRot, bool bDelete) noexcept
+        std::string IkKey(const std::string& Effector, double Seconds, const xmath::fvec3* pPos, int PinState, bool bRot, bool bDelete, const std::string& Anchor = {}) noexcept
         {
             std::string Err;
             if (!PoseRig(Err)) return "IkKey: " + Err;
@@ -4739,6 +4745,7 @@ namespace xanim_package_editor
                     Out = std::format("IkKey: {}'s key at {:.3f} s deleted", R.Name(b), Seconds); return {};
                 }
                 const bool bNew = IkKeyWrite(iL, b, Tick, k, Pos, Rot, bRot, bPin);
+                if (const auto Was = SelectedOv()->m_Layers[iL].m_IkKeys[k].m_Anchor; Was != Anchor) SetLayer(iL, std::format("IkKeys[G:{}]/Anchor", k).c_str(), Anchor, Was);     // (bound to a prop anchor, or freed)
                 Out = std::format("IkKey: layer {} key {} {} {} at {:.3f} s: {:.4f} {:.4f} {:.4f}{}{}", iL, k, bNew ? "added" : "replaced", R.Name(b), Seconds, Pos.m_X, Pos.m_Y, Pos.m_Z, bPin ? " pinned" : "", bRot ? " +rotation" : "");
                 return {};
             });
@@ -4852,9 +4859,18 @@ namespace xanim_package_editor
             auto* pDesc = Desc();
             if (!pDesc) { Err = "no description"; return false; }
             const xanim_package_desc::preview_prop* pP = nullptr;
-            for (const auto& P : pDesc->m_PreviewProps) if (P.m_Name == Name) { pP = &P; break; }
-            if (!pP) { Err = std::format("no preview prop '{}' (the description's PreviewProps)", Name); return false; }
-            if (pP->m_Bone.empty()) { Out = pP->m_Offset; return true; }
+            const auto Slash = Name.find('/'); const std::string PropName = Name.substr(0, Slash), AnchorName = Slash == std::string::npos ? std::string() : Name.substr(Slash + 1);
+            for (const auto& P : pDesc->m_PreviewProps) if (P.m_Name == PropName) { pP = &P; break; }
+            if (!pP) { Err = std::format("no preview prop '{}' (the description's PreviewProps)", PropName); return false; }
+            xmath::fvec3 Local(0, 0, 0);       // (the prop's centre, or one of its anchors: Prop/Anchor)
+            if (!AnchorName.empty())
+            {
+                const xanim_package_desc::prop_anchor* pA = nullptr; for (const auto& A : pP->m_Anchors) if (A.m_Name == AnchorName) pA = &A;
+                if (!pA) { Err = std::format("prop '{}' has no anchor '{}'", PropName, AnchorName); return false; }
+                if (!pP->m_Bone.empty()) { Err = "anchors are on standing props (a primitive's prop stands in the scene)"; return false; }
+                Local = pA->m_Position;
+            }
+            if (pP->m_Bone.empty()) { Out = pP->m_Offset + Local; return true; }
             if (!PoseRig(Err)) return false;
             const int b = m_PT.m_Rig.Find(pP->m_Bone);
             if (b < 0) { Err = std::format("prop '{}': no bone '{}'", Name, pP->m_Bone); return false; }
@@ -6151,6 +6167,28 @@ namespace xanim_package_editor
             ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::SliderFloat("##ovprevw", &m_OvPrevWeight, 0.0f, 1.0f, "weight %.2f");
         }
 
+        // Smart Primitive v2 "edit anchor": the anchor moves relative to its prop and every IK key bound to it (all clips) follows - one undo
+        // step. Placing an instance never comes here (it is a preview transform, no data changes).
+        std::string AnchorMove(const std::string& PropName, const std::string& AnchorName, const xmath::fvec3& To) noexcept
+        {
+            int nKeys = 0; xmath::fvec3 From; std::string Why;
+            (void)DirectOneStep(std::format("Move anchor {}/{}", PropName, AnchorName), [&](desc& D) -> std::string
+            {
+                xanim_package_desc::preview_prop* pP = nullptr; for (auto& P : D.m_PreviewProps) if (P.m_Name == PropName) pP = &P;
+                if (!pP) return Why = std::format("no preview prop '{}'", PropName);
+                if (!pP->m_Bone.empty()) return Why = "anchors are on standing props";
+                xanim_package_desc::prop_anchor* pA = nullptr; for (auto& A : pP->m_Anchors) if (A.m_Name == AnchorName) pA = &A;
+                if (!pA) return Why = std::format("prop '{}' has no anchor '{}'", PropName, AnchorName);
+                From = pA->m_Position; pA->m_Position = To;
+                const auto Bound = PropName + "/" + AnchorName; const auto Delta = To - From;
+                for (auto& S : D.m_ImportSources) for (auto& C : S.m_Clips) for (auto& L : C.m_Layers) for (auto& K : L.m_IkKeys)
+                    if (K.m_Anchor == Bound) { K.m_PX += Delta.m_X; K.m_PY += Delta.m_Y; K.m_PZ += Delta.m_Z; ++nKeys; }
+                return {};
+            });
+            if (!Why.empty()) return "AnchorMove: " + Why;
+            return std::format("AnchorMove: {}/{} {:.3f} {:.3f} {:.3f} -> {:.3f} {:.3f} {:.3f}; {} bound IK key(s) followed (one undo step)", PropName, AnchorName, From.m_X, From.m_Y, From.m_Z, To.m_X, To.m_Y, To.m_Z, nKeys);
+        }
+
         // the description's PreviewProps as wire shapes over the bones (the shared shape the Ragdoll editor draws its bodies with)
         void DrawPreviewProps() noexcept
         {
@@ -6170,6 +6208,13 @@ namespace xanim_package_editor
                 }
                 const int K = P.m_Shape == xanim_package_desc::prop_shape::CAPSULE ? 0 : P.m_Shape == xanim_package_desc::prop_shape::SPHERE ? 1 : 2;
                 xskeleton_editor::EmitWireShape(m_Viewport.m_ExtraLines, K, P.m_Size.m_X, P.m_Size.m_Y, P.m_Size, At, Q, IM_COL32(255, 200, 60, 255));
+                for (const auto& A : P.m_Anchors)      // (named contact points: a small cyan cross)
+                {
+                    const auto Pa = At + Q * A.m_Position; const auto C = IM_COL32(80, 220, 255, 255);
+                    xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, Pa - xmath::fvec3(0.04f, 0, 0), Pa + xmath::fvec3(0.04f, 0, 0), C, C);
+                    xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, Pa - xmath::fvec3(0, 0.04f, 0), Pa + xmath::fvec3(0, 0.04f, 0), C, C);
+                    xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, Pa - xmath::fvec3(0, 0, 0.04f), Pa + xmath::fvec3(0, 0, 0.04f), C, C);
+                }
                 const bool bPivot = P.m_PivotOffset.Length() > 0 || P.m_PivotYaw != 0, bBox = P.m_BoxHalf.m_X > 0 && P.m_BoxHalf.m_Z > 0;
                 if (bPivot || bBox)     // (Smart Primitive: the pivot's arrow on the ground, the interaction box)
                 {
@@ -6609,7 +6654,7 @@ namespace xanim_package_editor
             {
                 if (bPos) return "IkKey: -Pos or -Prop, not both";
                 std::string E; if (!S.PropAt(Prop, T, P, E)) return "IkKey: " + E;
-                return S.IkKey(Eff, T, &P, PinState, Rot == "1" || Rot == "true", Del == "1" || Del == "true") + std::format(" (at prop '{}')", Prop);
+                return S.IkKey(Eff, T, &P, PinState, Rot == "1" || Rot == "true", Del == "1" || Del == "true", Prop.find('/') != std::string::npos ? Prop : std::string()) + std::format(" (at prop '{}'{})", Prop, Prop.find('/') != std::string::npos ? ", bound" : "");
             }
             return S.IkKey(Eff, T, bPos ? &P : nullptr, PinState, Rot == "1" || Rot == "true", Del == "1" || Del == "true");
         }
@@ -6747,6 +6792,13 @@ namespace xanim_package_editor
             return S.KimodoInbetweenAccept(i);
         }
         case kind::kimodo_inbetween_discard: return S.IbDiscard();
+        case kind::anchor_move:
+        {
+            std::string Prop, Anchor, Pos; xmath::fvec3 P;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Prop); xeditor::cmd_util::GetArg(m_Parser, m_hB, Anchor); xeditor::cmd_util::GetArg(m_Parser, m_hC, Pos);
+            if (xanimation::Scan(Pos.c_str(), "%f %f %f", &P.m_X, &P.m_Y, &P.m_Z) != 3) return "AnchorMove: -Pos \"x y z\"";
+            return S.AnchorMove(Prop, Anchor, P);
+        }
         case kind::primitive_approach:
         {
             std::string Prop, From, Secs, Seed = "1", Prompt = "A person walks over and stops."; float F[3]{}; float Sec = -1; int iSeed = 1;
