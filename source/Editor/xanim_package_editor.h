@@ -3305,7 +3305,7 @@ namespace xanim_package_editor
         int m_nPreservedFootFrames = 0;     // (C88 (2): the swing frames the last refine kept on the feet's own paths)
         bool m_bInbetween = false;      // (KimodoInbetween running SuggestRefine: no anchor at the scope's centre)
 
-        // Inbetweener v2 step 1 (D:\LIONant\xLION_Docs\areas\animation\plans\inbetweener_design_v2_2026-11-26.md): Kimodo regenerates the
+        // The Inbetweener, step 1: Kimodo regenerates the
         // motion BETWEEN two times of a Pose layer at fixed timing - Refine Motion over that span with both edges anchored (the poses there and
         // beyond) and the middle free; every key of the layer inside the span is kept (an anchor); outside the span nothing changes; ONE undo
         // step; the report gives the skate and acceleration before and after. Another seed: Ctrl+Z, then again with -Seed.
