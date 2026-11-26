@@ -1536,13 +1536,13 @@ namespace xanim_package_editor
                 ImGui::SameLine(); ImGui::BeginDisabled(Why != nullptr);
                 if (ImGui::SmallButton("Regenerate between keys")) m_TLView.m_Reply = xeditor::Run(m_Undo, std::format("KimodoInbetween -Layer {} -From {:.4f} -To {:.4f} -Seeds \"1 2 3\"", iL, A, B));
                 ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text(Why ? Why : "Kimodo regenerates the motion between the two keys around the playhead (both kept, nothing outside changes): three candidates, nothing written until you accept one. One undo step.");
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text("%s", Why ? Why : "Kimodo regenerates the motion between the two keys around the playhead (both kept, nothing outside changes): three candidates, nothing written until you accept one. One undo step.");
                 for (int i = 0; i < int(m_IbCands.size()); ++i)
                 {
                     if (m_IbCands[std::size_t(i)].m_After.empty()) continue;
                     ImGui::SameLine();
                     if (ImGui::SmallButton(std::format("Accept {}##ib{}", i, i).c_str())) m_TLView.m_Reply = xeditor::Run(m_Undo, std::format("KimodoInbetweenAccept -Candidate {}", i));
-                    if (ImGui::IsItemHovered()) xeditor::hint::Text(std::format("Writes candidate {} (seed {}): seams in {:.1f}, out {:.1f} deg/s per frame. One undo step.", i, m_IbCands[std::size_t(i)].m_Seed, m_IbCands[std::size_t(i)].m_SeamIn * 30.0f, m_IbCands[std::size_t(i)].m_SeamOut * 30.0f));
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text("Writes candidate %d (seed %d): seams in %.1f, out %.1f deg/s per frame. One undo step.", i, m_IbCands[std::size_t(i)].m_Seed, double(m_IbCands[std::size_t(i)].m_SeamIn * 30.0f), double(m_IbCands[std::size_t(i)].m_SeamOut * 30.0f));
                 }
             }
             tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height - ImGui::GetFrameHeightWithSpacing() });
