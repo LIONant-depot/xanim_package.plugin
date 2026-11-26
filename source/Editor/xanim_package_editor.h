@@ -281,6 +281,9 @@ namespace xanim_package_editor
         explicit anim_actions(session& S) noexcept : m_pS(&S) {}
 
         void        PlayPause() noexcept;       const char* WhyNoPlayPause() const noexcept;
+        void        RegenerateBetweenKeys() noexcept;   const char* WhyNoRegenerate() const noexcept;
+        void        Use1() noexcept; void Use2() noexcept; void Use3() noexcept;
+        const char* WhyNoUse1() const noexcept; const char* WhyNoUse2() const noexcept; const char* WhyNoUse3() const noexcept;
 
         XPROPERTY_DEF
         ( "AnimPackage", anim_actions
@@ -289,6 +292,14 @@ namespace xanim_package_editor
                 , member_help<"Plays or pauses the selected clip in the preview">
                 , ximgui::actions::member_keys<"P">
                 , member_dynamic_reason<+[](const anim_actions& A) noexcept -> const char* { return A.WhyNoPlayPause(); }> >
+            >
+        , obj_scope<"Timeline"
+            , obj_action<"RegenerateBetweenKeys", &anim_actions::RegenerateBetweenKeys
+                , member_help<"Kimodo regenerates the motion between the two keys around the playhead (both kept, nothing outside changes): three candidates, nothing written until you use one">
+                , member_dynamic_reason<+[](const anim_actions& A) noexcept -> const char* { return A.WhyNoRegenerate(); }> >
+            , obj_action<"UseCandidate1", &anim_actions::Use1, member_help<"Writes in-between candidate 1 (one undo step)">, member_dynamic_reason<+[](const anim_actions& A) noexcept -> const char* { return A.WhyNoUse1(); }> >
+            , obj_action<"UseCandidate2", &anim_actions::Use2, member_help<"Writes in-between candidate 2 (one undo step)">, member_dynamic_reason<+[](const anim_actions& A) noexcept -> const char* { return A.WhyNoUse2(); }> >
+            , obj_action<"UseCandidate3", &anim_actions::Use3, member_help<"Writes in-between candidate 3 (one undo step)">, member_dynamic_reason<+[](const anim_actions& A) noexcept -> const char* { return A.WhyNoUse3(); }> >
             >
         )
     };
@@ -430,7 +441,7 @@ namespace xanim_package_editor
         int                                             m_LoopsElapsed = 0;
         bool                                            m_bPlaying = false;
         anim_actions                                    m_EditorActions{ *this };       // this editor's own keys (Preview/...)
-        void RegisterActions(ximgui::actions::context& Ctx) noexcept override { Ctx.Scope(m_EditorActions, "Preview"); }
+        void RegisterActions(ximgui::actions::context& Ctx) noexcept override { Ctx.Scope(m_EditorActions, "Preview"); Ctx.Scope(m_EditorActions, "Timeline"); }
         int                                             m_iSpeedIndex = xgpu::tools::editors::g_DefaultSpeedIndex;
         xgpu::tools::imgui::timeline::state             m_Timeline;
 
@@ -3364,6 +3375,27 @@ namespace xanim_package_editor
         // KimodoInbetweenAccept writes one candidate as ONE undo step - refused when the document changed since (a stale candidate).
         struct inbetween_candidate { int m_Seed = 0; std::string m_Before, m_After, m_Report; float m_SeamIn = 0, m_SeamOut = 0, m_SeamRef = 0, m_RefIn = 0, m_RefOut = 0; };
         std::pair<double, double> m_IbBand { -1.0, -1.0 };
+        // the span 'Regenerate between keys' works on: the two keys around the playhead on the selected key's layer (else the top Pose layer); nullptr = ok, else why not
+        const char* IbSpan(int& iL, double& A, double& B) noexcept
+        {
+            auto* pOv = SelectedOv(); iL = -1; A = B = -1;
+            for (const auto& r : m_TLView.m_Selection) if (const auto It = m_TLRows.find(r.m_Row); It != m_TLRows.end() && It->second.m_iLayer >= 0) { iL = It->second.m_iLayer; break; }
+            if (pOv && iL < 0) for (int i = int(pOv->m_Layers.size()) - 1; i >= 0; --i) if (pOv->m_Layers[std::size_t(i)].m_Kind == xanim_package_desc::layer_kind::POSE) { iL = i; break; }
+            if (!pOv || iL < 0 || iL >= int(pOv->m_Layers.size())) return "No Pose layer: add one (LayerAdd -Kind Pose) and key the two poses to keep";
+            const double T = m_TimeSeconds;
+            for (const auto& k : pOv->m_Layers[std::size_t(iL)].m_Keys) { const double t = double(k.m_Tick) / double(xanim_package_layers::ToTick(1.0)); if (t <= T && t > A) A = t; if (t > T && (B < 0 || t < B)) B = t; }
+            if (A < 0 || B < 0) return "Put the playhead between two keys of the layer: the motion between them is regenerated";
+            if (B - A < 0.2) return "The two keys are closer than 0.2 s";
+            if (m_K.m_Job.m_bRunning) return "Kimodo is busy";
+            return nullptr;
+        }
+        const char* IbWhyNoUse(int i) const noexcept
+        {
+            if (i >= int(m_IbCands.size())) return "No such candidate: Regenerate between keys first";
+            if (m_Undo.GetUndoIndex() != m_IbUndoAt) return "These candidates are out of date: the clip changed after they were made. Regenerate between keys again.";
+            if (m_IbCands[std::size_t(i)].m_After.empty()) return "This candidate failed (see its report)";
+            return nullptr;
+        }
         std::vector<inbetween_candidate> m_IbCands; double m_IbFrom = 0, m_IbTo = 0; int m_IbLayer = -1; int m_IbUndoAt = -1; int m_IbNextSeed = 1;
         float SeamAt(double T) noexcept      // the worst bone's |second difference of rotation| at T, deg per frame^2 (x fps^2 = deg/s^2)
         {
@@ -6594,6 +6626,14 @@ namespace xanim_package_editor
 
     inline const char* anim_actions::WhyNoPlayPause() const noexcept { return m_pS->SelectedClip() ? nullptr : "select a clip first"; }
     inline void anim_actions::PlayPause() noexcept { m_pS->TogglePlay(); }
+    inline const char* anim_actions::WhyNoRegenerate() const noexcept { int iL; double A, B; return m_pS->IbSpan(iL, A, B); }
+    inline void anim_actions::RegenerateBetweenKeys() noexcept { int iL; double A, B; if (m_pS->IbSpan(iL, A, B)) return; const int s0 = m_pS->m_IbNextSeed; m_pS->m_IbNextSeed += 3; xeditor::Run(m_pS->m_Undo, std::format("KimodoInbetween -Layer {} -From {:.4f} -To {:.4f} -Seeds \"{} {} {}\"", iL, A, B, s0, s0 + 1, s0 + 2)); }
+    inline const char* anim_actions::WhyNoUse1() const noexcept { return m_pS->IbWhyNoUse(0); }
+    inline const char* anim_actions::WhyNoUse2() const noexcept { return m_pS->IbWhyNoUse(1); }
+    inline const char* anim_actions::WhyNoUse3() const noexcept { return m_pS->IbWhyNoUse(2); }
+    inline void anim_actions::Use1() noexcept { if (!m_pS->IbWhyNoUse(0)) xeditor::Run(m_pS->m_Undo, "KimodoInbetweenAccept -Candidate 0"); }
+    inline void anim_actions::Use2() noexcept { if (!m_pS->IbWhyNoUse(1)) xeditor::Run(m_pS->m_Undo, "KimodoInbetweenAccept -Candidate 1"); }
+    inline void anim_actions::Use3() noexcept { if (!m_pS->IbWhyNoUse(2)) xeditor::Run(m_pS->m_Undo, "KimodoInbetweenAccept -Candidate 2"); }
 
     inline const xeditor::auto_register_resource_editor g_Registration
     { xrsc::anim_package_type_guid_v
