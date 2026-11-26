@@ -6245,7 +6245,7 @@ namespace xanim_package_editor
         // Motion space preview (R165 phase 2, editor side): the selected loop blended with its SpaceWith loop at weight W, phase-aligned over a
         // cycle of the lerped length (BlendLoops' idea on the source frames, trimmed as the compile trims). ponytail: aligned at their first
         // frames, not by their first left footstep as the game does (the game's offset is BlendLoops'); add it when a preview looks out of step
-        float m_SpaceW = -1; std::vector<xmath::transform3> m_SpaceFrames; int m_SpaceN = 0;
+        float m_SpaceW = -1; std::vector<xmath::transform3> m_SpaceFrames; int m_SpaceN = 0, m_SpaceMover = 0;      // (m_SpaceMover: the bone that carries the travel - the hips, not always bone 0)
         std::string SpacePreview(float W) noexcept
         {
             auto* pOv = SelectedOv(); auto* pS = SelectedSource(); auto* pDesc = Desc();
@@ -6270,7 +6270,9 @@ namespace xanim_package_editor
                 for (int b = 0; b < nB; ++b) m_SpaceFrames[std::size_t(i) * nB + b] = xmath::transform3::fromBlend(Pa[std::size_t(b)], Pb[std::size_t(b)], W);
             }
             m_SpaceN = n; m_SpaceW = W;
-            auto Speed = [&](const std::vector<xmath::transform3>& Fr, int Fps, int nF, double T0, double Len) { const auto P0 = SamplePose(Fr, Fps, nF, nB, T0), P1 = SamplePose(Fr, Fps, nF, nB, T0 + Len); auto d = P1[0].m_Position - P0[0].m_Position; d.m_Y = 0; return d.Length() / float(Len); };
+            auto Travel = [&](const std::vector<xmath::transform3>& Fr, int Fps, int nF, double T0, double Len, int b) { const auto P0 = SamplePose(Fr, Fps, nF, nB, T0), P1 = SamplePose(Fr, Fps, nF, nB, T0 + Len); auto d = P1[std::size_t(b)].m_Position - P0[std::size_t(b)].m_Position; d.m_Y = 0; return d.Length(); };
+            m_SpaceMover = 0; { float Best = -1; for (int b = 0; b < std::min(nB, 4); ++b) if (const float t = Travel(m_SpaceFrames, 30, n, 0, double(n - 1) / 30.0, b); t > Best) { Best = t; m_SpaceMover = b; } }
+            auto Speed = [&](const std::vector<xmath::transform3>& Fr, int Fps, int nF, double T0, double Len) { return Travel(Fr, Fps, nF, T0, Len, m_SpaceMover) / float(Len); };
             const float Va = Speed(FA->m_Frames, FA->m_FPS, FA->m_nFrames, A0, LA), Vb = Speed(FB->m_Frames, FB->m_FPS, FB->m_nFrames, B0, LB), Vw = Speed(m_SpaceFrames, 30, n, 0, double(n - 1) / 30.0);
             return std::format("SpaceWeight: '{}' <-> '{}' at {:.2f}: a {:.2f} s cycle; root speed {:.2f} (the ends: {:.2f} and {:.2f} units/s)", pOv->m_Name, pOv->m_SpaceWith, W, double(n) / 30.0, Vw, Va, Vb);
         }
@@ -6284,7 +6286,7 @@ namespace xanim_package_editor
             for (int i = 0; i < nB; ++i)
             {
                 auto Local = xmath::transform3::fromBlend(m_SpaceFrames[std::size_t(A) * nB + i], m_SpaceFrames[std::size_t(B) * nB + i], T);
-                if (Bones[i].m_iParent < 0) Local.m_Position = xmath::fvec3(0, Local.m_Position.m_Y, 0);      // (in place: the root's travel is the speed the line prints)
+                if (i == m_SpaceMover) { const auto& F0 = m_SpaceFrames[std::size_t(i)].m_Position; Local.m_Position.m_X = F0.m_X; Local.m_Position.m_Z = F0.m_Z; }      // (in place: the travel is the speed the line prints)
                 const auto M = Local.toMatrix();
                 m_PoseWorlds[i] = Bones[i].m_iParent < 0 ? M : m_PoseWorlds[Bones[i].m_iParent] * M;
             }
