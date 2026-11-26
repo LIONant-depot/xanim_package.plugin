@@ -6090,6 +6090,18 @@ namespace xanim_package_editor
                 }
                 const int K = P.m_Shape == xanim_package_desc::prop_shape::CAPSULE ? 0 : P.m_Shape == xanim_package_desc::prop_shape::SPHERE ? 1 : 2;
                 xskeleton_editor::EmitWireShape(m_Viewport.m_ExtraLines, K, P.m_Size.m_X, P.m_Size.m_Y, P.m_Size, At, Q, IM_COL32(255, 200, 60, 255));
+                const bool bPivot = P.m_PivotOffset.Length() > 0 || P.m_PivotYaw != 0, bBox = P.m_BoxHalf.m_X > 0 && P.m_BoxHalf.m_Z > 0;
+                if (bPivot || bBox)     // (Smart Primitive: the pivot's arrow on the ground, the interaction box)
+                {
+                    const auto Qp = (Q * xmath::fquat(xmath::fvec3(0, 1, 0), xmath::radian(P.m_PivotYaw * 0.017453293f))).NormalizeSafeCopy();
+                    xmath::fvec3 Pv = At + Q * P.m_PivotOffset; Pv.m_Y = 0;
+                    const auto Fw = Qp * xmath::fvec3(0, 0, 0.4f), Sd = Qp * xmath::fvec3(0.1f, 0, 0);
+                    const auto C = IM_COL32(120, 255, 160, 255);
+                    xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, Pv, Pv + Fw, C, C);
+                    xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, Pv + Fw, Pv + Fw * 0.7f + Sd, C, C);
+                    xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, Pv + Fw, Pv + Fw * 0.7f - Sd, C, C);
+                    if (bBox) xskeleton_editor::EmitWireShape(m_Viewport.m_ExtraLines, 2, 0, 0, P.m_BoxHalf, Pv + Qp * P.m_BoxCenter, Qp, IM_COL32(120, 255, 160, 160));
+                }
             }
             for (std::size_t i = 1; i < m_Flight.size(); ++i) xskeleton_editor::EmitSegment(m_Viewport.m_ExtraLines, m_Flight[i - 1], m_Flight[i], IM_COL32(90, 230, 255, 255), IM_COL32(90, 230, 255, 255));     // the last BallFlight
         }

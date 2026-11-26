@@ -355,6 +355,11 @@ namespace xanim_package_desc
         xmath::fvec3    m_Size    = xmath::fvec3(0.11f, 0.11f, 0.11f);    // sphere: x the radius; box: half extents; capsule: x the radius, y the half length
         std::string     m_Bone    = {};
         xmath::fvec3    m_Offset  = xmath::fvec3(0, 0.11f, 0.3f);        // from the bone (in its frame), or from the model origin
+        // Smart Primitive (D:/LIONant/xLION_Docs design): the pivot the interaction is authored against, and the box the approach may start from
+        xmath::fvec3    m_PivotOffset = xmath::fvec3(0, 0, 0);          // from the prop, in its frame
+        float           m_PivotYaw    = 0;                              // degrees about up: the way the character faces at the pivot
+        xmath::fvec3    m_BoxCenter   = xmath::fvec3(0, 0, 0);          // in the pivot's frame
+        xmath::fvec3    m_BoxHalf     = xmath::fvec3(0, 0, 0);          // half extents; zero = no interaction box
 
         XPROPERTY_DEF
         ( "Prop", preview_prop
@@ -363,6 +368,10 @@ namespace xanim_package_desc
         , obj_member<"Size",   &preview_prop::m_Size, member_help<"Sphere: X is the radius; Box: half extents; Capsule: X the radius, Y half the length (model units)"> >
         , obj_member<"Bone",   &preview_prop::m_Bone, member_help<"The bone that holds it (a hand, a foot); empty: it stands in the scene"> >
         , obj_member<"Offset", &preview_prop::m_Offset, member_help<"Where it is from the bone, in the bone's frame (empty Bone: from the model origin)"> >
+        , obj_member<"PivotOffset", &preview_prop::m_PivotOffset, member_help<"Smart Primitive: the pivot the interaction is authored against, from the prop (its frame)"> >
+        , obj_member<"PivotYaw", &preview_prop::m_PivotYaw, member_help<"Smart Primitive: degrees about up, the way the character faces at the pivot (the arrow)"> >
+        , obj_member<"BoxCenter", &preview_prop::m_BoxCenter, member_help<"Smart Primitive: the interaction box's centre in the pivot's frame: where an approach may start"> >
+        , obj_member<"BoxHalf", &preview_prop::m_BoxHalf, member_help<"Smart Primitive: the interaction box's half extents; zero: no box"> >
         )
     };
     XPROPERTY_REG(preview_prop)
