@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, anchor_move, interaction_validate, interaction_accept, interaction_list, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, anchor_move, interaction_validate, interaction_accept, interaction_list, space_weight, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -86,6 +86,9 @@ namespace xanim_package_editor
                 m_hA = m_Parser.addOption("Interaction", "Its name (default Sit)", false, 1);
                 m_hB = m_Parser.addOption("Prop", "The standing preview prop with the pivot", true, 1);
                 m_hC = m_Parser.addOption("From", "\"x z yaw\": the approach's start in the pivot's frame", true, 1);
+                break;
+            case kind::space_weight:
+                m_hA = m_Parser.addOption("Weight", "0..1: the selected loop (0) to its SpaceWith loop (1); -1: off", true, 1);
                 break;
             case kind::interaction_validate:
                 m_hA = m_Parser.addOption("Prop", "The standing preview prop with the pivot", true, 1);
@@ -335,7 +338,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach, m_AnchorMove, m_InteractionValidate, m_InteractionAccept, m_InteractionList;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach, m_AnchorMove, m_InteractionValidate, m_InteractionAccept, m_InteractionList, m_SpaceWeight;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -490,6 +493,7 @@ namespace xanim_package_editor
             , m_InteractionValidate(m_Undo, *this, playback_cmd::kind::interaction_validate, "InteractionValidate", "Smart Primitive gate: the approach on preview, placed at its start, against the selected clip across the join: alignment, continuity, the feet, clearance through the prop. Usage: InteractionValidate -Prop Chair -From \"x z yaw\"")
             , m_InteractionAccept(m_Undo, *this, playback_cmd::kind::interaction_accept, "InteractionAccept", "Smart Primitive: publishes the approach on preview as an entry of the interaction (the selected clip) - only if it passes the gate now; one undo step. Usage: InteractionAccept [-Interaction Sit] -Prop Chair -From \"x z yaw\"")
             , m_InteractionList(m_Undo, *this, playback_cmd::kind::interaction_list, "InteractionList", "Smart Primitive: the interactions and their accepted entries (and which need revalidation)")
+            , m_SpaceWeight(m_Undo, *this, playback_cmd::kind::space_weight, "SpaceWeight", "Motion space preview: the selected loop blended with its SpaceWith loop at a weight (the cycle, the root speed); nothing written. Usage: SpaceWeight -Weight 0.5 (-1: off)")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -6238,12 +6242,61 @@ namespace xanim_package_editor
         // The 3D view and the transport bar
         //----------------------------------------------------------------------------------------
 
+        // Motion space preview (R165 phase 2, editor side): the selected loop blended with its SpaceWith loop at weight W, phase-aligned over a
+        // cycle of the lerped length (BlendLoops' idea on the source frames, trimmed as the compile trims). ponytail: aligned at their first
+        // frames, not by their first left footstep as the game does (the game's offset is BlendLoops'); add it when a preview looks out of step
+        float m_SpaceW = -1; std::vector<xmath::transform3> m_SpaceFrames; int m_SpaceN = 0;
+        std::string SpacePreview(float W) noexcept
+        {
+            auto* pOv = SelectedOv(); auto* pS = SelectedSource(); auto* pDesc = Desc();
+            if (!pOv || !pS || !pDesc) return "SpaceWeight: select a clip first";
+            if (W < 0) { m_SpaceW = -1; m_SpaceFrames.clear(); return "SpaceWeight: off (the clip plays as it is)"; }
+            if (pOv->m_SpaceWith.empty()) return std::format("SpaceWeight: clip '{}' has no motion space (set its SpaceWith to another loop)", pOv->m_Name);
+            const xanim_package_desc::import_source* pSB = nullptr; const xanim_package_desc::clip* pB = nullptr;
+            for (const auto& S : pDesc->m_ImportSources) for (const auto& C : S.m_Clips) if (!C.m_bDelete && (C.m_Name.empty() ? C.m_OriginalName : C.m_Name) == pOv->m_SpaceWith) { pSB = &S; pB = &C; }
+            if (!pB) return std::format("SpaceWeight: no clip named '{}' in this package", pOv->m_SpaceWith);
+            const auto* FA = FindLayerSource(pS->key(), pOv->m_OriginalName); const auto* FB = FindLayerSource(pSB->key(), pB->m_OriginalName);
+            if (!FA || !FB || FA->m_FPS <= 0 || FB->m_FPS <= 0) return "SpaceWeight: the source frames are not there yet (compile the package once)";
+            const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size());
+            auto Span = [](const xanim_package_desc::clip& C, const xanim_package_layers::source_frames& F) { const int a = C.m_TrimStartFrame < 0 ? 0 : std::min(C.m_TrimStartFrame, F.m_nFrames - 1), b = C.m_TrimEndFrame < 0 ? F.m_nFrames - 1 : std::clamp(C.m_TrimEndFrame, a, F.m_nFrames - 1); return std::pair{ double(a) / F.m_FPS, double(std::max(1, b - a)) / F.m_FPS }; };
+            const auto [A0, LA] = Span(*pOv, *FA); const auto [B0, LB] = Span(*pB, *FB);
+            W = std::clamp(W, 0.0f, 1.0f);
+            const double L = LA + (LB - LA) * W; const int n = std::max(2, int(std::lround(L * 30.0)));
+            m_SpaceFrames.assign(std::size_t(n) * nB, {});
+            for (int i = 0; i < n; ++i)
+            {
+                const double u = double(i) / double(n);
+                const auto Pa = SamplePose(FA->m_Frames, FA->m_FPS, FA->m_nFrames, nB, A0 + u * LA), Pb = SamplePose(FB->m_Frames, FB->m_FPS, FB->m_nFrames, nB, B0 + u * LB);
+                for (int b = 0; b < nB; ++b) m_SpaceFrames[std::size_t(i) * nB + b] = xmath::transform3::fromBlend(Pa[std::size_t(b)], Pb[std::size_t(b)], W);
+            }
+            m_SpaceN = n; m_SpaceW = W;
+            auto Speed = [&](const std::vector<xmath::transform3>& Fr, int Fps, int nF, double T0, double Len) { const auto P0 = SamplePose(Fr, Fps, nF, nB, T0), P1 = SamplePose(Fr, Fps, nF, nB, T0 + Len); auto d = P1[0].m_Position - P0[0].m_Position; d.m_Y = 0; return d.Length() / float(Len); };
+            const float Va = Speed(FA->m_Frames, FA->m_FPS, FA->m_nFrames, A0, LA), Vb = Speed(FB->m_Frames, FB->m_FPS, FB->m_nFrames, B0, LB), Vw = Speed(m_SpaceFrames, 30, n, 0, double(n - 1) / 30.0);
+            return std::format("SpaceWeight: '{}' <-> '{}' at {:.2f}: a {:.2f} s cycle; root speed {:.2f} (the ends: {:.2f} and {:.2f} units/s)", pOv->m_Name, pOv->m_SpaceWith, W, double(n) / 30.0, Vw, Va, Vb);
+        }
+        void EvaluateSpace(const xskeleton::skeleton& Skeleton) noexcept
+        {
+            const auto Bones = Skeleton.getBones(); const int nB = int(Bones.size());
+            if (int(m_SpaceFrames.size()) != m_SpaceN * nB || m_SpaceN <= 0) { m_PoseWorlds = m_RestWorlds; return; }
+            const float FT = std::fmod(std::max(0.0f, m_TimeSeconds) * 30.0f, float(m_SpaceN));
+            const int A = int(FT) % m_SpaceN, B = (A + 1) % m_SpaceN; const float T = FT - std::floor(FT);
+            m_PoseWorlds.resize(nB);
+            for (int i = 0; i < nB; ++i)
+            {
+                auto Local = xmath::transform3::fromBlend(m_SpaceFrames[std::size_t(A) * nB + i], m_SpaceFrames[std::size_t(B) * nB + i], T);
+                if (Bones[i].m_iParent < 0) Local.m_Position = xmath::fvec3(0, Local.m_Position.m_Y, 0);      // (in place: the root's travel is the speed the line prints)
+                const auto M = Local.toMatrix();
+                m_PoseWorlds[i] = Bones[i].m_iParent < 0 ? M : m_PoseWorlds[Bones[i].m_iParent] * M;
+            }
+        }
+
         // The pose to show: the selected clip at the current time when there is one (with its root motion), the rest pose otherwise
         void EvaluatePose(const xskeleton::skeleton& Skeleton) noexcept
         {
             auto* pPackage = Package();
             UpdateLiveLayers();
-            if (LiveLayers()) EvaluateLiveLayers(Skeleton);        // the selected clip's layers composed now (what the compile will store)
+            if (m_SpaceW >= 0 && !m_SpaceFrames.empty()) EvaluateSpace(Skeleton);      // (a motion space previewed at a weight)
+            else if (LiveLayers()) EvaluateLiveLayers(Skeleton);        // the selected clip's layers composed now (what the compile will store)
             else if (auto* pClip = SelectedClip())
             {
                 xgpu::tools::editors::ComputeAnimatedBoneWorlds(Skeleton, *pPackage, m_iSelectedClip, m_TimeSeconds, m_PoseWorlds);
@@ -6944,6 +6997,7 @@ namespace xanim_package_editor
         }
         case kind::kimodo_inbetween_discard: return S.IbDiscard();
         case kind::interaction_list: return S.InteractionList();
+        case kind::space_weight: { std::string V; xeditor::cmd_util::GetArg(m_Parser, m_hA, V); float w = -1; std::from_chars(V.data(), V.data() + V.size(), w); return S.SpacePreview(w); }
         case kind::interaction_accept:
         {
             std::string Name = "Sit", Prop, From; float F[3]{};
