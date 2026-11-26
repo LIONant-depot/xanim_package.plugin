@@ -3376,6 +3376,7 @@ namespace xanim_package_editor
         // a full-body constraint, kept exactly (never rewritten), and the blend meets it. The Kimodo window is stored as a take
         // (Cache\KimodoTakes\<package>\) and listed on the layer (provenance).
         int m_nPreservedFootFrames = 0;     // (C88 (2): the swing frames the last refine kept on the feet's own paths)
+        int m_nPinnedIkFrames = 0; std::string m_PinnedIkNote;      // (superset item 2: pinned IK intervals sent to Kimodo; effectors Kimodo has no handle for)
         bool m_bInbetween = false;      // (KimodoInbetween running SuggestRefine: no anchor at the scope's centre)
 
         // The Inbetweener, step 1: Kimodo regenerates the
@@ -3570,6 +3571,29 @@ namespace xanim_package_editor
                 const auto Po = Own.size() == Accepted.size() ? SamplePose(Own, FPS, nF, nB, Key + double(i - K) / 30.0) : std::vector<xmath::transform3>(Win.begin() + std::size_t(i) * nB, Win.begin() + std::size_t(i + 1) * nB);
                 std::vector<xmath::fquat> Rw; World(Po.data(), P, &Rw); for (int s = 0; s < 2; ++s) { FootPos[s][i] = P[Feet[s]]; FootRot[s][i] = Rw[Feet[s]]; }
             }
+            // superset item 2, INTERVAL constraints on any handle: an IK key with Pinned holds its effector until that effector's next key;
+            // inside the scope those frames go to Kimodo as an end-effector constraint (hands, feet, hips: Kimodo's handles), so the body
+            // is generated reaching for it; any other effector (head, ...) is held by the IK compose after, and the report says so
+            struct pin_span { const char* m_Kimodo; int m_F0, m_F1; };
+            std::vector<pin_span> PinSpans; m_PinnedIkNote.clear();
+            {
+                const std::pair<int, const char*> Ee[] = { { Feet[0], "LeftFoot" }, { Feet[1], "RightFoot" }, { SlotBone(xanimation::bone_slot::HAND, xanimation::bone_side::LEFT), "LeftHand" }
+                                                         , { SlotBone(xanimation::bone_slot::HAND, xanimation::bone_side::RIGHT), "RightHand" }, { iHips, "Hips" } };
+                auto ToF = [&](std::int64_t Tick) { return K + int(std::lround((double(Tick) / double(xanim_package_layers::ToTick(1.0)) - Key) * 30.0)); };
+                for (const auto& L : pOv->m_Layers)
+                    for (const auto& k : L.m_IkKeys)
+                    {
+                        if (!k.m_bPinned) continue;
+                        std::int64_t Next = std::numeric_limits<std::int64_t>::max();
+                        for (const auto& k2 : L.m_IkKeys) if (k2.m_Effector == k.m_Effector && k2.m_Tick > k.m_Tick) Next = std::min(Next, k2.m_Tick);
+                        const int f0 = std::max(A, ToF(k.m_Tick)), f1 = std::min(B, Next == std::numeric_limits<std::int64_t>::max() ? B : ToF(Next) - 1);
+                        if (f0 > f1) continue;
+                        const auto It = std::find(Names.begin(), Names.end(), k.m_Effector); const int b = It == Names.end() ? -1 : int(It - Names.begin());
+                        const char* pK = nullptr; for (const auto& [eb, en] : Ee) if (eb >= 0 && eb == b) pK = en;
+                        if (pK) PinSpans.push_back({ pK, f0, f1 });
+                        else if (m_PinnedIkNote.find(k.m_Effector) == std::string::npos) m_PinnedIkNote += (m_PinnedIkNote.empty() ? "" : ", ") + k.m_Effector;
+                    }
+            }
             auto Skate = [&](const std::vector<xmath::fvec3>& Pos, std::vector<std::uint8_t>* pMark) -> float     // mean skate (hip heights/s) of the contacts inside the refined frames
             {
                 std::vector<xmath::fvec3> N(Pos.size()); for (std::size_t i = 0; i < Pos.size(); ++i) N[i] = Pos[i] * (1.0f / HipH);
@@ -3602,7 +3626,7 @@ namespace xanim_package_editor
                 for (int c0 = 0;; c0 += Stride) { const int s = std::min(c0, W - MaxW); Chunks.push_back({ s, s + MaxW }); if (s + MaxW >= W) break; }
             }
             static int s_Count = 0;
-            m_nPreservedFootFrames = 0;
+            m_nPreservedFootFrames = 0; m_nPinnedIkFrames = 0;
             std::filesystem::create_directories(m_Document.m_TempDir);
             const auto t1 = clock::now();
             std::vector<std::vector<xmath::transform3>> Gen(Chunks.size());
@@ -3648,6 +3672,14 @@ namespace xanim_package_editor
                         else if (bKeep) { Set.m_Frames.push_back(f - c0); Set.m_Poses.push_back(SPo[f - c0]); Set.m_Smooth.push_back(Root2(f - c0)); ++m_nPreservedFootFrames; }
                     }
                     nFootFrames += int(Set.m_Frames.size());
+                    if (!Set.m_Frames.empty()) Sets.push_back(std::move(Set));
+                }
+                for (const auto& Ps : PinSpans)      // (the pinned IK intervals in this window, at most ~16 frames each: Kimodo's guidance)
+                {
+                    kimodo::constraint_set Set{ "end-effector", {}, {}, {} }; Set.m_Joints = { Ps.m_Kimodo };
+                    const int p0 = std::max(Ps.m_F0, c0), p1 = std::min(Ps.m_F1, c1 - 1), St = std::max(1, (p1 - p0) / 16 + 1);
+                    for (int f = p0; f <= p1; f += St) if (f != K) { Set.m_Frames.push_back(f - c0); Set.m_Poses.push_back(SP[f - c0]); Set.m_Smooth.push_back(Root2(f - c0)); }
+                    m_nPinnedIkFrames += int(Set.m_Frames.size());
                     if (!Set.m_Frames.empty()) Sets.push_back(std::move(Set));
                 }
                 kimodo::constraint_set Path{ "root2d", {}, {}, {} };
@@ -3889,8 +3921,9 @@ namespace xanim_package_editor
             }
             const float SkateAfter = 0.5f * (Skate(AfterFeet[0], nullptr) + Skate(AfterFeet[1], nullptr));
             Report = std::format("refine scope -{:.2f} .. +{:.2f} s ({} frames as {} Kimodo window(s) of up to {} frames{}, 25 steps, {} anchors): {} frames keyed ({} keys), feet pinned on {} contact frames (pins within {:.3f} cm), {} swing frames kept on their own paths; "
-                                 "skate in contact {:.4f} -> {:.4f} hip heights/s; the key kept within {:.4f} deg; balance: the hips shifted on {} still frames (max {:.1f} cm); time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms"
-                , double(K - A) / 30.0, double(B - K) / 30.0, W, Chunks.size(), MaxW, Chunks.size() > 1 ? ", stitched" : "", Anchors.size(), nFrames, nKeys, nFootFrames - m_nPreservedFootFrames, PinMax * 100.0f, m_nPreservedFootFrames, SkateBefore, SkateAfter, KeyMiss, nBalanced, MaxShift * 100.0f, ms(t0, t1), ms(t1, t2), ms(t2, t3));
+                                 "skate in contact {:.4f} -> {:.4f} hip heights/s; the key kept within {:.4f} deg; balance: the hips shifted on {} still frames (max {:.1f} cm); time: request {:.0f} ms, Kimodo {:.0f} ms, back + keys {:.0f} ms{}"
+                , double(K - A) / 30.0, double(B - K) / 30.0, W, Chunks.size(), MaxW, Chunks.size() > 1 ? ", stitched" : "", Anchors.size(), nFrames, nKeys, nFootFrames - m_nPreservedFootFrames, PinMax * 100.0f, m_nPreservedFootFrames, SkateBefore, SkateAfter, KeyMiss, nBalanced, MaxShift * 100.0f, ms(t0, t1), ms(t1, t2), ms(t2, t3)
+                , (m_nPinnedIkFrames ? std::format("; pinned IK intervals: {} frames sent to Kimodo", m_nPinnedIkFrames) : std::string()) + (m_PinnedIkNote.empty() ? std::string() : "; pinned " + m_PinnedIkNote + " held by IK after (Kimodo's handles are the hands, feet and hips)"));
             return true;
         }
 

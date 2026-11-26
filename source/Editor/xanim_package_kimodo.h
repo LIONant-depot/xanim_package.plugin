@@ -261,6 +261,7 @@ namespace xanim_package_editor::kimodo
         std::vector<soma_pose>              m_Poses;        // one per frame (not for root2d)
         std::vector<std::array<float, 2>>   m_Smooth;       // the root's (x, z) per frame
         std::vector<std::array<float, 2>>   m_Heading;      // root2d: the body's heading per frame as (cos, sin) (empty: free)
+        std::vector<std::string>            m_Joints;       // "end-effector": Kimodo's base names (LeftFoot, RightFoot, LeftHand, RightHand, Hips)
     };
 
     inline bool WriteConstraints(const std::wstring& Path, const std::vector<constraint_set>& Sets, std::string& Error)
@@ -288,6 +289,7 @@ namespace xanim_package_editor::kimodo
                 for (std::size_t i = 0; i < C.m_Poses.size(); ++i) F << (i ? ", " : "") << "[" << C.m_Poses[i].m_Root[0] << ", " << C.m_Poses[i].m_Root[1] << ", " << C.m_Poses[i].m_Root[2] << "]";
                 F << "]";
             }
+            if (!C.m_Joints.empty()) { F << ", \"joint_names\": ["; for (std::size_t j = 0; j < C.m_Joints.size(); ++j) F << (j ? ", " : "") << "\"" << C.m_Joints[j] << "\""; F << "]"; }
             F << ", \"smooth_root_2d\": [";
             for (std::size_t i = 0; i < C.m_Smooth.size(); ++i) F << (i ? ", " : "") << "[" << C.m_Smooth[i][0] << ", " << C.m_Smooth[i][1] << "]";
             F << "]";
