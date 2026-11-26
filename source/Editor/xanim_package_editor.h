@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -97,6 +97,10 @@ namespace xanim_package_editor
                 m_hB = m_Parser.addOption("From",  "Seconds: the span's start (a key, kept)", true, 1);
                 m_hC = m_Parser.addOption("To",    "Seconds: the span's end (a key, kept)", true, 1);
                 m_hD = m_Parser.addOption("Seed",  "Seed (default 1): another seed, another in-between", false, 1);
+                m_hE = m_Parser.addOption("Seeds", "\"1 2 3\": CANDIDATES, nothing written - each with its seams; then KimodoInbetweenAccept -Candidate i", false, 1);
+                break;
+            case kind::kimodo_inbetween_accept:
+                m_hA = m_Parser.addOption("Candidate", "Which candidate (default 0)", false, 1);
                 break;
             case kind::kimodo_settings:
                 m_hA = m_Parser.addOption("Steps",    "Denoising steps (more: slower, can be cleaner; 0 = Kimodo's default)", false, 1);
@@ -296,7 +300,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -444,6 +448,7 @@ namespace xanim_package_editor
             , m_KimodoDiscard (m_Undo, *this, playback_cmd::kind::kimodo_discard,  "KimodoDiscard",  "Drops the previewed Kimodo motion (nothing was saved), or stops a generation or video capture still running (the Cancel button). Usage: KimodoDiscard")
             , m_KimodoSettings(m_Undo, *this, playback_cmd::kind::kimodo_settings, "KimodoSettings", "Kimodo's advanced generation settings for every generation from this editor (not saved, not undo steps): denoising steps, guidance (text, constraint), post-processing. 0 = Kimodo's default. Usage: KimodoSettings [-Steps 50] [-Guidance \"2 2\"] [-NoPost 0|1] (no option: shows them)")
             , m_KimodoInbetween(m_Undo, *this, playback_cmd::kind::kimodo_inbetween, "KimodoInbetween", "Regenerates the motion BETWEEN two times of a Pose layer with Kimodo at fixed timing: both edges kept, the layer's keys inside kept, nothing outside the span changes; one undo step; a report of skate and acceleration before and after. Another seed: Ctrl+Z and again. Usage: KimodoInbetween -Layer n -From s -To s [-Seed 1]")
+            , m_KimodoInbetweenAccept(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_accept, "KimodoInbetweenAccept", "Writes one candidate of KimodoInbetween -Seeds as one undo step; refused when the clip changed since (stale). Usage: KimodoInbetweenAccept [-Candidate 0]")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -3309,6 +3314,60 @@ namespace xanim_package_editor
         // motion BETWEEN two times of a Pose layer at fixed timing - Refine Motion over that span with both edges anchored (the poses there and
         // beyond) and the middle free; every key of the layer inside the span is kept (an anchor); outside the span nothing changes; ONE undo
         // step; the report gives the skate and acceleration before and after. Another seed: Ctrl+Z, then again with -Seed.
+        // Inbetweener step 2: CANDIDATES before anything is written. Each seed is generated inside a transaction that is rolled back; the
+        // candidate keeps the document's before/after snapshots, its report and its SEAM at both edges (the worst bone's change of angular
+        // speed across the edge frame on the composed clip, deg/s per frame, next to the same measure inside the span before the edit).
+        // KimodoInbetweenAccept writes one candidate as ONE undo step - refused when the document changed since (a stale candidate).
+        struct inbetween_candidate { int m_Seed = 0; std::string m_Before, m_After, m_Report; float m_SeamIn = 0, m_SeamOut = 0, m_SeamRef = 0; };
+        std::vector<inbetween_candidate> m_IbCands; double m_IbFrom = 0, m_IbTo = 0; int m_IbLayer = -1;
+        float SeamAt(double T) noexcept      // the worst bone's |second difference of rotation| at T, deg per frame^2 (x fps^2 = deg/s^2)
+        {
+            const std::vector<xmath::transform3>* pF = nullptr; int Fps = 30, n = 0; std::string E;
+            if (!SuggestClipFrames(pF, Fps, n, E) || n < 3) return -1;
+            auto* pDesc = Desc(); const int nB = pDesc ? int(pDesc->m_ResolvedSkeletonBones.m_Bones.size()) : 0; if (nB <= 0) return -1;
+            const int f = std::clamp(int(std::lround(T * Fps)), 1, n - 2); float Worst = 0;
+            for (int b = 0; b < nB; ++b)
+            {
+                const auto& q0 = (*pF)[std::size_t(f - 1) * nB + b].m_Rotation; const auto& q1 = (*pF)[std::size_t(f) * nB + b].m_Rotation; const auto& q2 = (*pF)[std::size_t(f + 1) * nB + b].m_Rotation;
+                Worst = std::max(Worst, std::fabs(AngleDeg(q1, q2) - AngleDeg(q0, q1)));
+            }
+            return Worst;
+        }
+        std::string KimodoInbetweenCandidates(int iLayer, double From, double To, const std::vector<int>& Seeds) noexcept
+        {
+            auto* pDesc = Desc(); if (!pDesc) return "KimodoInbetween: nothing loaded";
+            xproperty::settings::context C;
+            auto Snap = [&] { return xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C); };
+            const auto Before = Snap();
+            const float Ref = std::max(SeamAt(0.5 * (From + To)), 0.0f);
+            m_IbCands.clear(); m_IbFrom = From; m_IbTo = To; m_IbLayer = iLayer;
+            std::string Out = std::format("KimodoInbetween: {} candidate(s) for {:.2f}-{:.2f} s (nothing written; KimodoInbetweenAccept -Candidate i). Seam = the worst bone's jump in angular speed at the edge (deg/s per frame); inside the span before: {:.2f}\n", Seeds.size(), From, To, Ref * 30.0f);
+            for (const int Seed : Seeds)
+            {
+                const int UndoAt = m_Undo.GetUndoIndex();
+                const auto R = KimodoInbetween(iLayer, From, To, Seed);
+                inbetween_candidate Cd; Cd.m_Seed = Seed; Cd.m_Before = Before; Cd.m_Report = R; Cd.m_SeamRef = Ref;
+                if (R.starts_with("KimodoInbetween: done")) { Cd.m_After = Snap(); Cd.m_SeamIn = SeamAt(From); Cd.m_SeamOut = SeamAt(To); }
+                while (m_Undo.GetUndoIndex() > UndoAt) m_Undo.Undo();      // (rolled back: a candidate is never written)
+                xproperty::ui::undo::ApplySnapshotFromString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), Before, C);
+                const bool bOk = !Cd.m_After.empty();
+                Out += std::format("  candidate {}: seed {} - {}{}\n", m_IbCands.size(), Seed, bOk ? std::format("seam in {:.2f}, out {:.2f}", Cd.m_SeamIn * 30.0f, Cd.m_SeamOut * 30.0f) : "FAILED: ", bOk ? "" : R);
+                m_IbCands.push_back(std::move(Cd));
+            }
+            return Out;
+        }
+        std::string KimodoInbetweenAccept(int i) noexcept
+        {
+            if (i < 0 || i >= int(m_IbCands.size()) || m_IbCands[std::size_t(i)].m_After.empty()) return "KimodoInbetweenAccept: no such candidate (KimodoInbetween -Seeds first)";
+            xproperty::settings::context C;
+            const auto Now = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C);
+            const auto& Cd = m_IbCands[std::size_t(i)];
+            if (Now != Cd.m_Before) return "KimodoInbetweenAccept: the candidate is stale - the clip changed since it was made; run KimodoInbetween again";
+            const auto R = m_Undo.Execute(std::format("SnapshotEdit -Label {} -Before {} -After {}", xeditor::Quote(std::format("In-between {:.2f}-{:.2f} s (seed {})", m_IbFrom, m_IbTo, Cd.m_Seed)), xeditor::Quote(Cd.m_Before), xeditor::Quote(Cd.m_After)));
+            m_IbCands.clear();
+            return std::format("KimodoInbetweenAccept: candidate {} written (one undo step){}", i, R.empty() ? "" : " - " + R);
+        }
+
         std::string KimodoInbetween(int iLayer, double From, double To, int Seed) noexcept
         {
             auto* pOv = SelectedOv(); auto* pDesc = Desc();
@@ -6434,7 +6493,18 @@ namespace xanim_package_editor
             int iL = -1, iSeed = 1; float f0 = 0, f1 = 0;
             std::from_chars(L.data(), L.data() + L.size(), iL); std::from_chars(Sd.data(), Sd.data() + Sd.size(), iSeed);
             if (xanimation::Scan(F.c_str(), "%f", &f0) != 1 || xanimation::Scan(T.c_str(), "%f", &f1) != 1 || f1 <= f0) return "KimodoInbetween: -From and -To want seconds, From < To";
+            if (std::string Ss; xeditor::cmd_util::GetArg(m_Parser, m_hE, Ss))
+            {
+                std::vector<int> Seeds; std::istringstream In(Ss); int v = 0; while (In >> v) Seeds.push_back(v);
+                if (Seeds.empty() || Seeds.size() > 8) return "KimodoInbetween: -Seeds wants 1 to 8 numbers";
+                return S.KimodoInbetweenCandidates(iL, f0, f1, Seeds);
+            }
             return S.KimodoInbetween(iL, f0, f1, iSeed);
+        }
+        case kind::kimodo_inbetween_accept:
+        {
+            std::string V = "0"; xeditor::cmd_util::GetArg(m_Parser, m_hA, V); int i = 0; std::from_chars(V.data(), V.data() + V.size(), i);
+            return S.KimodoInbetweenAccept(i);
         }
         case kind::kimodo_settings:
         {
