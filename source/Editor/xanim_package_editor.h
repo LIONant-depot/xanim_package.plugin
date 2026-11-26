@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, anchor_move, interaction_validate, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, anchor_move, interaction_validate, interaction_accept, interaction_list, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -82,6 +82,11 @@ namespace xanim_package_editor
             case kind::select_clip: m_hA = m_Parser.addOption("Source", "Import source index",       true, 1); m_hB = m_Parser.addOption("Clip", "Clip index in that source", true, 1); break;
             case kind::seek:        m_hA = m_Parser.addOption("Time",   "Seconds from the clip start", true, 1); break;
             case kind::set_speed:   m_hA = m_Parser.addOption("Index",  "Playback speed step (0.25x .. 3x)", true, 1); break;
+            case kind::interaction_accept:
+                m_hA = m_Parser.addOption("Interaction", "Its name (default Sit)", false, 1);
+                m_hB = m_Parser.addOption("Prop", "The standing preview prop with the pivot", true, 1);
+                m_hC = m_Parser.addOption("From", "\"x z yaw\": the approach's start in the pivot's frame", true, 1);
+                break;
             case kind::interaction_validate:
                 m_hA = m_Parser.addOption("Prop", "The standing preview prop with the pivot", true, 1);
                 m_hB = m_Parser.addOption("From", "\"x z yaw\": the approach's start in the pivot's frame (as PrimitiveApproach -From)", true, 1);
@@ -330,7 +335,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach, m_AnchorMove, m_InteractionValidate;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach, m_AnchorMove, m_InteractionValidate, m_InteractionAccept, m_InteractionList;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -483,6 +488,8 @@ namespace xanim_package_editor
             , m_PrimitiveApproach(m_Undo, *this, playback_cmd::kind::primitive_approach, "PrimitiveApproach", "Smart Primitive: generates the approach into the selected clip's first frame from a start in the prop's interaction box (a Kimodo take, previewed; KimodoAccept keeps it). Usage: PrimitiveApproach -Prop Chair -From \"x z yaw\" [-Seconds s] [-Seed n] [-Prompt words]")
             , m_AnchorMove(m_Undo, *this, playback_cmd::kind::anchor_move, "AnchorMove", "Smart Primitive: moves a prop anchor in the prop's frame; every IK key bound to it (IkKey -Prop Chair/Seat) follows, in every clip. One undo step. Usage: AnchorMove -Prop Chair -Anchor Seat -Pos \"x y z\"")
             , m_InteractionValidate(m_Undo, *this, playback_cmd::kind::interaction_validate, "InteractionValidate", "Smart Primitive gate: the approach on preview, placed at its start, against the selected clip across the join: alignment, continuity, the feet, clearance through the prop. Usage: InteractionValidate -Prop Chair -From \"x z yaw\"")
+            , m_InteractionAccept(m_Undo, *this, playback_cmd::kind::interaction_accept, "InteractionAccept", "Smart Primitive: publishes the approach on preview as an entry of the interaction (the selected clip) - only if it passes the gate now; one undo step. Usage: InteractionAccept [-Interaction Sit] -Prop Chair -From \"x z yaw\"")
+            , m_InteractionList(m_Undo, *this, playback_cmd::kind::interaction_list, "InteractionList", "Smart Primitive: the interactions and their accepted entries (and which need revalidation)")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -2296,6 +2303,43 @@ namespace xanim_package_editor
             Row(dLF <= 5.0f && dRF <= 5.0f, std::format("contact: the feet {:.1f} / {:.1f} cm from where the interaction has them (5)", dLF, dRF));
             Row(FirstIn < 0, FirstIn < 0 ? std::string("clearance: no bone inside the prop during the approach") : std::format("clearance: {} inside the prop at frame {} of {}", R.Name(BoneIn), FirstIn, nA));
             return std::format("InteractionValidate: {} - entry ({:.2f}, {:.2f}, {:.0f} deg) of '{}', the approach's {} frames against the selected clip\n{}", nFail ? std::format("FAIL ({})", nFail) : std::string("PASS"), Fx, Fz, FyawDeg, PropName, nA, Out);
+        }
+
+        // publish an entry: only an approach that PASSES the gate now; the take is accepted (KimodoAccept) and the entry recorded on the
+        // interaction (made on first use: the selected clip, arrival Stop) - one undo step
+        std::string InteractionAccept(const std::string& IName, const std::string& PropName, float Fx, float Fz, float FyawDeg) noexcept
+        {
+            auto* pOv = SelectedOv(); if (!pOv) return "InteractionAccept: select the interaction's clip first";
+            const auto V = InteractionValidate(PropName, Fx, Fz, FyawDeg);
+            if (V.find(": PASS") == std::string::npos) return "InteractionAccept: refused - the approach does not pass the gate:\n" + V;
+            const auto Clip = pOv->m_OriginalName; std::string Out;
+            // ponytail: two undo steps (the entry, then the take's import). The entry is recorded FIRST: KimodoAccept saves and starts a
+            // compile (the 0xc0000409 crash first blamed on that was a long string value in the snapshot: C135)
+            const std::string Planned = std::format("{}_{}_entry", IName, PropName);
+            (void)DirectOneStep(std::format("Entry of {}", IName), [&](desc& D) -> std::string
+            {
+                xanim_package_desc::interaction* pI = nullptr; for (auto& I : D.m_Interactions) if (I.m_Name == IName && I.m_Prop == PropName) pI = &I;
+                if (!pI) { D.m_Interactions.push_back({}); pI = &D.m_Interactions.back(); pI->m_Name = IName; pI->m_Prop = PropName; pI->m_Clip = Clip; }
+                auto OneLine = [](std::string t) { for (auto& c : t) if (!(std::isalnum(static_cast<unsigned char>(c)) || std::strchr(" .,:()+-/_|%=<>", c))) c = ' '; return t; };     // (a snapshot value in plain characters)
+                pI->m_Entries.push_back({ Fx, Fz, FyawDeg, Planned, OneLine(V).substr(0, 120), false });      // (short: the property snapshot formats a value into a fixed buffer - a 600-character report killed the editor in vsprintf_s; ponytail: the full report is the gate's reply)
+                Out = std::format("InteractionAccept: entry {} of '{}' on '{}' ({:.2f}, {:.2f}, {:.0f} deg) accepted (take {})", pI->m_Entries.size(), IName, PropName, Fx, Fz, FyawDeg, Planned);
+                return {};
+            });
+            const auto A = KimodoAccept(Planned);
+            if (A.find("saved") == std::string::npos) return "InteractionAccept: the entry is recorded but the take was not saved: " + A;
+            Out += std::format(" - {}", A);
+            return Out.empty() ? "InteractionAccept: the entry was not recorded" : Out;
+        }
+        std::string InteractionList() noexcept
+        {
+            auto* pD = Desc(); if (!pD) return "InteractionList: nothing loaded";
+            std::string Out = std::format("InteractionList: {} interaction(s)\n", pD->m_Interactions.size());
+            for (const auto& I : pD->m_Interactions)
+            {
+                Out += std::format("  {} on '{}' clip '{}' arrival {}: {} entr(ies)\n", I.m_Name, I.m_Prop, I.m_Clip, I.m_Arrival, I.m_Entries.size());
+                for (std::size_t e = 0; e < I.m_Entries.size(); ++e) Out += std::format("    {}: from ({:.2f}, {:.2f}, {:.0f} deg){}\n", e + 1, I.m_Entries[e].m_X, I.m_Entries[e].m_Z, I.m_Entries[e].m_Yaw, I.m_Entries[e].m_bRevalidate ? " NEEDS REVALIDATION" : "");
+            }
+            return Out;
         }
 
         std::string PrimitiveApproach(const std::string& PropName, float Fx, float Fz, float FyawDeg, float Seconds, int Seed, const std::string& Prompt, const std::vector<std::array<float, 4>>* pRoute = nullptr, const std::vector<int>* pSeeds = nullptr) noexcept
@@ -6269,7 +6313,7 @@ namespace xanim_package_editor
         // step. Placing an instance never comes here (it is a preview transform, no data changes).
         std::string AnchorMove(const std::string& PropName, const std::string& AnchorName, const xmath::fvec3& To) noexcept
         {
-            int nKeys = 0; xmath::fvec3 From; std::string Why;
+            int nKeys = 0, nStale = 0; xmath::fvec3 From; std::string Why;
             (void)DirectOneStep(std::format("Move anchor {}/{}", PropName, AnchorName), [&](desc& D) -> std::string
             {
                 xanim_package_desc::preview_prop* pP = nullptr; for (auto& P : D.m_PreviewProps) if (P.m_Name == PropName) pP = &P;
@@ -6281,10 +6325,11 @@ namespace xanim_package_editor
                 const auto Bound = PropName + "/" + AnchorName; const auto Delta = To - From;
                 for (auto& S : D.m_ImportSources) for (auto& C : S.m_Clips) for (auto& L : C.m_Layers) for (auto& K : L.m_IkKeys)
                     if (K.m_Anchor == Bound) { K.m_PX += Delta.m_X; K.m_PY += Delta.m_Y; K.m_PZ += Delta.m_Z; ++nKeys; }
+                for (auto& I : D.m_Interactions) if (I.m_Prop == PropName) for (auto& En : I.m_Entries) if (!En.m_bRevalidate) { En.m_bRevalidate = true; ++nStale; }     // (still playable, flagged)
                 return {};
             });
             if (!Why.empty()) return "AnchorMove: " + Why;
-            return std::format("AnchorMove: {}/{} {:.3f} {:.3f} {:.3f} -> {:.3f} {:.3f} {:.3f}; {} bound IK key(s) followed (one undo step)", PropName, AnchorName, From.m_X, From.m_Y, From.m_Z, To.m_X, To.m_Y, To.m_Z, nKeys);
+            return std::format("AnchorMove: {}/{} {:.3f} {:.3f} {:.3f} -> {:.3f} {:.3f} {:.3f}; {} bound IK key(s) followed (one undo step){}", PropName, AnchorName, From.m_X, From.m_Y, From.m_Z, To.m_X, To.m_Y, To.m_Z, nKeys, nStale ? std::format("; {} accepted entr(ies) now need revalidation", nStale) : std::string());
         }
 
         // the description's PreviewProps as wire shapes over the bones (the shared shape the Ragdoll editor draws its bodies with)
@@ -6890,6 +6935,14 @@ namespace xanim_package_editor
             return S.KimodoInbetweenAccept(i);
         }
         case kind::kimodo_inbetween_discard: return S.IbDiscard();
+        case kind::interaction_list: return S.InteractionList();
+        case kind::interaction_accept:
+        {
+            std::string Name = "Sit", Prop, From; float F[3]{};
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Name); xeditor::cmd_util::GetArg(m_Parser, m_hB, Prop); xeditor::cmd_util::GetArg(m_Parser, m_hC, From);
+            if (xanimation::Scan(From.c_str(), "%f %f %f", &F[0], &F[1], &F[2]) != 3) return "InteractionAccept: -From wants \"x z yaw\"";
+            return S.InteractionAccept(Name, Prop, F[0], F[1], F[2]);
+        }
         case kind::interaction_validate:
         {
             std::string Prop, From; float F[3]{};

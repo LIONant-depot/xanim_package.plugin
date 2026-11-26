@@ -365,6 +365,40 @@ namespace xanim_package_desc
     };
     XPROPERTY_REG(prop_anchor)
 
+    // Smart Primitive v2: an interaction authored once in a prop's pivot frame, and the entries that PASSED the gate (InteractionValidate)
+    // when they were accepted - only these are offered at runtime. An anchor moved since: the entry needs revalidation (still playable).
+    struct interaction_entry
+    {
+        float           m_X = 0, m_Z = 0, m_Yaw = 0;    // the start in the pivot's frame (metres, degrees)
+        std::string     m_Take      = {};               // the accepted approach: KimodoAccept's reply (names its file)
+        std::string     m_Report    = {};               // the gate's report when accepted
+        bool            m_bRevalidate = false;          // an anchor of the prop moved after it was accepted
+        XPROPERTY_DEF
+        ( "Entry", interaction_entry
+        , obj_member<"X", &interaction_entry::m_X >, obj_member<"Z", &interaction_entry::m_Z >, obj_member<"Yaw", &interaction_entry::m_Yaw >
+        , obj_member<"Take", &interaction_entry::m_Take >
+        , obj_member<"Report", &interaction_entry::m_Report >
+        , obj_member<"NeedsRevalidation", &interaction_entry::m_bRevalidate >
+        )
+    };
+    XPROPERTY_REG(interaction_entry)
+
+    struct interaction
+    {
+        std::string                     m_Name    = "Sit";
+        std::string                     m_Prop    = {};     // the preview prop (by name) with the pivot
+        std::string                     m_Clip    = {};     // the interaction's clip (its original name)
+        std::string                     m_Arrival = "Stop"; // Stop (v1) or Continue
+        std::vector<interaction_entry>  m_Entries = {};
+        XPROPERTY_DEF
+        ( "Interaction", interaction
+        , obj_member<"Name", &interaction::m_Name >, obj_member<"Prop", &interaction::m_Prop >, obj_member<"Clip", &interaction::m_Clip >
+        , obj_member<"Arrival", &interaction::m_Arrival, member_help<"Stop: the approach settles into the clip's first frame; Continue: arrives moving (not yet)"> >
+        , obj_member<"Entries", &interaction::m_Entries, member_help<"Validated ways in (InteractionAccept); runtime offers only these"> >
+        )
+    };
+    XPROPERTY_REG(interaction)
+
     struct preview_prop
     {
         std::string     m_Name    = "Ball";
@@ -646,6 +680,7 @@ namespace xanim_package_desc
 
         xrsc::geom_skin                 m_PreviewSkin = {};             // editor only: the skin the preview poses (the compiler never reads it)
         std::vector<preview_prop>       m_PreviewProps = {};            // editor only: shapes the preview draws (props held by bones or standing)
+        std::vector<interaction>        m_Interactions = {};            // Smart Primitives: interactions on preview props and their validated entries
         xskeleton_desc::bone_manifest   m_ResolvedSkeletonBones = {};   // NOT saved - populated in Serialize() above
 
         XPROPERTY_VDEF
@@ -654,6 +689,7 @@ namespace xanim_package_desc
         , obj_member<"ImportSources",           &descriptor::m_ImportSources >
         , obj_member<"Kimodo",                  &descriptor::m_Kimodo >
         , obj_member<"PreviewProps",            &descriptor::m_PreviewProps, member_help<"Editor only (not in the build): simple props the preview draws (a ball at the foot, a prop in a hand)"> >
+        , obj_member<"Interactions",            &descriptor::m_Interactions, member_help<"Smart Primitives: an interaction on a preview prop (its clip, arrival) and the entries that passed the gate"> >
         , obj_member<"PreviewSkin",             &descriptor::m_PreviewSkin, member_help<"Editor only (not in the build): the skin the preview draws the animations on (a GeomSkin of this skeleton). Empty: the bones only"> >
         , obj_member<"ResolvedSkeletonBones",   &descriptor::m_ResolvedSkeletonBones, member_flags<flags::DONT_SHOW, flags::DONT_SAVE> >
         )
