@@ -355,7 +355,7 @@ namespace xanim_package_desc
         xmath::fvec3    m_Size    = xmath::fvec3(0.11f, 0.11f, 0.11f);    // sphere: x the radius; box: half extents; capsule: x the radius, y the half length
         std::string     m_Bone    = {};
         xmath::fvec3    m_Offset  = xmath::fvec3(0, 0.11f, 0.3f);        // from the bone (in its frame), or from the model origin
-        // Smart Primitive (D:/LIONant/xLION_Docs design): the pivot the interaction is authored against, and the box the approach may start from
+        // Smart Primitive: the pivot the interaction is authored against, and the box the approach may start from
         xmath::fvec3    m_PivotOffset = xmath::fvec3(0, 0, 0);          // from the prop, in its frame
         float           m_PivotYaw    = 0;                              // degrees about up: the way the character faces at the pivot
         xmath::fvec3    m_BoxCenter   = xmath::fvec3(0, 0, 0);          // in the pivot's frame
