@@ -1545,7 +1545,7 @@ namespace xanim_package_editor
                 const char* Why = iL < 0 ? "No Pose layer: add one (LayerAdd -Kind Pose) and key the two poses to keep" : (A < 0 || B < 0) ? "Put the playhead between two keys of the layer: the motion between them is regenerated" : (B - A < 0.2) ? "The two keys are closer than 0.2 s" : m_K.m_Job.m_bRunning ? "Kimodo is busy" : nullptr;
                 ImGui::SameLine(); ImGui::TextUnformatted("  ");
                 ImGui::SameLine(); ImGui::BeginDisabled(Why != nullptr);
-                if (ImGui::SmallButton("Regenerate between keys")) { m_EditorActions.RegenerateBetweenKeys(); }      // (the action: palette, keymap and button do the same -From {:.4f} -To {:.4f} -Seeds \"{} {} {}\"", iL, A, B, s0, s0 + 1, s0 + 2)); }      // (new seeds each click)
+                if (ImGui::SmallButton("Regenerate between keys")) { m_EditorActions.RegenerateBetweenKeys(); }      // (the action: the palette, a key and this button do the same; new seeds each click)
                 const bool bHoverRegen = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
                 m_IbBand = (bHoverRegen && A >= 0 && B > A) ? std::pair{ A, B } : !m_IbCands.empty() ? std::pair{ m_IbFrom, m_IbTo } : std::pair{ -1.0, -1.0 };     // (the span the action works on, shown on the timeline)
                 ImGui::EndDisabled();
