@@ -2424,7 +2424,7 @@ namespace xanim_package_editor
                 static int s_Count = 0;
                 std::filesystem::create_directories(m_Document.m_TempDir);
                 const auto Stem = std::format(L"{}\\kimodo_path_{}_{}", m_Document.m_TempDir, GetCurrentProcessId(), ++s_Count);
-                const int N = std::max(2, int(std::lround(Seconds * 30.0f)));
+                const int N = std::max(2, int(std::lround(Seconds * 30.0f))) + (bLoop && pVx ? 1 : 0);     // (-Loop: one more frame - the next pass's second, for the velocity across the seam)
                 kimodo::constraint_set Path{ "root2d", {}, {}, {} };
                 for (int f = 0; f < N; ++f)
                 {
@@ -2458,18 +2458,26 @@ namespace xanim_package_editor
                     const auto Args1 = std::format(L"gen --prompt \"{}\" --frames {} --seed {} --constraints \"{}.json\" --bvh \"{}_pass1.bvh\"", P, N, Seed, Stem, Stem);
                     if (!kimodo::RunBlocking(Exe, Args1, Stem + L"_pass1.log", 300000, Err)) return "KimodoGenerate -Loop (first take): " + Err;
                     kimodo::bvh B; if (!B.Load(Stem + L"_pass1.bvh", Err)) return "KimodoGenerate -Loop: " + Err;
-                    kimodo::soma_pose P0;
-                    for (int j = 0; j < 77; ++j)
+                    // frames 0 and 1 of the first take; frames N-2 and N-1 are them again, moved on by one period (N-2 frames): the pose AND its
+                    // velocity close (the C127 baker refused a closed pose with a 58 deg/s jump: it tried to repair the seam and slid a foot)
+                    auto Frame = [&](int f)
                     {
-                        int k = -1; for (int i = 0; i < B.nJoints(); ++i) if (B.m_Names[i] == kimodo::soma77_names_v[j]) { k = i; break; }
-                        if (k < 0) continue;
-                        float q[4]; kimodo::MatToQuat(&B.m_Rots[std::size_t(k) * 9], q);
-                        const auto L = xanimation::details::LogQ(xmath::fquat(q[0], q[1], q[2], q[3]).NormalizeSafeCopy());
-                        P0.m_Rot[j][0] = L.m_X; P0.m_Rot[j][1] = L.m_Y; P0.m_Rot[j][2] = L.m_Z;
-                    }
-                    for (int a = 0; a < 3; ++a) P0.m_Root[a] = B.m_Root[std::size_t(a)];
-                    auto P1 = P0; const float T = float(N - 1) / 30.0f; P1.m_Root[0] += *pVx * T; P1.m_Root[2] += Vz * T;
-                    Sets.push_back({ "fullbody", { 0, N - 1 }, { P0, P1 }, { { P0.m_Root[0], P0.m_Root[2] }, { P1.m_Root[0], P1.m_Root[2] } } });
+                        kimodo::soma_pose P;
+                        for (int j = 0; j < 77; ++j)
+                        {
+                            int k = -1; for (int i = 0; i < B.nJoints(); ++i) if (B.m_Names[i] == kimodo::soma77_names_v[j]) { k = i; break; }
+                            if (k < 0) continue;
+                            float q[4]; kimodo::MatToQuat(&B.m_Rots[(std::size_t(f) * B.nJoints() + k) * 9], q);
+                            const auto L = xanimation::details::LogQ(xmath::fquat(q[0], q[1], q[2], q[3]).NormalizeSafeCopy());
+                            P.m_Rot[j][0] = L.m_X; P.m_Rot[j][1] = L.m_Y; P.m_Rot[j][2] = L.m_Z;
+                        }
+                        for (int a = 0; a < 3; ++a) P.m_Root[a] = B.m_Root[std::size_t(f) * 3 + a];
+                        return P;
+                    };
+                    const auto P0 = Frame(0), Q0 = Frame(1); const float T = float(N - 2) / 30.0f;
+                    auto Shift = [&](kimodo::soma_pose P) { P.m_Root[0] += *pVx * T; P.m_Root[2] += Vz * T; return P; };
+                    const auto P1 = Shift(P0), Q1 = Shift(Q0);
+                    Sets.push_back({ "fullbody", { 0, 1, N - 2, N - 1 }, { P0, Q0, P1, Q1 }, { { P0.m_Root[0], P0.m_Root[2] }, { Q0.m_Root[0], Q0.m_Root[2] }, { P1.m_Root[0], P1.m_Root[2] }, { Q1.m_Root[0], Q1.m_Root[2] } } });
                     if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return "KimodoGenerate: " + Err;
                 }
                 const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --seed {} --constraints \"{}.json\" --bvh \"{}.bvh\"", P, N, Seed, Stem, Stem);
