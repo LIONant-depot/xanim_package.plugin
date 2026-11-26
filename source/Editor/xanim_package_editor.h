@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, primitive_approach, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -82,6 +82,13 @@ namespace xanim_package_editor
             case kind::select_clip: m_hA = m_Parser.addOption("Source", "Import source index",       true, 1); m_hB = m_Parser.addOption("Clip", "Clip index in that source", true, 1); break;
             case kind::seek:        m_hA = m_Parser.addOption("Time",   "Seconds from the clip start", true, 1); break;
             case kind::set_speed:   m_hA = m_Parser.addOption("Index",  "Playback speed step (0.25x .. 3x)", true, 1); break;
+            case kind::primitive_approach:
+                m_hA = m_Parser.addOption("Prop",    "The preview prop with the pivot (and the interaction box)", true, 1);
+                m_hB = m_Parser.addOption("From",    "\"x z yaw\": where the character starts, metres and degrees in the PIVOT's frame (+Z: the pivot's facing)", true, 1);
+                m_hC = m_Parser.addOption("Seconds", "Length (default: the distance at 1 m/s + 0.6 s)", false, 1);
+                m_hD = m_Parser.addOption("Seed",    "Seed (default 1)", false, 1);
+                m_hE = m_Parser.addOption("Prompt",  "Words for the approach (default: a person walks over and stops)", false, 1);
+                break;
             case kind::kimodo_generate:
                 m_hA = m_Parser.addOption("Prompt",  "What the motion is, in words (or -Video)", false, 1);
                 m_hB = m_Parser.addOption("Seconds", "Length in seconds (default 5)", false, 1);
@@ -311,7 +318,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard, m_PrimitiveApproach;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -461,6 +468,7 @@ namespace xanim_package_editor
             , m_KimodoInbetween(m_Undo, *this, playback_cmd::kind::kimodo_inbetween, "KimodoInbetween", "Regenerates the motion BETWEEN two times of a Pose layer with Kimodo at fixed timing: both edges kept, the layer's keys inside kept, nothing outside the span changes; one undo step; a report of skate and acceleration before and after. Another seed: Ctrl+Z and again. Usage: KimodoInbetween -Layer n -From s -To s [-Seed 1]")
             , m_KimodoInbetweenAccept(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_accept, "KimodoInbetweenAccept", "Writes one candidate of KimodoInbetween -Seeds as one undo step; refused when the clip changed since (stale). Usage: KimodoInbetweenAccept [-Candidate 0]")
             , m_KimodoInbetweenDiscard(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_discard, "KimodoInbetweenDiscard", "Drops the candidates of KimodoInbetween -Seeds; the clip stays as it was. Usage: KimodoInbetweenDiscard")
+            , m_PrimitiveApproach(m_Undo, *this, playback_cmd::kind::primitive_approach, "PrimitiveApproach", "Smart Primitive: generates the approach into the selected clip's first frame from a start in the prop's interaction box (a Kimodo take, previewed; KimodoAccept keeps it). Usage: PrimitiveApproach -Prop Chair -From \"x z yaw\" [-Seconds s] [-Seed n] [-Prompt words]")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -2211,7 +2219,55 @@ namespace xanim_package_editor
 
         // pVx (set): the root goes straight at (Vx, Vz) m/s facing ahead the whole take (Kimodo's root2d path + global heading on every
         // frame): a text-only "side-step" turned its body ~40 deg over 4 s (plan C72) - a strafe needs the path and the facing stated
-        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0, const float* pGoal = nullptr, const std::vector<std::array<float, 4>>* pTrack = nullptr) noexcept
+        // Smart Primitive step 2: the approach into the selected clip's first frame, generated by Kimodo from a start placement given in the
+        // prop's PIVOT frame. Generation space = the start placement (origin, facing +Z); the track goes straight to where the clip's first
+        // frame stands (facing along the way, turning into its facing at the end) and that frame is a full-body constraint on the take's last
+        // frame. ponytail: model space is taken as Kimodo's raw space / 100 (true for the Kimodo retargets here); a straight path.
+        std::string PrimitiveApproach(const std::string& PropName, float Fx, float Fz, float FyawDeg, float Seconds, int Seed, const std::string& Prompt) noexcept
+        {
+            auto* pDesc = Desc(); if (!pDesc) return "PrimitiveApproach: nothing loaded";
+            const xanim_package_desc::preview_prop* pP = nullptr;
+            for (const auto& P : pDesc->m_PreviewProps) if (P.m_Name == PropName) pP = &P;
+            if (!pP) return std::format("PrimitiveApproach: no preview prop '{}'", PropName);
+            if (!pP->m_Bone.empty()) return "PrimitiveApproach: the prop is held by a bone; a primitive's prop stands in the scene";
+            if (pP->m_BoxHalf.m_X > 0 && pP->m_BoxHalf.m_Z > 0 && (std::abs(Fx - pP->m_BoxCenter.m_X) > pP->m_BoxHalf.m_X || std::abs(Fz - pP->m_BoxCenter.m_Z) > pP->m_BoxHalf.m_Z))
+                return std::format("PrimitiveApproach: ({:.2f}, {:.2f}) is outside the interaction box (centre {:.2f} {:.2f}, half {:.2f} {:.2f}): start inside it", Fx, Fz, pP->m_BoxCenter.m_X, pP->m_BoxCenter.m_Z, pP->m_BoxHalf.m_X, pP->m_BoxHalf.m_Z);
+            std::string Err; auto* pCtx = KimodoRetargetCtx(Err); if (!pCtx) return "PrimitiveApproach: " + Err;
+            const std::vector<xmath::transform3>* pF = nullptr; int Fps = 30, n = 0;
+            if (!SuggestClipFrames(pF, Fps, n, Err)) return "PrimitiveApproach: " + Err;
+            const int nB = int(pDesc->m_ResolvedSkeletonBones.m_Bones.size());
+            const std::vector<xmath::transform3> F0(pF->begin(), pF->begin() + nB);
+            kimodo_space KS; std::vector<kimodo::soma_pose> SP;
+            if (!ToKimodo(*pCtx, F0, 1, nB, KS, SP, Err)) return "PrimitiveApproach: " + Err;
+            const auto Fw = KS.m_Denorm * xmath::fvec3(0, 0, 1);
+            const float Eyaw = std::atan2(Fw.m_X, Fw.m_Z), Ex = KS.m_Origin.m_X * 0.01f, Ez = KS.m_Origin.m_Z * 0.01f;      // (where the clip starts: metres, radians)
+            const float Pyaw = pP->m_PivotYaw * 0.017453293f, cP = std::cos(Pyaw), sP = std::sin(Pyaw);
+            const float Px = pP->m_Offset.m_X + pP->m_PivotOffset.m_X, Pz = pP->m_Offset.m_Z + pP->m_PivotOffset.m_Z;
+            const float Sx = Px + cP * Fx + sP * Fz, Sz = Pz - sP * Fx + cP * Fz, Syaw = Pyaw + FyawDeg * 0.017453293f;   // (RotY: x' = x cos + z sin, z' = -x sin + z cos)
+            const float cS = std::cos(-Syaw), sS = std::sin(-Syaw), Dx = cS * (Ex - Sx) + sS * (Ez - Sz), Dz = -sS * (Ex - Sx) + cS * (Ez - Sz);
+            auto Wrap = [](float a) { while (a > 3.14159265f) a -= 6.2831853f; while (a < -3.14159265f) a += 6.2831853f; return a; };
+            const float Ryaw = Wrap(Eyaw - Syaw), Dist = std::sqrt(Dx * Dx + Dz * Dz);
+            if (Seconds <= 0) Seconds = std::clamp(Dist / 1.0f + 0.6f, 1.0f, 10.0f);
+            const float Way = Dist > 0.3f ? std::atan2(Dx, Dz) : Ryaw;     // (facing along the way; a short step just turns)
+            const float D2R = 57.29578f;
+            std::vector<std::array<float, 4>> Tk{ { 0, 0, 0, 0 }, { 0.25f * Seconds, 0.2f * Dx, 0.2f * Dz, Wrap(Way) * D2R }, { 0.8f * Seconds, 0.85f * Dx, 0.85f * Dz, Wrap(Way) * D2R }, { Seconds, Dx, Dz, Ryaw * D2R } };
+            // the clip's first frame where the take ends: Kimodo's normalized pose turned by Ryaw and moved to (Dx, Dz)
+            const auto R = xanimation::details::AxisAngle(xmath::fvec3(0, 1, 0), Ryaw);
+            auto E = SP[0];
+            {
+                const xmath::fvec3 V(E.m_Rot[0][0], E.m_Rot[0][1], E.m_Rot[0][2]); const float a = V.Length();
+                const auto Q = a > 1e-8f ? xanimation::details::AxisAngle(V * (1.0f / a), a) : xmath::fquat::fromIdentity();
+                const auto L = xanimation::details::LogQ((R * Q).NormalizeSafeCopy()); E.m_Rot[0][0] = L.m_X; E.m_Rot[0][1] = L.m_Y; E.m_Rot[0][2] = L.m_Z;
+                const auto Rp = R * xmath::fvec3(E.m_Root[0], E.m_Root[1], E.m_Root[2]); E.m_Root[0] = Rp.m_X + Dx; E.m_Root[1] = Rp.m_Y; E.m_Root[2] = Rp.m_Z + Dz;
+            }
+            const int N = std::max(2, int(std::lround(Seconds * 30.0f)));
+            std::vector<kimodo::constraint_set> Extra{ { "fullbody", { N - 1 }, { E }, { { E.m_Root[0], E.m_Root[2] } } } };
+            const auto Out = KimodoGenerate(Prompt, Seconds, Seed, nullptr, 0, nullptr, &Tk, &Extra);
+            return std::format("PrimitiveApproach: from ({:.2f}, {:.2f}, {:.0f} deg) in the pivot frame of '{}': {:.2f} m to the clip's first frame, turning {:.0f} deg, {:.2f} s; the take must end at root {:.3f} {:.3f} {:.3f} (Kimodo space, m) - {}",
+                               Fx, Fz, FyawDeg, PropName, Dist, Ryaw * D2R, Seconds, E.m_Root[0], E.m_Root[1], E.m_Root[2], Out);
+        }
+
+        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0, const float* pGoal = nullptr, const std::vector<std::array<float, 4>>* pTrack = nullptr, const std::vector<kimodo::constraint_set>* pExtra = nullptr) noexcept
         {
             if (auto* pWhy = KimodoWhyNot()) return std::string("KimodoGenerate: ") + pWhy;
             if (m_K.m_Job.m_bRunning) return "KimodoGenerate: a generation is already running";
@@ -2247,7 +2303,8 @@ namespace xanim_package_editor
                     }
                     Path.m_Frames.push_back(f); Path.m_Smooth.push_back({ *pVx * t, Vz * t }); Path.m_Heading.push_back({ 1.0f, 0.0f });      // (heading 0: facing +Z, Kimodo's atan2(dz, -dx) of right - left hip)
                 }
-                if (!kimodo::WriteConstraints(Stem + L".json", { Path }, Err)) return "KimodoGenerate: " + Err;
+                std::vector<kimodo::constraint_set> Sets{ Path }; if (pExtra) Sets.insert(Sets.end(), pExtra->begin(), pExtra->end());
+                if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return "KimodoGenerate: " + Err;
                 std::wstring P = xstrtool::To(Prompt);
                 for (auto& c : P) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
                 const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --seed {} --constraints \"{}.json\" --bvh \"{}.bvh\"", P, N, Seed, Stem, Stem);
@@ -6665,6 +6722,15 @@ namespace xanim_package_editor
             return S.KimodoInbetweenAccept(i);
         }
         case kind::kimodo_inbetween_discard: return S.IbDiscard();
+        case kind::primitive_approach:
+        {
+            std::string Prop, From, Secs, Seed = "1", Prompt = "A person walks over and stops."; float F[3]{}; float Sec = -1; int iSeed = 1;
+            xeditor::cmd_util::GetArg(m_Parser, m_hA, Prop); xeditor::cmd_util::GetArg(m_Parser, m_hB, From);
+            if (xanimation::Scan(From.c_str(), "%f %f %f", &F[0], &F[1], &F[2]) != 3) return "PrimitiveApproach: -From wants \"x z yaw\"";
+            if (xeditor::cmd_util::GetArg(m_Parser, m_hC, Secs)) std::from_chars(Secs.data(), Secs.data() + Secs.size(), Sec);
+            xeditor::cmd_util::GetArg(m_Parser, m_hD, Seed); std::from_chars(Seed.data(), Seed.data() + Seed.size(), iSeed); xeditor::cmd_util::GetArg(m_Parser, m_hE, Prompt);
+            return S.PrimitiveApproach(Prop, F[0], F[1], F[2], Sec, iSeed, Prompt);
+        }
         case kind::kimodo_settings:
         {
             std::string V;
