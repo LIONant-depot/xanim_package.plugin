@@ -64,7 +64,7 @@ namespace xanim_package_editor
 
     struct playback_cmd : xundo::query_command_base
     {
-        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
+        enum class kind { select_clip, play, pause, seek, set_speed, info, list_clips, kimodo_generate, kimodo_accept, kimodo_discard, kimodo_info, kimodo_settings, kimodo_inbetween, kimodo_inbetween_accept, kimodo_inbetween_discard, layer_add, layer_mask, layers_info, pose_key, suggest_pose, suggest_pose_accept, layer_timeline, layer_timeline_edit, layer_parent
                         , pose_tool, pose_drag, pose_pin, pose_mirror, pose_copy, pose_paste, pose_suggest, kimodo_layer_add, kimodo_regenerate, kimodo_accept_candidate, kimodo_show, bake_to_pose, kimodo_takes_to_layers, kimodo_take_check, pose_rotate, new_clip, ik_key, key_selected, auto_key, clip_event, detect_footsteps, ball_flight, render_video, preview_overlay, motion_paths };
 
         session&    m_Session;
@@ -311,7 +311,7 @@ namespace xanim_package_editor
         using desc = xanim_package_desc::descriptor;
 
         playback_cmd                                    m_SelectClip, m_Play, m_Pause, m_Seek, m_SetSpeed, m_Info, m_ListClips;
-        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept;
+        playback_cmd                                    m_KimodoGenerate, m_KimodoAccept, m_KimodoDiscard, m_KimodoInfo, m_KimodoSettings, m_KimodoInbetween, m_KimodoInbetweenAccept, m_KimodoInbetweenDiscard;
         playback_cmd                                    m_LayerAdd, m_LayerMask, m_LayersInfo, m_PoseKey, m_SuggestPose, m_SuggestPoseAccept, m_LayerTimeline, m_LayerTimelineEdit, m_LayerParent;
         playback_cmd                                    m_PoseTool, m_PoseDrag, m_PosePin, m_PoseMirror, m_PoseCopy, m_PosePaste, m_PoseSuggest;
         playback_cmd                                    m_KimodoLayerAdd, m_KimodoRegenerate, m_KimodoAcceptCandidate, m_KimodoShow, m_BakeToPose, m_KimodoTakesToLayers, m_KimodoTakeCheck, m_PoseRotate, m_NewClip, m_IkKeyCmd, m_KeySelected, m_AutoKey, m_ClipEvent, m_DetectFootsteps, m_BallFlight, m_RenderVideoCmd, m_PreviewOverlayCmd, m_MotionPathsCmd;
@@ -460,6 +460,7 @@ namespace xanim_package_editor
             , m_KimodoSettings(m_Undo, *this, playback_cmd::kind::kimodo_settings, "KimodoSettings", "Kimodo's advanced generation settings for every generation from this editor (not saved, not undo steps): denoising steps, guidance (text, constraint), post-processing. 0 = Kimodo's default. Usage: KimodoSettings [-Steps 50] [-Guidance \"2 2\"] [-NoPost 0|1] (no option: shows them)")
             , m_KimodoInbetween(m_Undo, *this, playback_cmd::kind::kimodo_inbetween, "KimodoInbetween", "Regenerates the motion BETWEEN two times of a Pose layer with Kimodo at fixed timing: both edges kept, the layer's keys inside kept, nothing outside the span changes; one undo step; a report of skate and acceleration before and after. Another seed: Ctrl+Z and again. Usage: KimodoInbetween -Layer n -From s -To s [-Seed 1]")
             , m_KimodoInbetweenAccept(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_accept, "KimodoInbetweenAccept", "Writes one candidate of KimodoInbetween -Seeds as one undo step; refused when the clip changed since (stale). Usage: KimodoInbetweenAccept [-Candidate 0]")
+            , m_KimodoInbetweenDiscard(m_Undo, *this, playback_cmd::kind::kimodo_inbetween_discard, "KimodoInbetweenDiscard", "Drops the candidates of KimodoInbetween -Seeds; the clip stays as it was. Usage: KimodoInbetweenDiscard")
             , m_KimodoInfo    (m_Undo, *this, playback_cmd::kind::kimodo_info,     "KimodoInfo",     "Kimodo's state: running, previewing, the last result, the Retarget and folder. Usage: KimodoInfo")
             , m_LayerAdd      (m_Undo, *this, playback_cmd::kind::layer_add,       "LayerAdd",       "Adds a layer to the selected clip from another clip of this package (its mask is empty: it touches nothing yet). Usage: LayerAdd -Source key -Clip name [-Name text]")
             , m_LayerMask     (m_Undo, *this, playback_cmd::kind::layer_mask,      "LayerMask",      "Adds a bone (with its branch) to a layer's mask, or removes it when it is there; or uses a skeleton mask group. Usage: LayerMask -Layer n -Bone name [-Only 1] | LayerMask -Layer n -Shared name")
@@ -1545,25 +1546,37 @@ namespace xanim_package_editor
                 const char* Why = iL < 0 ? "No Pose layer: add one (LayerAdd -Kind Pose) and key the two poses to keep" : (A < 0 || B < 0) ? "Put the playhead between two keys of the layer: the motion between them is regenerated" : (B - A < 0.2) ? "The two keys are closer than 0.2 s" : m_K.m_Job.m_bRunning ? "Kimodo is busy" : nullptr;
                 ImGui::SameLine(); ImGui::TextUnformatted("  ");
                 ImGui::SameLine(); ImGui::BeginDisabled(Why != nullptr);
-                if (ImGui::SmallButton("Regenerate between keys")) { m_EditorActions.RegenerateBetweenKeys(); }      // (the action: the palette, a key and this button do the same; new seeds each click)
+                if (m_IbPending == 2) { m_IbPending = 0; m_EditorActions.RegenerateBetweenKeys(); }     // (runs the frame after "Regenerating..." was drawn: Kimodo blocks while it works)
+                if (m_IbPending == 1) m_IbPending = 2;
+                if (m_IbPending) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "%s", "Regenerating 3 candidates between the keys..."); ImGui::SameLine(); }
+                if (ImGui::SmallButton("Regenerate between keys") && !m_IbPending) m_IbPending = 1;      // (the action: the palette, a key and this button do the same; new seeds each click)
                 const bool bHoverRegen = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
                 m_IbBand = (bHoverRegen && A >= 0 && B > A) ? std::pair{ A, B } : !m_IbCands.empty() ? std::pair{ m_IbFrom, m_IbTo } : std::pair{ -1.0, -1.0 };     // (the span the action works on, shown on the timeline)
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) xeditor::hint::Text("%s", Why ? Why : "Kimodo regenerates the motion between the two keys around the playhead (both kept, nothing outside changes): three candidates, nothing written until you accept one. One undo step.");
                 const bool bStale = !m_IbCands.empty() && m_Undo.GetUndoIndex() != m_IbUndoAt;      // (the clip changed since the candidates were made)
+                if (bStale) m_IbShown = -1;      // (an edit came after: the shown candidate is no longer on the clip's base)
+                int Hover = -1;
                 for (int i = 0; i < int(m_IbCands.size()); ++i)
                 {
                     const auto& Cd = m_IbCands[std::size_t(i)];
                     ImGui::SameLine(); ImGui::BeginDisabled(bStale || Cd.m_After.empty());
                     if (ImGui::SmallButton(std::format("Use {}##ib{}", i + 1, i).c_str())) xeditor::Run(m_Undo, std::format("KimodoInbetweenAccept -Candidate {}", i));
                     ImGui::EndDisabled();
+                    if (!bStale && !Cd.m_After.empty() && ImGui::IsItemHovered()) Hover = i;
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     {
                         if (bStale) xeditor::hint::Text("%s", "These candidates are out of date: the clip changed after they were made. Regenerate between keys again.");
                         else if (Cd.m_After.empty()) xeditor::hint::Text("Candidate %d failed: %s", i + 1, Cd.m_Report.c_str());
-                        else xeditor::hint::Text("Use candidate %d (seed %d). The jump in motion where it joins the clip: %.1f deg/s at the first key, %.1f deg/s at the second (the clip itself has %.1f and %.1f there). One undo step.", i + 1, Cd.m_Seed, double(Cd.m_SeamIn * 30.0f), double(Cd.m_SeamOut * 30.0f), double(Cd.m_RefIn * 30.0f), double(Cd.m_RefOut * 30.0f));
+                        else xeditor::hint::Text("Use candidate %d (seed %d). The jump in motion where it joins the clip: %.1f deg/s at the first key, %.1f deg/s at the second (the clip itself has %.1f and %.1f there). Hover shows it on the clip; click writes it, one undo step.", i + 1, Cd.m_Seed, double(Cd.m_SeamIn * 30.0f), double(Cd.m_SeamOut * 30.0f), double(Cd.m_RefIn * 30.0f), double(Cd.m_RefOut * 30.0f));
                     }
                 }
+                if (!m_IbCands.empty())
+                {
+                    ImGui::SameLine(); if (ImGui::SmallButton("Discard##ib")) xeditor::Run(m_Undo, "KimodoInbetweenDiscard");
+                    if (ImGui::IsItemHovered()) xeditor::hint::Text("%s", "Drops the candidates; the clip stays as it was");
+                }
+                if (!bStale) IbShow(Hover);      // (leaving the buttons puts the clip back)
             }
             tl::Draw(m_TLView, m_TLTransport, Doc, Types, { 0, Height - ImGui::GetFrameHeightWithSpacing() });
             if (m_IbBand.first >= 0 && m_IbBand.second > m_IbBand.first)      // (Regenerate between keys: the span it works on, amber, as the edit scope)
@@ -3397,6 +3410,18 @@ namespace xanim_package_editor
             return nullptr;
         }
         std::vector<inbetween_candidate> m_IbCands; double m_IbFrom = 0, m_IbTo = 0; int m_IbLayer = -1; int m_IbUndoAt = -1; int m_IbNextSeed = 1;
+        int m_IbShown = -1; int m_IbPending = 0;      // (the candidate previewed on the clip, -1 none; the button's 'Regenerating...' frames: 1 drawn, 2 run next)
+        // UX 3: preview a candidate on the clip without writing it (no undo step); -1 puts the clip back as it was
+        void IbShow(int i) noexcept
+        {
+            if (i == m_IbShown || m_IbCands.empty()) return;
+            xproperty::settings::context C;
+            const auto& Snap = i >= 0 ? m_IbCands[std::size_t(i)].m_After : m_IbCands[0].m_Before;
+            if (!Snap.empty()) xproperty::ui::undo::ApplySnapshotFromString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), Snap, C);
+            m_IbShown = i;
+        }
+        std::string IbDiscard() noexcept { if (m_IbCands.empty()) return "KimodoInbetweenDiscard: no candidates"; IbShow(-1); m_IbCands.clear(); return "KimodoInbetweenDiscard: candidates dropped, the clip is as it was"; }
+
         float SeamAt(double T) noexcept      // the worst bone's |second difference of rotation| at T, deg per frame^2 (x fps^2 = deg/s^2)
         {
             const std::vector<xmath::transform3>* pF = nullptr; int Fps = 30, n = 0; std::string E;
@@ -3417,7 +3442,7 @@ namespace xanim_package_editor
             auto Snap = [&] { return xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C); };
             const auto Before = Snap();
             const float Ref = std::max(SeamAt(0.5 * (From + To)), 0.0f), RefIn = std::max(SeamAt(From), 0.0f), RefOut = std::max(SeamAt(To), 0.0f);     // (the take's own at the edges: the fair yardstick)
-            m_IbCands.clear(); m_IbFrom = From; m_IbTo = To; m_IbLayer = iLayer;
+            IbShow(-1); m_IbCands.clear(); m_IbFrom = From; m_IbTo = To; m_IbLayer = iLayer;
             std::string Out = std::format("KimodoInbetween: {} candidate(s) for {:.2f}-{:.2f} s (nothing written; KimodoInbetweenAccept -Candidate i). Seam = the worst bone's jump in angular speed at the edge (deg/s per frame); the take before at the edges: in {:.2f}, out {:.2f}\n", Seeds.size(), From, To, RefIn * 30.0f, RefOut * 30.0f);
             for (const int Seed : Seeds)
             {
@@ -3437,12 +3462,13 @@ namespace xanim_package_editor
         std::string KimodoInbetweenAccept(int i) noexcept
         {
             if (i < 0 || i >= int(m_IbCands.size()) || m_IbCands[std::size_t(i)].m_After.empty()) return "KimodoInbetweenAccept: no such candidate (KimodoInbetween -Seeds first)";
+            IbShow(-1);
             xproperty::settings::context C;
             const auto Now = xproperty::ui::undo::SnapshotToString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), C);
             const auto& Cd = m_IbCands[std::size_t(i)];
             if (Now != Cd.m_Before) return "KimodoInbetweenAccept: the candidate is stale - the clip changed since it was made; run KimodoInbetween again";
             const auto R = m_Undo.Execute(std::format("SnapshotEdit -Label {} -Before {} -After {}", xeditor::Quote(std::format("In-between {:.2f}-{:.2f} s (seed {})", m_IbFrom, m_IbTo, Cd.m_Seed)), xeditor::Quote(Cd.m_Before), xeditor::Quote(Cd.m_After)));
-            m_IbCands.clear();
+            m_IbCands.clear(); m_IbShown = -1;
             return std::format("KimodoInbetweenAccept: candidate {} written (one undo step){}", i, R.empty() ? "" : " - " + R);
         }
 
@@ -6593,6 +6619,7 @@ namespace xanim_package_editor
             std::string V = "0"; xeditor::cmd_util::GetArg(m_Parser, m_hA, V); int i = 0; std::from_chars(V.data(), V.data() + V.size(), i);
             return S.KimodoInbetweenAccept(i);
         }
+        case kind::kimodo_inbetween_discard: return S.IbDiscard();
         case kind::kimodo_settings:
         {
             std::string V;
