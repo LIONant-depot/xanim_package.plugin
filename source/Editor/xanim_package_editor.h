@@ -1550,7 +1550,7 @@ namespace xanim_package_editor
                     {
                         if (bStale) xeditor::hint::Text("%s", "These candidates are out of date: the clip changed after they were made. Regenerate between keys again.");
                         else if (Cd.m_After.empty()) xeditor::hint::Text("Candidate %d failed: %s", i + 1, Cd.m_Report.c_str());
-                        else xeditor::hint::Text("Use candidate %d (seed %d). The jump in motion where it joins the clip: %.1f deg/s at the first key, %.1f deg/s at the second (the clip itself has %.1f and %.1f there). One undo step.", i + 1, Cd.m_Seed, double(Cd.m_SeamIn * 30.0f), double(Cd.m_SeamOut * 30.0f), double(Cd.m_SeamRef * 30.0f), double(Cd.m_SeamRef * 30.0f));
+                        else xeditor::hint::Text("Use candidate %d (seed %d). The jump in motion where it joins the clip: %.1f deg/s at the first key, %.1f deg/s at the second (the clip itself has %.1f and %.1f there). One undo step.", i + 1, Cd.m_Seed, double(Cd.m_SeamIn * 30.0f), double(Cd.m_SeamOut * 30.0f), double(Cd.m_RefIn * 30.0f), double(Cd.m_RefOut * 30.0f));
                     }
                 }
             }
@@ -3362,7 +3362,7 @@ namespace xanim_package_editor
         // candidate keeps the document's before/after snapshots, its report and its SEAM at both edges (the worst bone's change of angular
         // speed across the edge frame on the composed clip, deg/s per frame, next to the same measure inside the span before the edit).
         // KimodoInbetweenAccept writes one candidate as ONE undo step - refused when the document changed since (a stale candidate).
-        struct inbetween_candidate { int m_Seed = 0; std::string m_Before, m_After, m_Report; float m_SeamIn = 0, m_SeamOut = 0, m_SeamRef = 0; };
+        struct inbetween_candidate { int m_Seed = 0; std::string m_Before, m_After, m_Report; float m_SeamIn = 0, m_SeamOut = 0, m_SeamRef = 0, m_RefIn = 0, m_RefOut = 0; };
         std::pair<double, double> m_IbBand { -1.0, -1.0 };
         std::vector<inbetween_candidate> m_IbCands; double m_IbFrom = 0, m_IbTo = 0; int m_IbLayer = -1; int m_IbUndoAt = -1; int m_IbNextSeed = 1;
         float SeamAt(double T) noexcept      // the worst bone's |second difference of rotation| at T, deg per frame^2 (x fps^2 = deg/s^2)
@@ -3391,7 +3391,7 @@ namespace xanim_package_editor
             {
                 const int UndoAt = m_Undo.GetUndoIndex();
                 const auto R = KimodoInbetween(iLayer, From, To, Seed);
-                inbetween_candidate Cd; Cd.m_Seed = Seed; Cd.m_Before = Before; Cd.m_Report = R; Cd.m_SeamRef = Ref;
+                inbetween_candidate Cd; Cd.m_Seed = Seed; Cd.m_Before = Before; Cd.m_Report = R; Cd.m_SeamRef = Ref; Cd.m_RefIn = RefIn; Cd.m_RefOut = RefOut;
                 if (R.starts_with("KimodoInbetween: done")) { Cd.m_After = Snap(); Cd.m_SeamIn = SeamAt(From); Cd.m_SeamOut = SeamAt(To); }
                 while (m_Undo.GetUndoIndex() > UndoAt) m_Undo.Undo();      // (rolled back: a candidate is never written)
                 xproperty::ui::undo::ApplySnapshotFromString(*m_Document.m_pDescriptor->getProperties(), m_Document.m_pDescriptor.get(), Before, C);
