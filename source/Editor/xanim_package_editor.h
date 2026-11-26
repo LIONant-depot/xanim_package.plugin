@@ -97,6 +97,8 @@ namespace xanim_package_editor
                 m_hC = m_Parser.addOption("Seconds", "Length (default: the distance at 1 m/s + 0.6 s)", false, 1);
                 m_hD = m_Parser.addOption("Seed",    "Seed (default 1)", false, 1);
                 m_hE = m_Parser.addOption("Prompt",  "Words for the approach (default: a person walks over and stops)", false, 1);
+                m_hF = m_Parser.addOption("Route",   "A file of rows \"t x z yaw\" in the START's frame (walk past, turn, back up); its last row is moved onto the entry", false, 1);
+                m_hG = m_Parser.addOption("Seeds",   "\"1 2 3\": candidates, each through the gate (InteractionValidate), ranked; the best stays on preview", false, 1);
                 break;
             case kind::kimodo_generate:
                 m_hA = m_Parser.addOption("Prompt",  "What the motion is, in words (or -Video)", false, 1);
@@ -2296,7 +2298,7 @@ namespace xanim_package_editor
             return std::format("InteractionValidate: {} - entry ({:.2f}, {:.2f}, {:.0f} deg) of '{}', the approach's {} frames against the selected clip\n{}", nFail ? std::format("FAIL ({})", nFail) : std::string("PASS"), Fx, Fz, FyawDeg, PropName, nA, Out);
         }
 
-        std::string PrimitiveApproach(const std::string& PropName, float Fx, float Fz, float FyawDeg, float Seconds, int Seed, const std::string& Prompt) noexcept
+        std::string PrimitiveApproach(const std::string& PropName, float Fx, float Fz, float FyawDeg, float Seconds, int Seed, const std::string& Prompt, const std::vector<std::array<float, 4>>* pRoute = nullptr, const std::vector<int>* pSeeds = nullptr) noexcept
         {
             auto* pDesc = Desc(); if (!pDesc) return "PrimitiveApproach: nothing loaded";
             const xanim_package_desc::preview_prop* pP = nullptr;
@@ -2323,7 +2325,11 @@ namespace xanim_package_editor
             if (Seconds <= 0) Seconds = std::clamp(Dist / 1.0f + 0.6f, 1.0f, 10.0f);
             const float Way = Dist > 0.3f ? std::atan2(Dx, Dz) : Ryaw;     // (facing along the way; a short step just turns)
             const float D2R = 57.29578f;
-            std::vector<std::array<float, 4>> Tk{ { 0, 0, 0, 0 }, { 0.25f * Seconds, 0.2f * Dx, 0.2f * Dz, Wrap(Way) * D2R }, { 0.8f * Seconds, 0.85f * Dx, 0.85f * Dz, Wrap(Way) * D2R }, { Seconds, Dx, Dz, Ryaw * D2R } };
+            // arrival Stop (v2, the gate's continuity check): the root is at the entry from 75 % of the take and stays, turned to its heading -
+            // the take settles instead of arriving at walking speed. -Route: rows "t x z yaw" in the START's frame (walk past, turn, back up),
+            // its last row moved onto the entry
+            std::vector<std::array<float, 4>> Tk{ { 0, 0, 0, 0 }, { 0.2f * Seconds, 0.2f * Dx, 0.2f * Dz, Wrap(Way) * D2R }, { 0.6f * Seconds, 0.85f * Dx, 0.85f * Dz, Wrap(Way) * D2R }, { 0.75f * Seconds, Dx, Dz, Ryaw * D2R }, { Seconds, Dx, Dz, Ryaw * D2R } };
+            if (pRoute && pRoute->size() >= 2) { Tk = *pRoute; Seconds = Tk.back()[0] + 0.5f; Tk.push_back({ Seconds, Dx, Dz, Ryaw * D2R }); Tk[Tk.size() - 2] = { Tk[Tk.size() - 2][0], Dx, Dz, Ryaw * D2R }; }
             // the clip's first frame where the take ends: Kimodo's normalized pose turned by Ryaw and moved to (Dx, Dz)
             const auto R = xanimation::details::AxisAngle(xmath::fvec3(0, 1, 0), Ryaw);
             auto E = SP[0];
@@ -2335,6 +2341,26 @@ namespace xanim_package_editor
             }
             const int N = std::max(2, int(std::lround(Seconds * 30.0f)));
             std::vector<kimodo::constraint_set> Extra{ { "fullbody", { N - 1 }, { E }, { { E.m_Root[0], E.m_Root[2] } } } };
+            if (pSeeds && !pSeeds->empty())        // CANDIDATES: each generated, put on preview and through the gate; the best stays on preview
+            {
+                struct cand { int m_Seed; int m_nFail; std::wstring m_Bvh; std::string m_Report; };
+                std::vector<cand> C;
+                for (const int Sd : *pSeeds)
+                {
+                    const auto G = KimodoGenerate(Prompt, Seconds, Sd, nullptr, 0, nullptr, &Tk, &Extra);
+                    if (!G.ends_with("started")) { C.push_back({ Sd, 99, {}, G }); continue; }
+                    bool Ok = false; std::string Msg; while (!m_K.m_Job.Poll(Ok, Msg)) Sleep(50);
+                    if (!Ok) { C.push_back({ Sd, 99, {}, "the generation failed: " + Msg.substr(Msg.size() > 300 ? Msg.size() - 300 : 0) }); continue; }
+                    KimodoShowBvh(m_K.m_Job.m_Bvh);
+                    const auto V = InteractionValidate(PropName, Fx, Fz, FyawDeg);
+                    const auto At = V.find("FAIL ("); C.push_back({ Sd, At == std::string::npos ? (V.find(": PASS") != std::string::npos ? 0 : 99) : std::atoi(V.c_str() + At + 6), m_K.m_Job.m_Bvh, V });
+                }
+                std::stable_sort(C.begin(), C.end(), [](const cand& a, const cand& b) { return a.m_nFail < b.m_nFail; });
+                std::string Out = std::format("PrimitiveApproach: {} candidate(s) from ({:.2f}, {:.2f}, {:.0f} deg) of '{}', ranked by the gate (failed checks first last); the best is on preview (KimodoAccept keeps it)\n", C.size(), Fx, Fz, FyawDeg, PropName);
+                for (const auto& c : C) Out += std::format("--- seed {}: {} failed check(s)\n{}\n", c.m_Seed, c.m_nFail, c.m_Report);
+                if (!C.empty() && !C[0].m_Bvh.empty()) KimodoShowBvh(C[0].m_Bvh);
+                return Out;
+            }
             const auto Out = KimodoGenerate(Prompt, Seconds, Seed, nullptr, 0, nullptr, &Tk, &Extra);
             return std::format("PrimitiveApproach: from ({:.2f}, {:.2f}, {:.0f} deg) in the pivot frame of '{}': {:.2f} m to the clip's first frame, turning {:.0f} deg, {:.2f} s; the take must end at root {:.3f} {:.3f} {:.3f} (Kimodo space, m) - {}",
                                Fx, Fz, FyawDeg, PropName, Dist, Ryaw * D2R, Seconds, E.m_Root[0], E.m_Root[1], E.m_Root[2], Out);
@@ -2466,8 +2492,14 @@ namespace xanim_package_editor
             if (!Ok && Msg.size() > 600) Msg = "..." + Msg.substr(Msg.size() - 600);     // (the end of the log says why)
             m_K.m_Status = Msg.empty() ? (Ok ? "done" : "the generation failed (no message)") : Msg;
             if (!Ok) return;
+            KimodoShowBvh(m_K.m_Job.m_Bvh);
+        }
+        // a generated BVH becomes the preview (what Accept keeps is m_K.m_Job.m_Bvh)
+        void KimodoShowBvh(const std::wstring& Path) noexcept
+        {
+            m_K.m_Job.m_Bvh = Path;
             kimodo::bvh B; std::string Err;
-            if (!B.Load(m_K.m_Job.m_Bvh, Err)) { m_K.m_bStatusError = true; m_K.m_Status = "the generated BVH could not be read: " + Err; return; }
+            if (!B.Load(Path, Err)) { m_K.m_bStatusError = true; m_K.m_Status = "the generated BVH could not be read: " + Err; return; }
             auto* pSkel = m_K.m_SkeletonRef.empty() ? nullptr : xresource::g_Mgr.getResource(m_K.m_SkeletonRef);
             if (!pSkel) { m_K.m_bStatusError = true; m_K.m_Status = "the SOMA skeleton is not loaded"; return; }
             m_K.m_BoneToJoint.assign(pSkel->getBones().size(), -1);
@@ -6879,7 +6911,10 @@ namespace xanim_package_editor
             if (xanimation::Scan(From.c_str(), "%f %f %f", &F[0], &F[1], &F[2]) != 3) return "PrimitiveApproach: -From wants \"x z yaw\"";
             if (xeditor::cmd_util::GetArg(m_Parser, m_hC, Secs)) std::from_chars(Secs.data(), Secs.data() + Secs.size(), Sec);
             xeditor::cmd_util::GetArg(m_Parser, m_hD, Seed); std::from_chars(Seed.data(), Seed.data() + Seed.size(), iSeed); xeditor::cmd_util::GetArg(m_Parser, m_hE, Prompt);
-            return S.PrimitiveApproach(Prop, F[0], F[1], F[2], Sec, iSeed, Prompt);
+            std::vector<std::array<float, 4>> Route; std::vector<int> Seeds;
+            if (std::string Rf; xeditor::cmd_util::GetArg(m_Parser, m_hF, Rf)) { std::ifstream In(Rf); std::array<float, 4> Row{}; while (In >> Row[0] >> Row[1] >> Row[2] >> Row[3]) Route.push_back(Row); if (Route.size() < 2) return "PrimitiveApproach: -Route wants a file of 2+ rows \"t x z yaw\": " + Rf; }
+            if (std::string Ss; xeditor::cmd_util::GetArg(m_Parser, m_hG, Ss)) { std::istringstream In(Ss); int v; while (In >> v) Seeds.push_back(v); if (Seeds.empty() || Seeds.size() > 6) return "PrimitiveApproach: -Seeds wants 1 to 6 numbers"; }
+            return S.PrimitiveApproach(Prop, F[0], F[1], F[2], Sec, iSeed, Prompt, Route.empty() ? nullptr : &Route, Seeds.empty() ? nullptr : &Seeds);
         }
         case kind::kimodo_settings:
         {
