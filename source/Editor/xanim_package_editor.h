@@ -5469,11 +5469,11 @@ namespace xanim_package_editor
             {
                 int Steps = m_K.m_Steps; float Cfg[2] = { m_K.m_CfgText, m_K.m_CfgConstraint }; bool NoPost = m_K.m_bNoPost;
                 ImGui::SetNextItemWidth(90.0f); if (ImGui::InputInt("Steps", &Steps)) xeditor::Run(m_Undo, std::format("KimodoSettings -Steps {}", std::clamp(Steps, 0, 1000)));
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Denoising steps: more is slower and can be cleaner. 0 = Kimodo's default.");
+                if (ImGui::IsItemHovered()) xeditor::hint::Text("Denoising steps: more is slower and can be cleaner. 0 = Kimodo's default.");
                 ImGui::SetNextItemWidth(160.0f); if (ImGui::InputFloat2("Guidance (text, constraint)", Cfg, "%.2f")) xeditor::Run(m_Undo, std::format("KimodoSettings -Guidance \"{:.2f} {:.2f}\"", std::max(0.0f, Cfg[0]), std::max(0.0f, Cfg[1])));
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How strongly the take follows the prompt and the constraints. 0 0 = Kimodo's default.");
+                if (ImGui::IsItemHovered()) xeditor::hint::Text("How strongly the take follows the prompt and the constraints. 0 0 = Kimodo's default.");
                 if (ImGui::Checkbox("No post-processing", &NoPost)) xeditor::Run(m_Undo, std::format("KimodoSettings -NoPost {}", NoPost ? 1 : 0));
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip Kimodo's foot clean-up (raw model output).");
+                if (ImGui::IsItemHovered()) xeditor::hint::Text("Skip Kimodo's foot clean-up (raw model output).");
                 ImGui::TreePop();
             }
             if (ImGui::IsItemHovered()) xeditor::hint::Text("Another seed, another take of the same prompt");
