@@ -97,6 +97,7 @@ namespace xanim_package_editor
                 m_hE = m_Parser.addOption("Goal",    "\"x z from to\": the root stays where it starts until 'from' seconds and is at (x, z) metres (+Z ahead, +X to the left) from 'to' on, facing ahead the whole take - a step or a stagger that ends where it must (recovery clips, R68)", false, 1);
                 m_hF = m_Parser.addOption("Video",   "A video file instead of a prompt: the motion of its main person (xmocap capture; -Start s, -Seconds s of it)", false, 1);
                 m_hG = m_Parser.addOption("Start",   "With -Video: where in the video the take starts, seconds (default 0)", false, 1);
+                m_hI = m_Parser.addOption("Loop",    "1 with -Path: generated as a closed loop (a first take, then again with its first frame pinned at both ends)", false, 1);
                 m_hH = m_Parser.addOption("Track",   "A file of rows \"t x z yaw\" (seconds, metres +Z ahead +X to the left, degrees +toward +X): the root follows this path AND faces this way, interpolated per frame - a pivot, a turn on the spot, a curve with its own facing (C132)", false, 1);
                 break;
             case kind::kimodo_inbetween:
@@ -274,7 +275,7 @@ namespace xanim_package_editor
         }
         std::string Query() noexcept override;
 
-        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE, m_hF, m_hG, m_hH;
+        xcmdline::parser::handle m_hA, m_hB, m_hC, m_hD, m_hE, m_hF, m_hG, m_hH, m_hI;
     };
 
     //--------------------------------------------------------------------------------------------
@@ -2267,7 +2268,7 @@ namespace xanim_package_editor
                                Fx, Fz, FyawDeg, PropName, Dist, Ryaw * D2R, Seconds, E.m_Root[0], E.m_Root[1], E.m_Root[2], Out);
         }
 
-        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0, const float* pGoal = nullptr, const std::vector<std::array<float, 4>>* pTrack = nullptr, const std::vector<kimodo::constraint_set>* pExtra = nullptr) noexcept
+        std::string KimodoGenerate(const std::string& Prompt, float Seconds, int Seed, const float* pVx = nullptr, float Vz = 0, const float* pGoal = nullptr, const std::vector<std::array<float, 4>>* pTrack = nullptr, const std::vector<kimodo::constraint_set>* pExtra = nullptr, bool bLoop = false) noexcept
         {
             if (auto* pWhy = KimodoWhyNot()) return std::string("KimodoGenerate: ") + pWhy;
             if (m_K.m_Job.m_bRunning) return "KimodoGenerate: a generation is already running";
@@ -2307,6 +2308,28 @@ namespace xanim_package_editor
                 if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return "KimodoGenerate: " + Err;
                 std::wstring P = xstrtool::To(Prompt);
                 for (auto& c : P) if (c == L'"' || c == L'\n' || c == L'\r') c = L' ';
+                // -Loop (MM-23: very slow walks the C127 baker refused): a first take, then the same request again with ITS first frame as
+                // a full-body constraint on frame 0 and, moved on by the path over the take, on the last frame - the loop is generated
+                // closed (the baker drops that last frame: the next pass's first). Only with a straight -Path (its root advance is known).
+                if (bLoop && pVx)
+                {
+                    const auto Args1 = std::format(L"gen --prompt \"{}\" --frames {} --seed {} --constraints \"{}.json\" --bvh \"{}_pass1.bvh\"", P, N, Seed, Stem, Stem);
+                    if (!kimodo::RunBlocking(Exe, Args1, Stem + L"_pass1.log", 300000, Err)) return "KimodoGenerate -Loop (first take): " + Err;
+                    kimodo::bvh B; if (!B.Load(Stem + L"_pass1.bvh", Err)) return "KimodoGenerate -Loop: " + Err;
+                    kimodo::soma_pose P0;
+                    for (int j = 0; j < 77; ++j)
+                    {
+                        int k = -1; for (int i = 0; i < B.nJoints(); ++i) if (B.m_Names[i] == kimodo::soma77_names_v[j]) { k = i; break; }
+                        if (k < 0) continue;
+                        float q[4]; kimodo::MatToQuat(&B.m_Rots[std::size_t(k) * 9], q);
+                        const auto L = xanimation::details::LogQ(xmath::fquat(q[0], q[1], q[2], q[3]).NormalizeSafeCopy());
+                        P0.m_Rot[j][0] = L.m_X; P0.m_Rot[j][1] = L.m_Y; P0.m_Rot[j][2] = L.m_Z;
+                    }
+                    for (int a = 0; a < 3; ++a) P0.m_Root[a] = B.m_Root[std::size_t(a)];
+                    auto P1 = P0; const float T = float(N - 1) / 30.0f; P1.m_Root[0] += *pVx * T; P1.m_Root[2] += Vz * T;
+                    Sets.push_back({ "fullbody", { 0, N - 1 }, { P0, P1 }, { { P0.m_Root[0], P0.m_Root[2] }, { P1.m_Root[0], P1.m_Root[2] } } });
+                    if (!kimodo::WriteConstraints(Stem + L".json", Sets, Err)) return "KimodoGenerate: " + Err;
+                }
                 const auto Args = std::format(L"gen --prompt \"{}\" --frames {} --seed {} --constraints \"{}.json\" --bvh \"{}.bvh\"", P, N, Seed, Stem, Stem);
                 if (!m_K.m_Job.StartArgs(Exe, Args, Stem + L".bvh", Stem + L".log", Err)) return "KimodoGenerate: " + Err;
             }
@@ -6415,7 +6438,9 @@ namespace xanim_package_editor
                 if (xanimation::Scan(Path.c_str(), "%f %f", &Vx, &Vz) != 2) return "KimodoGenerate: -Path wants \"vx vz\" (metres per second)";
                 bPath = true;
             }
-            return S.KimodoGenerate(Prompt, Seconds, iSeed, bPath ? &Vx : nullptr, Vz);
+            std::string Loop; xeditor::cmd_util::GetArg(m_Parser, m_hI, Loop);
+            if ((Loop == "1" || Loop == "true") && !bPath) return "KimodoGenerate: -Loop needs -Path \"vx vz\" (the loop's root advance)";
+            return S.KimodoGenerate(Prompt, Seconds, iSeed, bPath ? &Vx : nullptr, Vz, nullptr, nullptr, nullptr, Loop == "1" || Loop == "true");
         }
         case kind::kimodo_accept:
         {
