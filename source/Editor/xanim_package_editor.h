@@ -6256,8 +6256,8 @@ namespace xanim_package_editor
         //----------------------------------------------------------------------------------------
 
         // Motion space preview (R165 phase 2, editor side): the selected loop blended with its SpaceWith loop at weight W, phase-aligned over a
-        // cycle of the lerped length (BlendLoops' idea on the source frames, trimmed as the compile trims). ponytail: aligned at their first
-        // frames, not by their first left footstep as the game does (the game's offset is BlendLoops'); add it when a preview looks out of step
+        // cycle of the lerped length (BlendLoops' idea on the source frames, trimmed as the compile trims). B's phase is put on A's first left
+        // footstep as the game does (xlionrender_system's m_SpOff: OffB = stepB - stepA * LB / LA, from the Footstep events; 0 when one has none)
         float m_SpaceW = -1; std::vector<xmath::transform3> m_SpaceFrames; int m_SpaceN = 0, m_SpaceMover = 0;      // (m_SpaceMover: the bone that carries the travel - the hips, not always bone 0)
         std::string SpacePreview(float W) noexcept
         {
@@ -6275,11 +6275,16 @@ namespace xanim_package_editor
             const auto [A0, LA] = Span(*pOv, *FA); const auto [B0, LB] = Span(*pB, *FB);
             W = std::clamp(W, 0.0f, 1.0f);
             const double L = LA + (LB - LA) * W; const int n = std::max(2, int(std::lround(L * 30.0)));
+            // the first left Footstep in the trimmed clip, in the compiled clip's seconds (the compile's event mapping: tick / tps - trim start)
+            std::string RigErr; const std::string LeftFoot = PoseRig(RigErr) ? m_PT.m_Rig.m_Names[m_PT.m_Rig.m_LF] : std::string{};
+            auto FirstStep = [&](const xanim_package_desc::clip& C, double T0, double Len) { double Best = -1; for (const auto& E : C.m_Events) if (E.m_Kind == xanim_package::event_kind::FOOTSTEP && E.m_Bone == LeftFoot) { const double t = double(E.m_Tick) / tl_tps_v - T0; if (t >= 0 && t <= Len && (Best < 0 || t < Best)) Best = t; } return Best; };
+            const double SA = FirstStep(*pOv, A0, LA), SB = FirstStep(*pB, B0, LB);
+            const double OffB = (SA < 0 || SB < 0) ? 0.0 : SB - SA * LB / LA;
             m_SpaceFrames.assign(std::size_t(n) * nB, {});
             for (int i = 0; i < n; ++i)
             {
-                const double u = double(i) / double(n);
-                const auto Pa = SamplePose(FA->m_Frames, FA->m_FPS, FA->m_nFrames, nB, A0 + u * LA), Pb = SamplePose(FB->m_Frames, FB->m_FPS, FB->m_nFrames, nB, B0 + u * LB);
+                const double u = double(i) / double(n), tb = u * LB + OffB;
+                const auto Pa = SamplePose(FA->m_Frames, FA->m_FPS, FA->m_nFrames, nB, A0 + u * LA), Pb = SamplePose(FB->m_Frames, FB->m_FPS, FB->m_nFrames, nB, B0 + (tb - LB * std::floor(tb / LB)));
                 for (int b = 0; b < nB; ++b) m_SpaceFrames[std::size_t(i) * nB + b] = xmath::transform3::fromBlend(Pa[std::size_t(b)], Pb[std::size_t(b)], W);
             }
             m_SpaceN = n; m_SpaceW = W;
@@ -6287,7 +6292,7 @@ namespace xanim_package_editor
             m_SpaceMover = 0; { float Best = -1; for (int b = 0; b < std::min(nB, 4); ++b) if (const float t = Travel(m_SpaceFrames, 30, n, 0, double(n - 1) / 30.0, b); t > Best) { Best = t; m_SpaceMover = b; } }
             auto Speed = [&](const std::vector<xmath::transform3>& Fr, int Fps, int nF, double T0, double Len) { return Travel(Fr, Fps, nF, T0, Len, m_SpaceMover) / float(Len); };
             const float Va = Speed(FA->m_Frames, FA->m_FPS, FA->m_nFrames, A0, LA), Vb = Speed(FB->m_Frames, FB->m_FPS, FB->m_nFrames, B0, LB), Vw = Speed(m_SpaceFrames, 30, n, 0, double(n - 1) / 30.0);
-            return std::format("SpaceWeight: '{}' <-> '{}' at {:.2f}: a {:.2f} s cycle; root speed {:.2f} (the ends: {:.2f} and {:.2f} units/s)", pOv->m_Name, pOv->m_SpaceWith, W, double(n) / 30.0, Vw, Va, Vb);
+            return std::format("SpaceWeight: '{}' <-> '{}' at {:.2f}: a {:.2f} s cycle; root speed {:.2f} (the ends: {:.2f} and {:.2f} units/s); B offset {:.3f} s{}", pOv->m_Name, pOv->m_SpaceWith, W, double(n) / 30.0, Vw, Va, Vb, OffB, (SA < 0 || SB < 0) ? " (no left Footstep in one clip: aligned at frame 0)" : "");
         }
         void EvaluateSpace(const xskeleton::skeleton& Skeleton) noexcept
         {
