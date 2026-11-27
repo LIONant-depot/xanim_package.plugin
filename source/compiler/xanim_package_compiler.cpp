@@ -1283,7 +1283,7 @@ namespace xanim_package_compiler
             auto& ResolvedBones = Manifest.m_Bones;
 
             std::vector<xanim_package::clip>       Clips;
-            std::vector<std::string>               Names;
+            std::vector<std::string>               Names, OrigNames;
             std::vector<std::pair<std::string, int>> Spaces;      // (per compiled clip: its motion space partner by name, samples)
             std::vector<xmath::transform3>          AllKeyFrames;
             std::vector<xmath::fvec3>               AllRootMotion;
@@ -1331,7 +1331,7 @@ namespace xanim_package_compiler
                     return Err;
                 if (Skip) continue;
 
-                Names.push_back((pOv && !pOv->m_Name.empty()) ? pOv->m_Name : Raw.m_Anim.m_Name);
+                Names.push_back((pOv && !pOv->m_Name.empty()) ? pOv->m_Name : Raw.m_Anim.m_Name); OrigNames.push_back(Raw.m_Anim.m_Name);
                 Spaces.push_back(pOv ? std::pair{ pOv->m_SpaceWith, pOv->m_SpaceSamples } : std::pair{ std::string(), 0 });
                 Clips.emplace_back(std::move(Compiled));
             }
@@ -1350,6 +1350,30 @@ namespace xanim_package_compiler
                 if (!Clips[i].m_bLoop || !Clips[j].m_bLoop || j == i) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Clip '{}': a motion space needs two different LOOPS ('{}' with '{}') - none", Names[i], Names[i], With)); continue; }
                 Clips[i].m_SpaceWith = std::int32_t(j); Clips[i].m_SpaceSamples = std::clamp(n, 2, 16);
                 LogMessage(xresource_pipeline::msg_type::INFO, std::format("Motion space: '{}' <-> '{}', {} samples", Names[i], With, Clips[i].m_SpaceSamples));
+            }
+            // Smart Primitive step 5: the accepted entries, one record each (the interaction's clip and the entry's take by name: compiled, then original)
+            {
+                auto Find = [&](const std::string& N) { for (std::size_t i = 0; i < Names.size(); ++i) if (Names[i] == N) return int(i); for (std::size_t i = 0; i < OrigNames.size(); ++i) if (OrigNames[i] == N) return int(i); return -1; };
+                std::vector<xanim_package::interaction_entry> Ie;
+                for (const auto& I : m_Descriptor.m_Interactions)
+                {
+                    const int iClip = Find(I.m_Clip);
+                    if (iClip < 0) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Interaction '{}': its clip '{}' is not in this package - no runtime entries", I.m_Name, I.m_Clip)); continue; }
+                    for (const auto& E : I.m_Entries)
+                    {
+                        const int iTake = Find(E.m_Take);
+                        if (iTake < 0) { LogMessage(xresource_pipeline::msg_type::WARNING, std::format("Interaction '{}': the take '{}' of an entry is not a clip of this package - entry dropped", I.m_Name, E.m_Take)); continue; }
+                        xanim_package::interaction_entry R{}; R.m_NameHash = xstrtool::CRC32(I.m_Name); R.m_iClip = std::int16_t(iClip); R.m_iTake = std::int16_t(iTake);
+                        R.m_X = E.m_X; R.m_Z = E.m_Z; R.m_Yaw = E.m_Yaw; R.m_bRevalidate = E.m_bRevalidate ? 1 : 0; Ie.push_back(R);
+                    }
+                }
+                if (!Ie.empty())
+                {
+                    m_FinalPackage.m_nInteractions = std::uint32_t(Ie.size()); m_FinalPackage.m_pInteractions = new xanim_package::interaction_entry[Ie.size()];
+                    std::memset(static_cast<void*>(m_FinalPackage.m_pInteractions), 0, sizeof(xanim_package::interaction_entry) * Ie.size());      // padding: the file follows from the content only
+                    for (std::size_t i = 0; i < Ie.size(); ++i) { auto& D = m_FinalPackage.m_pInteractions[i]; const auto& S = Ie[i]; D.m_NameHash = S.m_NameHash; D.m_iClip = S.m_iClip; D.m_iTake = S.m_iTake; D.m_X = S.m_X; D.m_Z = S.m_Z; D.m_Yaw = S.m_Yaw; D.m_bRevalidate = S.m_bRevalidate; }
+                    LogMessage(xresource_pipeline::msg_type::INFO, std::format("Interaction entries: {}", Ie.size()));
+                }
             }
             // C127: the loop report (one row per clip marked Loop: clip, verdict, frames as cut, seam as cut mm / deg-per-s, what was done or why not)
             if (!m_LoopReport.empty())

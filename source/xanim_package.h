@@ -64,9 +64,20 @@ namespace xanim_package
         float               m_Duration  {};     // 0: a point
     };
 
+    // Smart Primitive v2 step 5: an accepted entry of an interaction, compiled (one record per entry). The start placement in the pivot's
+    // frame (metres, degrees about up; heading 0 = +Z); Take: the accepted approach clip that walks from there into Clip's first frame
+    struct interaction_entry
+    {
+        std::uint32_t       m_NameHash  {};     // CRC32 of the interaction's name (Sit)
+        std::int16_t        m_iClip     {-1};   // the interaction's clip
+        std::int16_t        m_iTake     {-1};   // the entry's approach clip
+        float               m_X {}, m_Z {}, m_Yaw {};
+        std::uint8_t        m_bRevalidate {};   // an anchor moved after it was accepted (still playable)
+    };
+
     struct anim_package
     {
-        inline static constexpr auto xserializer_version_v = 8;     // 8: motion spaces (a clip's SpaceWith/SpaceSamples); 2: events; 3: clip traits; 4: root turn; 5: compressed clips; 6: the raw keys in a sidecar; 7: seamless loops (a loop's frames exclude the next pass's first; m_LoopTurn)
+        inline static constexpr auto xserializer_version_v = 9;     // 9: interaction entries (Smart Primitive step 5); 8: motion spaces (a clip's SpaceWith/SpaceSamples); 2: events; 3: clip traits; 4: root turn; 5: compressed clips; 6: the raw keys in a sidecar; 7: seamless loops (a loop's frames exclude the next pass's first; m_LoopTurn)
 
                                         anim_package    (void)                          noexcept = default;
         inline                         anim_package    (xserializer::stream& Stream)    noexcept;
@@ -102,6 +113,7 @@ namespace xanim_package
             return { std::span<const xanimation::compressed_clip::bone>(m_pCTracks + std::size_t(iClip) * m_nBones, m_nBones), m_pRot64, m_pQ16, m_pF32, int(m_nBones), C.m_nFrames, C.m_FPS, C.m_bLoop };
         }
         inline std::span<event>                 getClipEvents      (int iClip)     const noexcept { auto& C = m_pClips[iClip]; return { m_pEvents + C.m_iFirstEvent, C.m_nEvents }; }
+        inline std::span<interaction_entry>     getInteractions    (void)          const noexcept { return { m_pInteractions, m_nInteractions }; }
 
         clip*               m_pClips            {nullptr};   // m_nClips entries
         std::uint32_t*      m_pBoneNameHashes   {nullptr};   // m_nBones entries, package-wide, SAME order as
@@ -115,7 +127,8 @@ namespace xanim_package
         std::uint64_t*      m_pRot64            {nullptr};   // m_nRot64: animated rotations, 64 bits a frame
         std::uint16_t*      m_pQ16              {nullptr};   // m_nQ16: animated positions/scales, 3 x 16 bits a frame
         float*              m_pF32              {nullptr};   // m_nF32: long-range positions/scales, 3 floats a frame
-        float*              m_pRootTurn         {nullptr};   // m_nRootTurnFrames entries: 0 or m_nTotalRootMotionFrames, parallel to m_pRootMotion (the root's turn about +Y)
+        float*              m_pRootTurn         {nullptr};
+        interaction_entry*  m_pInteractions     {nullptr};   // m_nInteractions entries (Smart Primitive step 5)   // m_nRootTurnFrames entries: 0 or m_nTotalRootMotionFrames, parallel to m_pRootMotion (the root's turn about +Y)
         std::uint16_t       m_nClips                  {0};
         std::uint32_t       m_nBones                  {0};   // shared bone width/order for every clip
         std::uint32_t       m_nTotalKeyFrames         {0};
@@ -123,6 +136,7 @@ namespace xanim_package
         std::uint32_t       m_nTotalEvents            {0};
         std::uint32_t       m_nRootTurnFrames         {0};
         std::uint32_t       m_nCTracks = 0, m_nRot64 = 0, m_nQ16 = 0, m_nF32 = 0;
+        std::uint32_t       m_nInteractions = 0;
         std::uint32_t       m_nSidecarKeys = 0;     // K5 step 2: the raw keys live in <package file>.keys (anim_keys), m_nSidecarKeys of them; m_pKeyFrame is
                                                     // null until LoadKeys attaches them (the editors, package-to-package imports); the runtime samples the compressed tracks
         void*               m_pKeysBlock   {nullptr};   // (the attached sidecar's block, freed with the package; never saved: always null in the file)
@@ -181,6 +195,7 @@ namespace xanim_package
         if (m_pRootMotion)     delete[] m_pRootMotion;
         if (m_pEvents)         delete[] m_pEvents;
         if (m_pRootTurn)       delete[] m_pRootTurn;
+        if (m_pInteractions)   delete[] m_pInteractions;
         if (m_pCTracks)        delete[] m_pCTracks;
         if (m_pRot64)          delete[] m_pRot64;
         if (m_pQ16)            delete[] m_pQ16;
@@ -235,6 +250,18 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(T.m_Position.m_X))
             || (Err = Stream.Serialize(T.m_Position.m_Y))
             || (Err = Stream.Serialize(T.m_Position.m_Z))
+            ;
+        return Err;
+    }
+
+    //-------------------------------------------------------------------------
+    template<> inline
+    xerr SerializeIO<xanim_package::interaction_entry>(xserializer::stream& Stream, const xanim_package::interaction_entry& E) noexcept
+    {
+        xerr Err;
+        false
+            || (Err = Stream.Serialize(E.m_NameHash)) || (Err = Stream.Serialize(E.m_iClip)) || (Err = Stream.Serialize(E.m_iTake))
+            || (Err = Stream.Serialize(E.m_X)) || (Err = Stream.Serialize(E.m_Z)) || (Err = Stream.Serialize(E.m_Yaw)) || (Err = Stream.Serialize(E.m_bRevalidate))
             ;
         return Err;
     }
@@ -334,6 +361,8 @@ namespace xserializer::io_functions
             || (Err = Stream.Serialize(Package.m_pQ16,             Package.m_nQ16))
             || (Err = Stream.Serialize(Package.m_nF32))
             || (Err = Stream.Serialize(Package.m_pF32,             Package.m_nF32))
+            || (Err = Stream.Serialize(Package.m_nInteractions))
+            || (Err = Stream.Serialize(Package.m_pInteractions,    Package.m_nInteractions))
             || (Err = Stream.Serialize(Package.m_nSidecarKeys))
             ;
         return Err;
