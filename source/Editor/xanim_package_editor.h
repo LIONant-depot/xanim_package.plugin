@@ -2328,7 +2328,7 @@ namespace xanim_package_editor
             auto* pOv = SelectedOv(); if (!pOv) return "InteractionAccept: select the interaction's clip first";
             const auto V = InteractionValidate(PropName, Fx, Fz, FyawDeg);
             if (V.find(": PASS") == std::string::npos) return "InteractionAccept: refused - the approach does not pass the gate:\n" + V;
-            const auto Clip = pOv->m_Name.empty() ? pOv->m_OriginalName : pOv->m_Name; std::string Out;      // (the compiled name: unique; original names repeat across sources)
+            const auto Clip = pOv->m_Name.empty() ? pOv->m_OriginalName : pOv->m_Name; const auto RM = pOv->m_RootMotion; std::string Out;      // (the compiled name: unique; original names repeat across sources)
             // ponytail: two undo steps (the entry, then the take's import). The entry is recorded FIRST: KimodoAccept saves and starts a
             // compile (the 0xc0000409 crash first blamed on that was a long string value in the snapshot: C135)
             const std::string Planned = std::format("{}_{}_entry", IName, PropName);
@@ -2341,7 +2341,7 @@ namespace xanim_package_editor
                 Out = std::format("InteractionAccept: entry {} of '{}' on '{}' ({:.2f}, {:.2f}, {:.0f} deg) accepted (take {})", pI->m_Entries.size(), IName, PropName, Fx, Fz, FyawDeg, Planned);
                 return {};
             });
-            const auto A = KimodoAccept(Planned);
+            const auto A = KimodoAccept(Planned, RM == xanim_package::root_motion_mode::NONE ? xanim_package::root_motion_mode::XZ_ONLY : RM);
             if (A.find("saved") == std::string::npos) return "InteractionAccept: the entry is recorded but the take was not saved: " + A;
             Out += std::format(" - {}", A);
             return Out.empty() ? "InteractionAccept: the entry was not recorded" : Out;
@@ -5881,7 +5881,7 @@ namespace xanim_package_editor
             return "KimodoAccept: " + m_K.m_Status;
         }
 
-        std::string KimodoAccept(std::string Name) noexcept
+        std::string KimodoAccept(std::string Name, xanim_package::root_motion_mode RootMotion = xanim_package::root_motion_mode::NONE) noexcept
         {
             auto* pDesc = Desc();
             if (!m_K.m_bPreview || !pDesc) return "KimodoAccept: nothing to accept (generate first)";
@@ -5914,6 +5914,8 @@ namespace xanim_package_editor
             xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[]"), xeditor::Quote("1")));
             xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[G:0]/OriginalName"), xeditor::Quote("Motion")));
             xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[G:0]/Name"), xeditor::Quote(ClipName)));
+            if (RootMotion != xanim_package::root_motion_mode::NONE)      // (an interaction's take moves the character: it carries root motion like the interaction)
+                xeditor::Run(m_Undo, std::format("SetProperty -Path {} -Value {}", xeditor::Quote(Base + "Clips[G:0]/RootMotion"), xeditor::Quote(RootMotion == xanim_package::root_motion_mode::XYZ ? "XYZ" : "XZ Only")));
             (void)m_Undo.Query("Save");
             (void)m_Undo.Query("Compile");
 
