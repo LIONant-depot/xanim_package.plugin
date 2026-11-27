@@ -2328,7 +2328,7 @@ namespace xanim_package_editor
             auto* pOv = SelectedOv(); if (!pOv) return "InteractionAccept: select the interaction's clip first";
             const auto V = InteractionValidate(PropName, Fx, Fz, FyawDeg);
             if (V.find(": PASS") == std::string::npos) return "InteractionAccept: refused - the approach does not pass the gate:\n" + V;
-            const auto Clip = pOv->m_OriginalName; std::string Out;
+            const auto Clip = pOv->m_Name.empty() ? pOv->m_OriginalName : pOv->m_Name; std::string Out;      // (the compiled name: unique; original names repeat across sources)
             // ponytail: two undo steps (the entry, then the take's import). The entry is recorded FIRST: KimodoAccept saves and starts a
             // compile (the 0xc0000409 crash first blamed on that was a long string value in the snapshot: C135)
             const std::string Planned = std::format("{}_{}_entry", IName, PropName);

@@ -387,7 +387,7 @@ namespace xanim_package_desc
     {
         std::string                     m_Name    = "Sit";
         std::string                     m_Prop    = {};     // the preview prop (by name) with the pivot
-        std::string                     m_Clip    = {};     // the interaction's clip (its original name)
+        std::string                     m_Clip    = {};     // the interaction's clip (its compiled name)
         std::string                     m_Arrival = "Stop"; // Stop (v1) or Continue
         std::vector<interaction_entry>  m_Entries = {};
         XPROPERTY_DEF

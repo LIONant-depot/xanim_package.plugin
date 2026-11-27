@@ -1353,7 +1353,7 @@ namespace xanim_package_compiler
             }
             // Smart Primitive step 5: the accepted entries, one record each (the interaction's clip and the entry's take by name: compiled, then original)
             {
-                auto Find = [&](const std::string& N) { for (std::size_t i = 0; i < Names.size(); ++i) if (Names[i] == N) return int(i); for (std::size_t i = 0; i < OrigNames.size(); ++i) if (OrigNames[i] == N) return int(i); return -1; };
+                auto Find = [&](const std::string& N) { for (std::size_t i = 0; i < Names.size(); ++i) if (Names[i] == N) return int(i); int k = -1; for (std::size_t i = 0; i < OrigNames.size(); ++i) if (OrigNames[i] == N) { if (k >= 0) return -1; k = int(i); } return k; };      // (an original name only when one clip has it: they repeat across sources)
                 std::vector<xanim_package::interaction_entry> Ie;
                 for (const auto& I : m_Descriptor.m_Interactions)
                 {
