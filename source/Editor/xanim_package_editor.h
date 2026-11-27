@@ -6281,10 +6281,13 @@ namespace xanim_package_editor
             const double SA = FirstStep(*pOv, A0, LA), SB = FirstStep(*pB, B0, LB);
             const double OffB = (SA < 0 || SB < 0) ? 0.0 : SB - SA * LB / LA;
             m_SpaceFrames.assign(std::size_t(n) * nB, {});
+            const auto Bs = SamplePose(FB->m_Frames, FB->m_FPS, FB->m_nFrames, nB, B0), Be = SamplePose(FB->m_Frames, FB->m_FPS, FB->m_nFrames, nB, B0 + LB);
             for (int i = 0; i < n; ++i)
             {
-                const double u = double(i) / double(n), tb = u * LB + OffB;
-                const auto Pa = SamplePose(FA->m_Frames, FA->m_FPS, FA->m_nFrames, nB, A0 + u * LA), Pb = SamplePose(FB->m_Frames, FB->m_FPS, FB->m_nFrames, nB, B0 + (tb - LB * std::floor(tb / LB)));
+                const double u = double(i) / double(n), tb = u * LB + OffB, k = std::floor(tb / LB);
+                const auto Pa = SamplePose(FA->m_Frames, FA->m_FPS, FA->m_nFrames, nB, A0 + u * LA);
+                auto Pb = SamplePose(FB->m_Frames, FB->m_FPS, FB->m_nFrames, nB, B0 + (tb - LB * k));
+                for (int b = 0; b < nB; ++b) { auto d = Be[std::size_t(b)].m_Position - Bs[std::size_t(b)].m_Position; d.m_Y = 0; Pb[std::size_t(b)].m_Position += d * float(k); }      // (a wrapped sample keeps its cycles' travel: the loop goes on, it does not jump back)
                 for (int b = 0; b < nB; ++b) m_SpaceFrames[std::size_t(i) * nB + b] = xmath::transform3::fromBlend(Pa[std::size_t(b)], Pb[std::size_t(b)], W);
             }
             m_SpaceN = n; m_SpaceW = W;
