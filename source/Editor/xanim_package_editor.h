@@ -4724,8 +4724,9 @@ namespace xanim_package_editor
         }
 
         // One solve from a baseline: the handle at TargetModel (model frame), the pins held where the baseline has them. Pure: same inputs,
-        // same pose (a drag solves from its start pose each frame, so the mouse's event rate does not matter).
-        bool PoseSolve(const xanimation::pose& Base, int Eff, const xmath::fvec3& TargetModel, bool bFK, const std::set<int>& Pins, xanimation::pose& Out, std::string& Note, float* pPinErrCm = nullptr) noexcept
+        // same pose. pSeed (a drag's last result, may be Out): solved from it too, kept when as good (body_ik SolveSeeded: no jumps between
+        // equally good poses while dragging).
+        bool PoseSolve(const xanimation::pose& Base, int Eff, const xmath::fvec3& TargetModel, bool bFK, const std::set<int>& Pins, xanimation::pose& Out, std::string& Note, float* pPinErrCm = nullptr, const xanimation::pose* pSeed = nullptr) noexcept
         {
             const auto& R = m_PT.m_Rig;
             const int nB = R.count();
@@ -4753,7 +4754,7 @@ namespace xanim_package_editor
                 }
             }
             std::vector<xanimation::ik_task_report> Rep(Tasks.size());
-            S.Solve(Base, W, Tasks, Rep, Out, Set);
+            if (pSeed) S.SolveSeeded(Base, *pSeed, W, Tasks, Rep, Out, Set); else S.Solve(Base, W, Tasks, Rep, Out, Set);
             // why: the root never moves (only the hips do), so "locked" alone means the body was held by the pins or simply ran out of reach
             std::uint8_t Why = Rep[0].m_Reasons;
             if (!bFK && (Why & ~xanimation::ik_reason::BUDGET) == xanimation::ik_reason::LOCKED) Why = 0;
@@ -5327,7 +5328,7 @@ namespace xanim_package_editor
                     const float Den = Ray.Dot(m_PT.m_Normal);
                     if (std::abs(Den) > 1e-6f) m_PT.m_Target = Eye + Ray * ((m_PT.m_Plane - Eye).Dot(m_PT.m_Normal) / Den);
                     std::string Note;
-                    PoseSolve(m_PT.m_Base, m_PT.m_Drag, m_PT.m_Target - m_PT.m_Offset, m_PT.m_bFK, m_PT.m_DragPins, m_PT.m_Preview, Note);
+                    PoseSolve(m_PT.m_Base, m_PT.m_Drag, m_PT.m_Target - m_PT.m_Offset, m_PT.m_bFK, m_PT.m_DragPins, m_PT.m_Preview, Note, nullptr, &m_PT.m_Preview);
                     m_PT.m_Note = Note; m_PT.m_bPreview = true; m_PT.m_PreviewTime = m_PT.m_Time;
                     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
                     {   // released: the keys, one undo step
@@ -5637,6 +5638,7 @@ namespace xanim_package_editor
                     {
                         m_PT.m_bFK = m_PT.m_bHoverTip; m_PT.m_Drag = m_PT.m_Hover; m_PT.m_Time = m_TimeSeconds; m_PT.m_Cand = -1;
                         m_PT.m_DragPins = PoseEffectivePins(m_TimeSeconds);
+                        m_PT.m_Preview = m_PT.m_Base;       // (the drag's seed starts at its start pose)
                         xanimation::body_ik FK; FK.Setup(R.m_Par); FK.ComputeWorld(m_PT.m_Base);
                         int Grab = m_PT.m_Drag;
                         if (m_PT.m_bFK) for (int c = Grab + 1; c < R.count(); ++c) if (R.m_Par[c] == m_PT.m_Drag) { Grab = c; break; }
